@@ -2,15 +2,7 @@
   "buildCommand": "cd desktop && npm install && npm run build",
   "outputDirectory": "desktop/dist",
   "framework": null,
-  "functions": {
-    "api/index.py": {
-      "runtime": "python3.11",
-      "maxDuration": 30
-    }
-  },
   "rewrites": [
-    { "source": "/api/(.*)", "destination": "/api/index" },
-    { "source": "/health", "destination": "/api/index" },
     { "source": "/(.*)", "destination": "/index.html" }
   ],
   "headers": [
