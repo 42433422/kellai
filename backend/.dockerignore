@@ -1,0 +1,8 @@
+.dockerignore
+.env.example
+.git
+.github
+node_modules
+src-tauri
+scripts
+*.md

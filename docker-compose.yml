@@ -1,0 +1,29 @@
+version: "3.8"
+
+services:
+  kellai-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: kellai-backend
+    restart: unless-stopped
+    ports:
+      - "${KELLAI_PORT:-8790}:8790"
+    volumes:
+      - kellai-data:/data
+    environment:
+      # ===== 必须修改 =====
+      - KELLAI_JWT_SECRET=${KELLAI_JWT_SECRET:?请在 .env 中设置 KELLAI_JWT_SECRET}
+      # ===== 建议修改 =====
+      - KELLAI_PASSWORD_SALT=${KELLAI_PASSWORD_SALT:-kellai_default_salt_2026}
+      - KELLAI_CORS_ORIGINS=${KELLAI_CORS_ORIGINS:-http://localhost:1420,http://localhost:8790}
+      # ===== 一般不用改 =====
+      - KELLAI_APP_ENV=production
+      - KELLAI_STRICT_AUTH=1
+      - KELLAI_PORT=8790
+      - KELLAI_DATA_DIR=/data
+      - KELLAI_LOG_LEVEL=${KELLAI_LOG_LEVEL:-INFO}
+
+volumes:
+  kellai-data:
+    driver: local

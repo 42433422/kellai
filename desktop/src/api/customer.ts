@@ -1,0 +1,29 @@
+import api from './client';
+
+/** 获取客户 Pipeline 信息 */
+export const getCustomerPipeline = (customerId: number) =>
+  api.get(`/api/kellai/pipeline`, { params: { customer_id: customerId, auto_advance: true } });
+
+/** 获取客户 CRM 数据 */
+export const getCustomerCrm = (customerId: number) =>
+  api.get(`/api/kellai/crm`, { params: { customer_id: customerId } });
+
+/** 获取客户消息列表 */
+export const getCustomerMessages = (customerId: number, limit = 50) =>
+  api.get(`/api/kellai/messages`, { params: { customer_id: customerId, limit }, skipErrorToast: true });
+
+/** 获取客户 AI 画像 */
+export const getCustomerAiProfile = (customerId: number) =>
+  api.get(`/api/kellai/ai/profile/${customerId}`, { skipErrorToast: true });
+
+/** 发送消息 */
+export const sendMessage = (customerId: number, channelType: string, contactId: string, content: string) =>
+  api.post('/api/kellai/messages/send', { customer_id: customerId, channel_type: channelType, contact_id: contactId, content });
+
+/** AI 推荐回复 */
+export const suggestReply = (customerId: number, message: string, intent = '', stage = '') =>
+  api.post('/api/kellai/ai/suggest-reply', { customer_id: customerId, message, intent, stage });
+
+/** 更新 Pipeline 阶段 */
+export const updatePipelineStage = (customerId: number, stage: string, note = '') =>
+  api.post('/api/kellai/pipeline/stage', { customer_id: customerId, stage, note });

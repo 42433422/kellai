@@ -1,0 +1,262 @@
+@import "tailwindcss";
+
+/* Tailwind v4 暗色模式配置：通过自定义变量切换 */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* 暗色模式全局背景与文字颜色 */
+:root {
+  color-scheme: light;
+}
+:root.dark {
+  color-scheme: dark;
+}
+
+/* AI 助手对话消息淡入动画 */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fadeIn {
+  animation: fadeIn 0.3s ease-out;
+}
+
+/* 全局平滑过渡背景色 */
+html,
+body,
+#root {
+  height: 100%;
+  transition: background-color 0.2s ease;
+}
+
+/* 全局默认背景和文字颜色 */
+body {
+  background-color: #ffffff;
+  color: #111827;
+}
+
+.dark body {
+  background-color: #0f172a;
+  color: #e2e8f0;
+}
+
+/* ========== 新手教程：完全自动推进 → 隐藏所有导航按钮 ========== */
+/* 教程每一步都是自动的，用户不需要点「下一步」/「上一步」/「完成」 */
+/* 只保留右上角的 × 关闭按钮（driver.js 自动渲染的 .driver-popover-close-btn） */
+.driver-popover.kellai-tour-popover .driver-popover-next-btn,
+.driver-popover.kellai-tour-popover .driver-popover-prev-btn,
+.driver-popover.kellai-tour-popover .driver-popover-done-btn,
+.driver-popover.kellai-tour-popover .driver-popover-arrows,
+.driver-popover.kellai-tour-popover .driver-popover-footer .driver-popover-btn-group {
+  display: none !important;
+}
+/* 关闭按钮要显眼 */
+.driver-popover.kellai-tour-popover .driver-popover-close-btn {
+  width: 28px !important;
+  height: 28px !important;
+  font-size: 20px !important;
+  background: rgba(239, 68, 68, 0.1) !important;
+  color: #ef4444 !important;
+  border-radius: 6px !important;
+  top: 8px !important;
+  right: 8px !important;
+}
+.driver-popover.kellai-tour-popover .driver-popover-close-btn:hover {
+  background: rgba(239, 68, 68, 0.2) !important;
+}
+/* 标题居中、加点 emoji 装饰 */
+.driver-popover.kellai-tour-popover .driver-popover-title {
+  font-size: 16px !important;
+  font-weight: 700 !important;
+  text-align: center !important;
+  padding-right: 24px !important;
+}
+/* 描述里加进度条感觉 */
+.driver-popover.kellai-tour-popover .driver-popover-description {
+  font-size: 13px !important;
+  line-height: 1.6 !important;
+  margin: 8px 0 0 !important;
+  color: #475569 !important;
+}
+:where(.dark) .driver-popover.kellai-tour-popover .driver-popover-description {
+  color: #cbd5e1 !important;
+}
+
+/* ========== 新手教程气泡（driver.js popover 自定义样式） ========== */
+.driver-popover.kellai-tour-popover {
+  background: #ffffff;
+  color: #0f172a;
+  border-radius: 14px;
+  box-shadow:
+    0 20px 50px -10px rgba(15, 23, 42, 0.28),
+    0 8px 20px -5px rgba(15, 23, 42, 0.15);
+  border: 1px solid rgba(15, 23, 42, 0.06);
+  max-width: 360px;
+  font-family: inherit;
+  padding: 20px 22px 18px;
+  line-height: 1.55;
+}
+
+.driver-popover.kellai-tour-popover .driver-popover-title {
+  font-size: 17px;
+  font-weight: 700;
+  color: #0f172a;
+  margin: 0 0 8px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.driver-popover.kellai-tour-popover .driver-popover-description {
+  font-size: 13.5px;
+  color: #475569;
+  margin: 0 0 18px;
+  padding: 0;
+}
+
+.driver-popover.kellai-tour-popover .driver-popover-description b {
+  color: #1e293b;
+  font-weight: 600;
+}
+
+.driver-popover.kellai-tour-popover .driver-popover-description kbd {
+  display: inline-block;
+  background: #f1f5f9;
+  border: 1px solid #e2e8f0;
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 11.5px;
+  color: #475569;
+  margin: 0 1px;
+}
+
+.driver-popover.kellai-tour-popover .driver-popover-progress-text {
+  font-size: 12px;
+  color: #94a3b8;
+}
+
+.driver-popover.kellai-tour-popover .driver-popover-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+}
+
+.driver-popover.kellai-tour-popover .driver-popover-navigation-btns {
+  display: flex;
+  gap: 6px;
+  flex: 1;
+  justify-content: flex-end;
+}
+
+.driver-popover.kellai-tour-popover button {
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  border-radius: 8px;
+  padding: 7px 14px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  line-height: 1.2;
+}
+
+.driver-popover.kellai-tour-popover .driver-popover-next-btn {
+  background: linear-gradient(135deg, #3b82f6 0%, #4f46e5 100%);
+  color: #ffffff;
+  border-color: transparent;
+  box-shadow: 0 2px 6px -1px rgba(59, 130, 246, 0.35);
+}
+
+.driver-popover.kellai-tour-popover .driver-popover-next-btn:hover {
+  filter: brightness(1.08);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 10px -1px rgba(59, 130, 246, 0.45);
+}
+
+.driver-popover.kellai-tour-popover .driver-popover-prev-btn {
+  background: #f1f5f9;
+  color: #475569;
+  border-color: #e2e8f0;
+}
+
+.driver-popover.kellai-tour-popover .driver-popover-prev-btn:hover {
+  background: #e2e8f0;
+  color: #0f172a;
+}
+
+.driver-popover.kellai-tour-popover .driver-popover-close-btn {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  background: transparent;
+  color: #94a3b8;
+  padding: 4px;
+  border: none;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  transition: all 0.15s;
+}
+
+.driver-popover.kellai-tour-popover .driver-popover-close-btn:hover {
+  background: #f1f5f9;
+  color: #475569;
+}
+
+.driver-popover.kellai-tour-popover .driver-popover-arrow {
+  border-color: #ffffff;
+}
+
+.driver-popover.kellai-tour-popover .driver-popover-arrow-side-top.driver-popover-arrow {
+  border-top-color: #ffffff;
+}
+
+/* 高亮区域的圆角 + 微阴影 */
+#driver-highlight-element {
+  border-radius: 12px;
+  box-shadow:
+    0 0 0 4px rgba(59, 130, 246, 0.45),
+    0 12px 32px -8px rgba(59, 130, 246, 0.35),
+    0 0 0 9999px rgba(15, 23, 42, 0.04);
+}
+
+/* ========== 教程模式 = 围观模式 ==========*/
+/* 蒙版 (driver-overlay / driver-stage) 拦住所有点击，用户不能操作页面。
+ * 只能通过 popover 里的 × / ⏸ / ⏭ / CTA 按钮控制。
+ * popover 单独保持 pointer-events: auto，确保这些控制按钮可点。 */
+.driver-popover {
+  pointer-events: auto !important;
+}
+
+/* 教程激活时：全站除 driver 浮层以外的内容一律 pointer-events: none。
+ * 这样即便 popover stage cutout（高亮元素）下方有可点区域，用户也戳不到。
+ * 启动时给 <body> 加 .tutorial-active，结束 / 跳过时移除。 */
+body.tutorial-active * {
+  pointer-events: none !important;
+}
+body.tutorial-active .driver-popover,
+body.tutorial-active .driver-popover * {
+  pointer-events: auto !important;
+}
+/* driver.js 自己的 overlay / stage 也要保持可点（让 overlayClickBehavior 走 no-op） */
+body.tutorial-active .driver-overlay,
+body.tutorial-active .driver-overlay * {
+  pointer-events: auto !important;
+}

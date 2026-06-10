@@ -1,0 +1,52 @@
+# Dependencies
+node_modules/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Build output
+desktop/dist/
+
+# Environment
+.env
+.env.local
+.env.*.local
+!.env.example
+!.env.production
+
+# Data (local SQLite)
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Debug
+.dbg/
+debug-*.md
+
+# Tauri build
+desktop/src-tauri/target/
+
+# Vercel
+.vercel/
+
+# Python
+.pytest_cache/
+*.pyc
+
+# Trae specs
+.trae/
+
+# Scripts temp
+scripts/
