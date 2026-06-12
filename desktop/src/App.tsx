@@ -1,5 +1,5 @@
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
-import { useEffect, useState } from "react";
+import { useEffect, useState, lazy, Suspense } from "react";
 import Layout from "./components/Layout";
 import Login from "./pages/Login";
 import Dashboard from "./pages/Dashboard";
@@ -8,38 +8,54 @@ import Messages from "./pages/Messages";
 import CustomerDetail from "./pages/CustomerDetail";
 import AIAssistant from "./pages/AIAssistant";
 import Settings from "./pages/Settings";
+import SalesFlow from "./pages/SalesFlow";
+import Performance from "./pages/Performance";
+import ContentStudio from "./pages/ContentStudio";
+import ContentAnalytics from "./pages/ContentAnalytics";
+import ScoutHunter from "./pages/ScoutHunter";
+import SentimentMonitor from "./pages/SentimentMonitor";
+import FlowMonitor from "./pages/FlowMonitor";
+import TemplateMarket from "./pages/TemplateMarket";
+import FinanceDashboard from "./pages/FinanceDashboard";
+import FinanceAI from "./pages/FinanceAI";
+import PerformanceBoard from "./pages/PerformanceBoard";
+import OpenPlatform from "./pages/OpenPlatform";
+import PluginMarket from "./pages/PluginMarket";
+import DeveloperPortal from "./pages/DeveloperPortal";
+import AppBuilder from "./pages/AppBuilder";
+import APIDocs from "./pages/APIDocs";
 import ErrorBoundary from "./components/ErrorBoundary";
+import Loading from "./components/Loading";
 import { useAuthStore } from "./stores/auth";
 import { useThemeStore } from "./stores/theme";
 import { useMessageStore } from "./stores/message";
-import {
-  useOnboardingStore,
-} from "./stores/onboarding";
+import { useOnboardingStore } from "./stores/onboarding";
+import { useSalesStore } from "./stores/salesStore";
+import { useFinanceStore } from "./stores/financeStore";
+import { useOpenPlatformStore } from "./stores/openPlatformStore";
 import { Loader2, Users } from "lucide-react";
 
-/** 认证守卫：未登录时重定向到登录页 */
+const FlowDesigner = lazy(() => import("./pages/FlowDesigner"));
+
 function AuthGuard({ children }: { children: React.ReactNode }) {
   const { isAuthenticated, loadFromStorage, user } = useAuthStore();
   const loadOnboarding = useOnboardingStore((s) => s.loadForUser);
+  const loadSales = useSalesStore((s) => s.loadFromStorage);
+  const loadFinance = useFinanceStore((s) => s.loadFromStorage);
+  const loadOpen = useOpenPlatformStore((s) => s.loadFromStorage);
 
   useEffect(() => {
     loadFromStorage();
   }, [loadFromStorage]);
 
-  // 首次登录后：把当前用户的教程状态加载到 store
   useEffect(() => {
     if (isAuthenticated && user?.id) {
       loadOnboarding(String(user.id));
+      loadSales();
+      loadFinance();
+      loadOpen();
     }
-  }, [isAuthenticated, user?.id, loadOnboarding]);
-
-  // 加载完成后：若状态为 not_started，自动弹出教程
-  useEffect(() => {
-    if (!isAuthenticated) return;
-    // 首次登录自动显示启动面板（不再是直接启动教程）
-    // 用户点"开始"才会真正进教程，点"跳过"则标记为已完成
-    // 教程启动在 OnboardingStartPanel 里处理
-  }, [isAuthenticated]);
+  }, [isAuthenticated, user?.id, loadOnboarding, loadSales, loadFinance, loadOpen]);
 
   if (!isAuthenticated) {
     return <Navigate to="/login" replace />;
@@ -48,14 +64,6 @@ function AuthGuard({ children }: { children: React.ReactNode }) {
   return <>{children}</>;
 }
 
-/**
- * 启动期：根据"7 天免登录"凭据自动登录。
- *
- * 状态机：
- *   - idle：尚未尝试
- *   - trying：正在用保存的密码静默登录
- *   - done：已结束（成功 or 失败），由 Router 接管
- */
 function AuthBootstrap({ children }: { children: React.ReactNode }) {
   const loadFromStorage = useAuthStore((s) => s.loadFromStorage);
   const attemptSilentAutoLogin = useAuthStore((s) => s.attemptSilentAutoLogin);
@@ -65,24 +73,19 @@ function AuthBootstrap({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      // 1) 优先看 localStorage 里的 token（用户上次没登出）
       loadFromStorage();
       if (cancelled) return;
       if (useAuthStore.getState().isAuthenticated) {
         setPhase("done");
         return;
       }
-      // 2) 没有 token，但可能有"7 天免登录"凭据
       setPhase("trying");
       await attemptSilentAutoLogin();
       if (!cancelled) setPhase("done");
     })();
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, [loadFromStorage, attemptSilentAutoLogin]);
 
-  // 启动期：短暂显示"启动中"遮罩；只显示一次（phase==trying 时）
   if (phase === "trying" && !isAuthenticated) {
     return (
       <div className="flex h-screen items-center justify-center bg-gray-50">
@@ -97,8 +100,6 @@ function AuthBootstrap({ children }: { children: React.ReactNode }) {
   return <>{children}</>;
 }
 
-/** 消息未读轮询桥接：登录后启动轮询，登出时清理。
- *  仅做"挂载即订阅、卸载即清理"，不直接渲染 DOM。 */
 function MessagePollingBridge() {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
   const startPolling = useMessageStore((s) => s.startPolling);
@@ -118,7 +119,6 @@ function MessagePollingBridge() {
   return null;
 }
 
-/** 占位页面组件 */
 function PlaceholderPage({
   title,
   icon: Icon,
@@ -141,7 +141,6 @@ function PlaceholderPage({
   );
 }
 
-/** 主题初始化组件：挂载时从 localStorage 恢复主题并订阅系统变化 */
 function ThemeBootstrap({ children }: { children: React.ReactNode }) {
   const loadFromStorage = useThemeStore((s) => s.loadFromStorage);
   const initSystemListener = useThemeStore((s) => s.initSystemListener);
@@ -155,6 +154,10 @@ function ThemeBootstrap({ children }: { children: React.ReactNode }) {
   return <>{children}</>;
 }
 
+function Page({ children }: { children: React.ReactNode }) {
+  return <ErrorBoundary>{children}</ErrorBoundary>;
+}
+
 export default function App() {
   return (
     <ThemeBootstrap>
@@ -162,10 +165,7 @@ export default function App() {
         <MessagePollingBridge />
         <BrowserRouter>
           <Routes>
-            {/* 登录页 */}
             <Route path="/login" element={<Login />} />
-
-            {/* 需要认证的页面 - ErrorBoundary 包在 Layout 外面但 Route 里面 */}
             <Route
               path="/"
               element={
@@ -174,17 +174,37 @@ export default function App() {
                 </AuthGuard>
               }
             >
-              {/* 工作台 - 每个页面独立 ErrorBoundary，避免一个页面崩溃影响全局 */}
-              <Route index element={<ErrorBoundary><Dashboard /></ErrorBoundary>} />
-              <Route path="funnel" element={<ErrorBoundary><Funnel /></ErrorBoundary>} />
-              <Route path="messages" element={<ErrorBoundary><Messages /></ErrorBoundary>} />
-              <Route path="customers/:id" element={<ErrorBoundary><CustomerDetail /></ErrorBoundary>} />
-              <Route path="customers" element={<ErrorBoundary><PlaceholderPage title="客户管理" icon={Users} description="客户信息管理、标签分组、跟进记录，功能开发中..." /></ErrorBoundary>} />
-              <Route path="ai" element={<ErrorBoundary><AIAssistant /></ErrorBoundary>} />
-              <Route path="settings" element={<ErrorBoundary><Settings /></ErrorBoundary>} />
+              <Route index element={<Page><Dashboard /></Page>} />
+              <Route path="funnel" element={<Page><Funnel /></Page>} />
+              <Route path="messages" element={<Page><Messages /></Page>} />
+              <Route path="customers/:id" element={<Page><CustomerDetail /></Page>} />
+              <Route path="customers" element={<Page><PlaceholderPage title="客户管理" icon={Users} description="客户信息管理、标签分组、跟进记录，功能开发中..." /></Page>} />
+              <Route path="ai" element={<Page><AIAssistant /></Page>} />
+              <Route path="settings" element={<Page><Settings /></Page>} />
+              {/* v3 Sales */}
+              <Route path="sales/flow" element={<Page><SalesFlow /></Page>} />
+              <Route path="sales/performance" element={<Page><Performance /></Page>} />
+              {/* v4 Content */}
+              <Route path="content/studio" element={<Page><ContentStudio /></Page>} />
+              <Route path="content/analytics" element={<Page><ContentAnalytics /></Page>} />
+              {/* v5 Scout */}
+              <Route path="scout/hunter" element={<Page><ScoutHunter /></Page>} />
+              <Route path="scout/sentiment" element={<Page><SentimentMonitor /></Page>} />
+              {/* v6 Flow */}
+              <Route path="flow/designer" element={<Page><Suspense fallback={<Loading />}><FlowDesigner /></Suspense></Page>} />
+              <Route path="flow/monitor" element={<Page><FlowMonitor /></Page>} />
+              <Route path="flow/templates" element={<Page><TemplateMarket /></Page>} />
+              {/* v7 Finance */}
+              <Route path="finance/dashboard" element={<Page><FinanceDashboard /></Page>} />
+              <Route path="finance/ai" element={<Page><FinanceAI /></Page>} />
+              <Route path="finance/performance" element={<Page><PerformanceBoard /></Page>} />
+              {/* v8 Open */}
+              <Route path="open" element={<Page><OpenPlatform /></Page>} />
+              <Route path="open/plugins" element={<Page><PluginMarket /></Page>} />
+              <Route path="open/developer" element={<Page><DeveloperPortal /></Page>} />
+              <Route path="open/app-builder" element={<Page><AppBuilder /></Page>} />
+              <Route path="open/docs" element={<Page><APIDocs /></Page>} />
             </Route>
-
-            {/* 404 兜底 */}
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </BrowserRouter>

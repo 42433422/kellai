@@ -28,6 +28,7 @@
  */
 
 import type { AxiosAdapter, AxiosResponse, InternalAxiosRequestConfig } from 'axios';
+import { handleExtendedRoutes } from './mockRouter';
 import {
   MOCK_CUSTOMERS,
   getMockFunnelStages,
@@ -538,6 +539,10 @@ export const mockAdapter: AxiosAdapter = async (config) => {
       },
     });
   }
+
+  /* ----- v3-v8 扩展端点 ----- */
+  const extended = await handleExtendedRoutes(config, method, url, params, data);
+  if (extended) return extended;
 
   /* ----- 兜底：mock 模式下走真请求会报错，便于发现漏配 ----- */
   console.warn('[mock] 未覆盖的接口:', method.toUpperCase(), url, data || params);

@@ -383,3 +383,394 @@ export interface PaginatedResponse<T> {
   page: number;
   pageSize: number;
 }
+
+// === v3 Sales ===
+export type SalesFlowStep = 'requirement' | 'proposal' | 'promotion' | 'signing';
+export type SalesFlowStatus = 'idle' | 'running' | 'completed' | 'failed';
+export type ContractStatus = 'draft' | 'pending_sign' | 'signed' | 'cancelled';
+
+export interface SalesFlow {
+  id: string;
+  customer_id: number;
+  customer_name: string;
+  current_step: SalesFlowStep;
+  status: SalesFlowStatus;
+  started_at: string;
+  updated_at: string;
+  steps_completed: SalesFlowStep[];
+}
+
+export interface QuoteItem {
+  name: string;
+  quantity: number;
+  unit_price: number;
+  total: number;
+}
+
+export interface QuoteRequest {
+  customer_id: number;
+  industry?: string;
+  scale?: string;
+}
+
+export interface Quote {
+  id: string;
+  customer_id: number;
+  items: QuoteItem[];
+  subtotal: number;
+  discount: number;
+  total: number;
+  valid_until: string;
+  created_at: string;
+}
+
+export interface Contract {
+  id: string;
+  customer_id: number;
+  quote_id: string;
+  status: ContractStatus;
+  title: string;
+  content_preview: string;
+  sign_url?: string;
+  created_at: string;
+}
+
+export interface LTVForecast {
+  customer_id: number;
+  predicted_ltv: number;
+  confidence: number;
+  factors: { name: string; impact: number }[];
+  recommendation: string;
+}
+
+export interface GoalBreakdown {
+  period: string;
+  target: number;
+  actual: number;
+  progress: number;
+}
+
+export interface PerformanceGoal {
+  id: string;
+  title: string;
+  target: number;
+  actual: number;
+  unit: string;
+  breakdown: GoalBreakdown[];
+}
+
+export interface SalesPerformance {
+  period: string;
+  revenue_target: number;
+  revenue_actual: number;
+  completion_rate: number;
+  deals_closed: number;
+  avg_deal_size: number;
+  goals: PerformanceGoal[];
+}
+
+export interface AttributionChannel {
+  channel: string;
+  channel_label: string;
+  leads: number;
+  conversions: number;
+  revenue: number;
+  contribution_pct: number;
+}
+
+export interface AttributionReport {
+  date_range: string;
+  channels: AttributionChannel[];
+  total_revenue: number;
+}
+
+export interface FunnelTraceNode {
+  stage: string;
+  stage_label: string;
+  timestamp: string;
+  duration_hours?: number;
+}
+
+export interface FunnelTraceEdge {
+  from_stage: string;
+  to_stage: string;
+  conversion_rate: number;
+}
+
+export interface FunnelTrace {
+  customer_id?: number;
+  nodes: FunnelTraceNode[];
+  edges: FunnelTraceEdge[];
+  overall_conversion: number;
+}
+
+export interface SalesScriptHint {
+  customer_id: number;
+  stage: string;
+  stage_label: string;
+  suggestion: string;
+  scripts: string[];
+}
+
+// === v4 Content ===
+export type ContentType = 'text' | 'image' | 'video_script';
+export type ContentStatus = 'draft' | 'published' | 'scheduled';
+
+export interface Content {
+  id: string;
+  type: ContentType;
+  title: string;
+  body: string;
+  image_url?: string;
+  status: ContentStatus;
+  platforms: string[];
+  created_at: string;
+  published_at?: string;
+}
+
+export interface AdStrategy {
+  recommended_channels: { channel: string; label: string; score: number; best_hours: string[] }[];
+  budget_split: { channel: string; pct: number }[];
+  reasoning: string;
+}
+
+export interface ContentAnalyticsItem {
+  content_id: string;
+  title: string;
+  platform: string;
+  views: number;
+  likes: number;
+  shares: number;
+  conversions: number;
+  ctr: number;
+}
+
+export interface ContentAnalytics {
+  items: ContentAnalyticsItem[];
+  totals: { views: number; likes: number; conversions: number };
+}
+
+export interface ABTestVariant {
+  id: string;
+  name: string;
+  content: string;
+  views: number;
+  conversions: number;
+  win_rate: number;
+}
+
+export interface ABTest {
+  id: string;
+  name: string;
+  status: 'running' | 'completed';
+  variants: ABTestVariant[];
+  winner_id?: string;
+}
+
+// === v5 Scout ===
+export interface ScoutTarget {
+  id: string;
+  platform: string;
+  post_title: string;
+  comment: string;
+  author: string;
+  intent_score: number;
+  intent_level: 'high' | 'medium' | 'low';
+  reason: string;
+  scanned_at: string;
+}
+
+export interface IntentScore {
+  comment: string;
+  score: number;
+  level: 'high' | 'medium' | 'low';
+  keywords: string[];
+  reason: string;
+}
+
+export interface SentimentItem {
+  id: string;
+  type: 'hotspot' | 'competitor' | 'opportunity';
+  title: string;
+  summary: string;
+  severity: 'high' | 'medium' | 'low';
+  timestamp: string;
+}
+
+export interface ScoutTrace {
+  target_id: string;
+  steps: { action: string; timestamp: string; result: string }[];
+  converted: boolean;
+}
+
+// === v6 Flow ===
+export type FlowNodeType = 'acquire' | 'communicate' | 'sales' | 'after_sales' | 'webhook';
+
+export interface FlowNode {
+  id: string;
+  type: FlowNodeType;
+  label: string;
+  config: Record<string, unknown>;
+  position: { x: number; y: number };
+}
+
+export interface FlowEdge {
+  id: string;
+  source: string;
+  target: string;
+}
+
+export interface FlowTemplate {
+  id: string;
+  name: string;
+  industry: string;
+  description: string;
+  nodes: FlowNode[];
+  edges: FlowEdge[];
+  automation_rate: number;
+}
+
+export interface FlowExecution {
+  id: string;
+  flow_id: string;
+  flow_name: string;
+  status: 'running' | 'completed' | 'failed';
+  started_at: string;
+  completed_at?: string;
+  logs: { node_id: string; message: string; timestamp: string }[];
+}
+
+export interface Anomaly {
+  id: string;
+  flow_id: string;
+  node_id: string;
+  severity: 'critical' | 'warning';
+  message: string;
+  suggestion: string;
+  detected_at: string;
+}
+
+export interface Webhook {
+  id: string;
+  url: string;
+  events: string[];
+  enabled: boolean;
+  created_at: string;
+}
+
+export interface FlowDefinition {
+  id: string;
+  name: string;
+  nodes: FlowNode[];
+  edges: FlowEdge[];
+  created_at: string;
+  updated_at: string;
+}
+
+// === v7 Finance ===
+export interface FinanceDashboardData {
+  revenue: number;
+  cost: number;
+  profit: number;
+  profit_margin: number;
+  channel_breakdown: { channel: string; revenue: number; cost: number; profit: number }[];
+  monthly_trend: { month: string; revenue: number; cost: number; profit: number }[];
+}
+
+export interface BudgetSuggestion {
+  total_budget: number;
+  allocations: { channel: string; amount: number; roi: number; reason: string }[];
+}
+
+export interface FinancePerformanceMember {
+  user_id: number;
+  name: string;
+  revenue: number;
+  deals: number;
+  conversion_rate: number;
+  rank: number;
+}
+
+export interface FinanceAlert {
+  id: string;
+  type: 'cost_overrun' | 'profit_drop' | 'channel_anomaly';
+  severity: 'high' | 'medium' | 'low';
+  title: string;
+  message: string;
+  timestamp: string;
+  read: boolean;
+}
+
+export interface FinanceReport {
+  id: string;
+  title: string;
+  period: string;
+  generated_at: string;
+  download_url: string;
+}
+
+export interface DecisionAdvice {
+  summary: string;
+  actions: { title: string; description: string; priority: 'high' | 'medium' | 'low' }[];
+}
+
+// === v8 Open Platform ===
+export interface APIKey {
+  id: string;
+  name: string;
+  key_prefix: string;
+  scopes: string[];
+  created_at: string;
+  last_used_at?: string;
+}
+
+export interface Plugin {
+  id: string;
+  name: string;
+  description: string;
+  author: string;
+  category: string;
+  rating: number;
+  installs: number;
+  price: number;
+  installed: boolean;
+}
+
+export interface ISVPartner {
+  id: string;
+  name: string;
+  tier: 'gold' | 'silver' | 'bronze';
+  solutions: number;
+  certified: boolean;
+}
+
+export interface WebhookConfig {
+  id: string;
+  url: string;
+  events: string[];
+  secret: string;
+  active: boolean;
+}
+
+export interface EventSubscription {
+  id: string;
+  event_type: string;
+  description: string;
+  subscribed: boolean;
+}
+
+export interface AppTemplate {
+  id: string;
+  name: string;
+  description: string;
+  fields: { key: string; label: string; type: string }[];
+}
+
+export interface ReviewStatus {
+  app_id: string;
+  app_name: string;
+  status: 'pending' | 'approved' | 'rejected';
+  submitted_at: string;
+  reviewed_at?: string;
+  feedback?: string;
+}

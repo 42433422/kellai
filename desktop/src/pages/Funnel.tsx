@@ -1,9 +1,12 @@
 import { useState, useCallback, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Search, Filter, Phone, MessageCircle, Video, Smartphone } from 'lucide-react';
+import { Search, Filter, LayoutGrid, GitBranch } from 'lucide-react';
 import { clsx } from 'clsx';
-import type { FunnelStage, ClientSummary } from '../types';
+import ChannelLogo from '../components/ChannelLogo';
+import SimpleBarChart from '../components/SimpleBarChart';
+import type { FunnelStage, ClientSummary, FunnelTrace } from '../types';
 import { getFunnelData, updatePipelineStage } from '../api/funnel';
+import { getFunnelTrace } from '../api/sales';
 import { useApiQuery, useApiMutation, useQueryClient } from '../hooks/useApiQuery';
 import { toastStore } from '../stores/toast';
 
@@ -22,11 +25,21 @@ const STAGE_ORDER = [
 ];
 
 /** 渠道来源图标映射 */
-const CHANNEL_ICONS: Record<string, { icon: typeof Phone; label: string }> = {
-  wework: { icon: MessageCircle, label: '企微' },
-  phone: { icon: Phone, label: '电话' },
-  douyin: { icon: Video, label: '抖音' },
-  miniapp: { icon: Smartphone, label: '小程序' },
+const CHANNEL_ICONS: Record<string, { label: string }> = {
+  wework: { label: '企微' },
+  phone: { label: '电话' },
+  douyin: { label: '抖音' },
+  miniapp: { label: '小程序' },
+  pdd: { label: '拼多多' },
+  taobao: { label: '淘宝' },
+  jd: { label: '京东' },
+  alibaba: { label: '1688' },
+  whatsapp: { label: 'WhatsApp' },
+  telegram: { label: 'Telegram' },
+  line: { label: 'LINE' },
+  email: { label: '邮件' },
+  sms: { label: '短信' },
+  web: { label: '网页' },
 };
 
 /** AI 评分颜色类名：红→黄→绿 */
@@ -142,10 +155,9 @@ function DraggableClientCard({ client }: { client: ClientSummary }) {
           {client.channel_sources?.slice(0, 3).map((ch) => {
             const chInfo = CHANNEL_ICONS[ch];
             if (!chInfo) return null;
-            const Icon = chInfo.icon;
             return (
               <span key={ch} title={chInfo.label} className="text-gray-400 hover:text-gray-600 dark:text-slate-500 dark:hover:text-slate-300">
-                <Icon className="h-3 w-3" />
+                <ChannelLogo type={ch} size={12} />
               </span>
             );
           })}
@@ -171,6 +183,7 @@ function DraggableClientCard({ client }: { client: ClientSummary }) {
  */
 export default function Funnel() {
   const queryClient = useQueryClient();
+  const [viewMode, setViewMode] = useState<'board' | 'trace'>('board');
   const [searchText, setSearchText] = useState('');
   const [channelFilter, setChannelFilter] = useState('');
   const [scoreFilter, setScoreFilter] = useState('');
@@ -212,6 +225,12 @@ export default function Funnel() {
       // 失败时也使用空结构，不抛错
       retry: false,
     }
+  );
+
+  const traceQuery = useApiQuery<FunnelTrace>(
+    ['sales', 'funnel-trace'],
+    () => getFunnelTrace(),
+    { enabled: viewMode === 'trace' }
   );
 
   /* ---- React Query Mutation：更新客户阶段 ---- */
@@ -333,6 +352,56 @@ export default function Funnel() {
 
   return (
     <div className="flex h-full flex-col">
+      {/* 视图切换 */}
+      <div className="mb-4 flex gap-2">
+        <button
+          type="button"
+          onClick={() => setViewMode('board')}
+          className={clsx(
+            'flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium',
+            viewMode === 'board' ? 'bg-blue-600 text-white' : 'bg-white text-gray-600 dark:bg-slate-800 dark:text-slate-300'
+          )}
+        >
+          <LayoutGrid className="h-4 w-4" /> 看板视图
+        </button>
+        <button
+          type="button"
+          onClick={() => setViewMode('trace')}
+          className={clsx(
+            'flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium',
+            viewMode === 'trace' ? 'bg-blue-600 text-white' : 'bg-white text-gray-600 dark:bg-slate-800 dark:text-slate-300'
+          )}
+        >
+          <GitBranch className="h-4 w-4" /> 全链路追踪
+        </button>
+      </div>
+
+      {viewMode === 'trace' && traceQuery.data && (
+        <div className="mb-4 rounded-xl border border-gray-200 bg-white p-6 dark:border-slate-700 dark:bg-slate-800">
+          <h3 className="mb-4 font-semibold">线索到成交全链路 · 整体转化率 {traceQuery.data.overall_conversion}%</h3>
+          <div className="mb-6 flex flex-wrap gap-4">
+            {traceQuery.data.nodes.map((n, i) => (
+              <div key={n.stage} className="flex items-center gap-2">
+                <div className="rounded-lg bg-blue-50 px-3 py-2 text-sm dark:bg-blue-500/20">
+                  <p className="font-medium">{n.stage_label}</p>
+                  <p className="text-xs text-gray-500">{new Date(n.timestamp).toLocaleDateString('zh-CN')}</p>
+                </div>
+                {i < traceQuery.data!.nodes.length - 1 && <span className="text-gray-400">→</span>}
+              </div>
+            ))}
+          </div>
+          <SimpleBarChart
+            items={traceQuery.data.edges.map((e) => ({
+              label: `${e.from_stage} → ${e.to_stage}`,
+              value: e.conversion_rate,
+            }))}
+            unit="%"
+          />
+        </div>
+      )}
+
+      {viewMode === 'board' && (
+      <>
       {/* 搜索与筛选栏 */}
       <div className="mb-4 flex items-center gap-3">
         {/* 搜索框 */}
@@ -429,6 +498,8 @@ export default function Funnel() {
               })}
         </div>
       </div>
+      </>
+      )}
     </div>
   );
 }

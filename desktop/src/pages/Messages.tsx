@@ -3,9 +3,6 @@ import {
   Search,
   Send,
   MessageCircle,
-  Phone,
-  Mail,
-  Smartphone,
   Sparkles,
   Bot,
   X,
@@ -13,10 +10,15 @@ import {
   ChevronRight,
 } from 'lucide-react';
 import { clsx } from 'clsx';
+import ChannelLogo, { CHANNEL_BRAND_COLOR } from '../components/ChannelLogo';
 import { getMessages, sendMessage, suggestReply, getChannels } from '../api/messages';
+import { getScriptHint } from '../api/sales';
 import { useApiQuery, useApiMutation, useQueryClient } from '../hooks/useApiQuery';
 import { useMessageStore } from '../stores/message';
+import { useSalesStore } from '../stores/salesStore';
+import ScriptHintToast from '../components/ScriptHintToast';
 import { unwrapApiResponse } from '../utils/format';
+import type { SalesScriptHint } from '../types';
 
 /** 消息项（API 返回） */
 interface MessageItem {
@@ -53,14 +55,6 @@ interface ChannelItem {
   name: string;
   type: string;
 }
-
-/** 渠道类型配置 */
-const CHANNEL_CONFIG: Record<string, { icon: typeof MessageCircle; label: string; color: string }> = {
-  wework: { icon: MessageCircle, label: '企微', color: 'text-blue-500' },
-  sms: { icon: Smartphone, label: '短信', color: 'text-orange-500' },
-  email: { icon: Mail, label: '邮件', color: 'text-purple-500' },
-  phone: { icon: Phone, label: '电话', color: 'text-cyan-500' },
-};
 
 /** 阶段标签颜色映射（与 Dashboard/Format 统一） */
 const STAGE_COLORS: Record<string, string> = {
@@ -192,13 +186,12 @@ function formatTime(dateStr: string): string {
   return `${date.getMonth() + 1}/${date.getDate()}`;
 }
 
-/** 获取渠道图标 */
-function ChannelIcon({ type, className }: { type: string; className?: string }) {
-  const config = CHANNEL_CONFIG[type];
-  if (!config) return <MessageCircle className={className} />;
-  const Icon = config.icon;
-  return <Icon className={clsx(className, config.color)} />;
-}
+/** 渠道名称映射 */
+const CHANNEL_LABEL: Record<string, string> = {
+  wework: '企微', sms: '短信', email: '邮件', phone: '电话',
+  douyin: '抖音', miniprogram: '小程序', pdd: '拼多多', taobao: '淘宝',
+  jd: '京东', alibaba: '1688', whatsapp: 'WhatsApp', telegram: 'Telegram', line: 'LINE',
+};
 
 /** 消息按客户聚合成分组列表 */
 function groupMessagesByCustomer(messages: MessageItem[]): ContactGroup[] {
@@ -262,6 +255,10 @@ export default function Messages() {
 
   // 推荐话术浮层
   const [showQuickReplies, setShowQuickReplies] = useState(false);
+  const [scriptHint, setScriptHint] = useState<SalesScriptHint | null>(null);
+  const scriptHintsEnabled = useSalesStore((s) => s.scriptHintsEnabled);
+
+  const SALES_STAGES = ['quoted', 'negotiating', 'pending_sign', 'proposal'];
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -370,6 +367,16 @@ export default function Messages() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [selectedContactId]);
+
+  /** 销售关键节点话术提示 */
+  useEffect(() => {
+    if (!scriptHintsEnabled || !selectedContact) return;
+    const lastMsg = selectedContact.messages[selectedContact.messages.length - 1];
+    if (!lastMsg || lastMsg.direction !== 'inbound') return;
+    const stage = lastMsg.ai_intent ?? 'quoted';
+    if (!SALES_STAGES.includes(stage)) return;
+    getScriptHint(selectedContact.customerId, stage).then(setScriptHint).catch(() => {});
+  }, [selectedContact, scriptHintsEnabled]);
 
   /** 发送消息 */
   const handleSend = useCallback(() => {
@@ -505,22 +512,22 @@ export default function Messages() {
                       : 'hover:bg-gray-100 dark:hover:bg-slate-700/50'
                   )}
                 >
-                  {/* 头像（首字母圆形） */}
+                  {/* 头像（渠道 Logo） */}
                   <div className="relative shrink-0">
                     <div
                       className={clsx(
-                        'flex h-10 w-10 items-center justify-center rounded-full text-sm font-medium text-white',
+                        'flex h-10 w-10 items-center justify-center rounded-full',
                         selectedContactId === contact.customerId
-                          ? 'bg-blue-500'
-                          : 'bg-gradient-to-br from-indigo-400 to-blue-500'
+                          ? 'bg-blue-50 dark:bg-blue-500/20'
+                          : 'bg-gray-50 dark:bg-slate-700'
                       )}
                     >
-                      {(contact.customerName || '?').charAt(0)}
+                      <ChannelLogo type={cornerChannel ?? 'wework'} size={28} />
                     </div>
-                    {/* 渠道图标（最后一条消息所属渠道） */}
+                    {/* 渠道名称角标 */}
                     {cornerChannel && (
-                      <div className="absolute -bottom-0.5 -right-0.5 flex h-4 w-4 items-center justify-center rounded-full border border-white bg-white dark:border-slate-800 dark:bg-slate-800">
-                        <ChannelIcon type={cornerChannel} className="h-2.5 w-2.5" />
+                      <div className="absolute -bottom-1 -right-1 flex h-4 min-w-4 items-center justify-center rounded-full border border-white bg-white px-1 dark:border-slate-800 dark:bg-slate-800" style={{ fontSize: 9, fontWeight: 600, color: CHANNEL_BRAND_COLOR[cornerChannel] ?? '#6B7280' }}>
+                        {CHANNEL_LABEL[cornerChannel] ?? cornerChannel}
                       </div>
                     )}
                   </div>
@@ -596,11 +603,11 @@ export default function Messages() {
                   </div>
                   <div className="mt-0.5 flex items-center gap-1.5">
                     {selectedContact.channelTypes.map((ch) => {
-                      const config = CHANNEL_CONFIG[ch];
+                      const config = CHANNEL_LABEL[ch];
                       return (
                         <span key={ch} className="flex items-center gap-0.5 text-[10px] text-gray-400 dark:text-slate-500">
-                          <ChannelIcon type={ch} className="h-3 w-3" />
-                          {config?.label ?? ch}
+                          <ChannelLogo type={ch} size={12} />
+                          {config ?? ch}
                         </span>
                       );
                     })}
@@ -668,7 +675,7 @@ export default function Messages() {
                               isInbound ? 'justify-start' : 'justify-end'
                             )}
                           >
-                            <ChannelIcon type={msg.channel_type} className="h-3 w-3 text-gray-400 dark:text-slate-500" />
+                            <ChannelLogo type={msg.channel_type} size={12} />
                             {msg.ai_intent && (
                               <span
                                 className={clsx(
@@ -739,7 +746,7 @@ export default function Messages() {
                 >
                   {channelsRaw.length > 0
                     ? channelsRaw.filter((ch) => ch.type !== 'douyin' && ch.type !== 'web' && ch.type !== 'miniprogram').map((ch) => (
-                        <option key={ch.id} value={ch.type}>{CHANNEL_CONFIG[ch.type]?.label ?? ch.name}</option>
+                        <option key={ch.id} value={ch.type}>{CHANNEL_LABEL[ch.type] ?? ch.name}</option>
                       ))
                     : (
                         <>
@@ -856,14 +863,14 @@ export default function Messages() {
                 </div>
                 <div className="flex flex-wrap gap-1">
                   {selectedContact.channelTypes.map((ch) => {
-                    const config = CHANNEL_CONFIG[ch];
+                    const config = CHANNEL_LABEL[ch];
                     return (
                       <span
                         key={ch}
                         className="flex items-center gap-0.5 rounded bg-gray-100 px-1.5 py-0.5 text-[10px] text-gray-600 dark:bg-slate-700 dark:text-slate-300"
                       >
-                        <ChannelIcon type={ch} className="h-2.5 w-2.5" />
-                        {config?.label ?? ch}
+                        <ChannelLogo type={ch} size={10} />
+                        {config ?? ch}
                       </span>
                     );
                   })}
@@ -940,6 +947,15 @@ export default function Messages() {
           </div>
         </div>
       )}
+
+      <ScriptHintToast
+        hint={scriptHint}
+        onDismiss={() => setScriptHint(null)}
+        onUse={(text) => {
+          setInputText(text);
+          setScriptHint(null);
+        }}
+      />
     </div>
   );
 }

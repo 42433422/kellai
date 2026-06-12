@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api.routes import router
+from app.api import sales, content, scout, flow, finance, open as open_api
 
 # --- 日志基础配置 ---
 logging.basicConfig(
@@ -311,6 +312,12 @@ def create_app() -> FastAPI:
 
     # 路由
     app.include_router(router)
+    app.include_router(sales.router)
+    app.include_router(content.router)
+    app.include_router(scout.router)
+    app.include_router(flow.router)
+    app.include_router(finance.router)
+    app.include_router(open_api.router)
 
     @app.get("/health")
     def health():

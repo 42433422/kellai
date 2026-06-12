@@ -4,12 +4,6 @@ import {
   ArrowLeft,
   Send,
   Sparkles,
-  Phone,
-  Briefcase,
-  Mail,
-  Smartphone,
-  Globe,
-  Music,
   MessageSquare,
   ChevronDown,
   Clock,
@@ -24,6 +18,7 @@ import {
   AlertCircle,
 } from 'lucide-react';
 import { clsx } from 'clsx';
+import ChannelLogo from '../components/ChannelLogo';
 import type {
   CustomerPipeline,
   CustomerMessage,
@@ -40,6 +35,8 @@ import {
   suggestReply,
   updatePipelineStage,
 } from '../api/customer';
+import { getLTVForecast, generateQuote, startAutoFlow } from '../api/sales';
+import type { LTVForecast, Quote, SalesFlow } from '../types';
 import { formatTimeAgo, getChannelColor, unwrapApiResponse } from '../utils/format';
 
 /* ========== 常量 ========== */
@@ -57,17 +54,6 @@ const STAGE_OPTIONS = [
   { id: 'delivering', label: '交付中' },
   { id: 'delivered', label: '已交付' },
 ];
-
-/** 渠道图标映射 */
-const CHANNEL_ICON_MAP: Record<string, React.ElementType> = {
-  wework: Briefcase,
-  phone: Phone,
-  douyin: Music,
-  email: Mail,
-  sms: Smartphone,
-  web: Globe,
-  whatsapp: MessageSquare,
-};
 
 /** 渠道中文名映射 */
 const CHANNEL_LABEL_MAP: Record<string, string> = {
@@ -103,6 +89,7 @@ const URGENCY_LABEL: Record<string, string> = {
 /** Tab 定义 */
 const TABS = [
   { id: 'overview', label: '概览' },
+  { id: 'sales', label: '销售' },
   { id: 'timeline', label: '时间轴' },
   { id: 'intake', label: '需求表单' },
   { id: 'crm', label: 'CRM' },
@@ -113,9 +100,9 @@ type TabId = (typeof TABS)[number]['id'];
 
 /* ========== 工具函数 ========== */
 
-/** 获取渠道图标组件 */
-function getChannelIcon(type: string): React.ElementType {
-  return CHANNEL_ICON_MAP[type] ?? MessageSquare;
+/** 渠道 Logo 渲染 */
+function ChannelIconSmall({ type }: { type: string }) {
+  return <ChannelLogo type={type} size={16} />;
 }
 
 /** AI 评分颜色 */
@@ -189,6 +176,11 @@ export default function CustomerDetail() {
   const [updatingStage, setUpdatingStage] = useState(false);
   const [showStageSelect, setShowStageSelect] = useState(false);
 
+  // 销售 Tab 数据
+  const [ltvData, setLtvData] = useState<LTVForecast | null>(null);
+  const [salesQuote, setSalesQuote] = useState<Quote | null>(null);
+  const [salesFlow, setSalesFlow] = useState<SalesFlow | null>(null);
+
   // Toast
   const [toast, setToast] = useState({ message: '', visible: false });
 
@@ -240,6 +232,31 @@ export default function CustomerDetail() {
   useEffect(() => {
     loadCustomerData();
   }, [loadCustomerData]);
+
+  useEffect(() => {
+    if (!customerId || activeTab !== 'sales') return;
+    getLTVForecast(customerId).then(setLtvData).catch(() => {});
+  }, [customerId, activeTab]);
+
+  const handleStartSalesFlow = async () => {
+    try {
+      const flow = await startAutoFlow(customerId);
+      setSalesFlow(flow);
+      showToast('自动销售流程已启动');
+    } catch {
+      showToast('启动失败');
+    }
+  };
+
+  const handleGenerateQuote = async () => {
+    try {
+      const quote = await generateQuote(customerId);
+      setSalesQuote(quote);
+      showToast('报价已生成');
+    } catch {
+      showToast('生成失败');
+    }
+  };
 
   /** 获取 AI 建议回复 */
   const handleGetSuggestions = useCallback(async () => {
@@ -510,6 +527,50 @@ export default function CustomerDetail() {
             </div>
           )}
 
+          {activeTab === 'sales' && (
+            <div className="space-y-4">
+              <div className="rounded-xl border border-gray-100 bg-white p-6 dark:border-slate-800 dark:bg-slate-900">
+                <h3 className="mb-4 text-sm font-semibold text-gray-700 dark:text-slate-200">LTV 预测</h3>
+                {ltvData ? (
+                  <>
+                    <p className="text-2xl font-bold text-green-600">¥{ltvData.predicted_ltv.toLocaleString()}</p>
+                    <p className="mt-2 text-sm text-gray-500">{ltvData.recommendation}</p>
+                  </>
+                ) : (
+                  <p className="text-sm text-gray-400">加载中...</p>
+                )}
+              </div>
+              {salesQuote && (
+                <div className="rounded-xl border border-gray-100 bg-white p-6 dark:border-slate-800 dark:bg-slate-900">
+                  <h3 className="mb-2 text-sm font-semibold">最近报价</h3>
+                  <p className="text-xl font-bold">¥{salesQuote.total.toLocaleString()}</p>
+                </div>
+              )}
+              {salesFlow && (
+                <div className="rounded-xl border border-gray-100 bg-white p-6 dark:border-slate-800 dark:bg-slate-900">
+                  <h3 className="mb-2 text-sm font-semibold">流程状态</h3>
+                  <p className="text-sm">当前步骤：{salesFlow.current_step} · {salesFlow.status}</p>
+                </div>
+              )}
+              <div className="flex gap-3">
+                <button
+                  type="button"
+                  onClick={handleStartSalesFlow}
+                  className="rounded-lg bg-blue-600 px-4 py-2 text-sm text-white hover:bg-blue-700"
+                >
+                  启动自动销售
+                </button>
+                <button
+                  type="button"
+                  onClick={handleGenerateQuote}
+                  className="rounded-lg border px-4 py-2 text-sm hover:bg-gray-50 dark:border-slate-600 dark:hover:bg-slate-800"
+                >
+                  生成报价
+                </button>
+              </div>
+            </div>
+          )}
+
           {activeTab === 'timeline' && (
             <div className="rounded-xl border border-gray-100 bg-white p-6 dark:border-slate-800 dark:bg-slate-900">
               <h3 className="mb-4 text-sm font-semibold text-gray-700 dark:text-slate-200">Pipeline 时间轴</h3>
@@ -707,10 +768,7 @@ export default function CustomerDetail() {
                 aria-label="选择发送渠道"
               >
                 <span className="flex items-center gap-2">
-                  {(() => {
-                    const Icon = getChannelIcon(selectedChannel);
-                    return <Icon className="h-4 w-4" />;
-                  })()}
+                  <ChannelIconSmall type={selectedChannel} />
                   {CHANNEL_LABEL_MAP[selectedChannel] ?? selectedChannel}
                 </span>
                 <ChevronDown className="h-4 w-4" />
@@ -731,10 +789,7 @@ export default function CustomerDetail() {
                           : 'text-gray-600 hover:bg-gray-50 dark:text-slate-300 dark:hover:bg-slate-700',
                       )}
                     >
-                      {(() => {
-                        const Icon = getChannelIcon(channel.value);
-                        return <Icon className="h-4 w-4" />;
-                      })()}
+                      <ChannelIconSmall type={channel.value} />
                       {channel.label}
                     </button>
                   ))}

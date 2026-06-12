@@ -17,6 +17,24 @@ import {
   Sun,
   Moon,
   HelpCircle,
+  TrendingUp,
+  GitBranch,
+  PenTool,
+  Crosshair,
+  Workflow,
+  Wallet,
+  Globe,
+  Zap,
+  BarChart3,
+  Radar,
+  Activity,
+  LayoutTemplate,
+  LineChart,
+  Brain,
+  Trophy,
+  Puzzle,
+  Code,
+  BookOpen,
   type LucideIcon,
 } from "lucide-react";
 import { useAuthStore } from "../stores/auth";
@@ -27,46 +45,63 @@ import { clsx } from "clsx";
 import SearchModal from "./SearchModal";
 import NotificationDropdown from "./NotificationDropdown";
 import NavItem from "./NavItem";
+import NavGroup from "./NavGroup";
 import OnboardingTutorial from "./OnboardingTutorial";
 import OnboardingStartPanel from "./OnboardingStartPanel";
 import VirtualCursor from "./VirtualCursor";
 
-/** 侧边栏导航项配置（badge 不再硬编码，由 store 注入） */
+/** 侧边栏导航项配置 */
 type NavConfig = {
   to: string;
   icon: LucideIcon;
   label: string;
   end?: boolean;
-  /** 未读数来源：返回 0 表示无徽标 */
   badgeFrom: (state: { unreadTotal: number; unreadByCustomer: Record<string, number> }) => number;
-  /** 新手教程锚点（CSS 选择器值，会写到 data-tour 属性） */
   tour?: string;
 };
 
-const navConfig: NavConfig[] = [
-    { to: "/", icon: LayoutDashboard, label: "工作台", end: true, badgeFrom: () => 0, tour: "nav-dashboard" },
-    { to: "/funnel", icon: Filter, label: "漏斗看板", badgeFrom: () => 0, tour: "nav-funnel" },
-    {
-      to: "/messages",
-      icon: MessageSquare,
-      label: "消息中心",
-      badgeFrom: (s) => s.unreadTotal,
-      tour: "nav-messages",
-    },
-    { to: "/customers", icon: Users, label: "客户管理", badgeFrom: () => 0, tour: "nav-customers" },
-    { to: "/ai", icon: Bot, label: "AI 助手", badgeFrom: () => 0, tour: "nav-ai" },
-    { to: "/settings", icon: Settings, label: "设置", badgeFrom: () => 0, tour: "nav-settings" },
-  ];
+const coreNavConfig: NavConfig[] = [
+  { to: "/", icon: LayoutDashboard, label: "工作台", end: true, badgeFrom: () => 0, tour: "nav-dashboard" },
+  { to: "/funnel", icon: Filter, label: "漏斗看板", badgeFrom: () => 0, tour: "nav-funnel" },
+  { to: "/messages", icon: MessageSquare, label: "消息中心", badgeFrom: (s) => s.unreadTotal, tour: "nav-messages" },
+  { to: "/customers", icon: Users, label: "客户管理", badgeFrom: () => 0, tour: "nav-customers" },
+  { to: "/ai", icon: Bot, label: "AI 助手", badgeFrom: () => 0, tour: "nav-ai" },
+  { to: "/settings", icon: Settings, label: "设置", badgeFrom: () => 0, tour: "nav-settings" },
+];
 
 /** 面包屑映射 */
-const breadcrumbMap: Record<string, string> = {
+export const breadcrumbMap: Record<string, string> = {
   "/": "工作台",
   "/funnel": "漏斗看板",
   "/messages": "消息中心",
   "/customers": "客户管理",
   "/ai": "AI 助手",
   "/settings": "设置",
+  "/sales/flow": "自动销售流程",
+  "/sales/performance": "业绩看板",
+  "/content/studio": "内容创作",
+  "/content/analytics": "内容效果",
+  "/scout/hunter": "猎手巡检",
+  "/scout/sentiment": "舆情监控",
+  "/flow/designer": "流程设计器",
+  "/flow/monitor": "流程监控",
+  "/flow/templates": "模板市场",
+  "/finance/dashboard": "财务看板",
+  "/finance/ai": "AI 财务助手",
+  "/finance/performance": "绩效看板",
+  "/open": "开放平台",
+  "/open/plugins": "插件市场",
+  "/open/developer": "开发者门户",
+  "/open/app-builder": "应用构建器",
+  "/open/docs": "API 文档",
 };
+
+function resolveBreadcrumb(pathname: string): string {
+  if (breadcrumbMap[pathname]) return breadcrumbMap[pathname];
+  const customerMatch = pathname.match(/^\/customers\/(\d+)$/);
+  if (customerMatch) return "客户详情";
+  return "工作台";
+}
 
 export default function Layout() {
   const [collapsed, setCollapsed] = useState(false);
@@ -75,14 +110,12 @@ export default function Layout() {
   const userMenuRef = useRef<HTMLDivElement>(null);
   const { user, logout } = useAuthStore();
   const { applied, toggle } = useThemeStore();
-  // 订阅未读汇总；只订阅需要的字段避免全量 re-render
   const unreadTotal = useMessageStore(selectUnreadTotal);
   const unreadByCustomer = useMessageStore((s) => s.unreadByCustomer);
   const messageState = { unreadTotal, unreadByCustomer };
   const navigate = useNavigate();
   const location = useLocation();
 
-  // 新手教程
   const setOnboardingActive = useOnboardingStore((s) => s.setActive);
   const resetOnboarding = useOnboardingStore((s) => s.reset);
   const startOnboarding = (v: boolean) => {
@@ -90,19 +123,14 @@ export default function Layout() {
     setOnboardingActive(v);
   };
 
-  /** 退出登录 */
   const handleLogout = () => {
     logout();
     navigate("/login");
   };
 
-  /** 点击外部关闭用户菜单 */
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
-      if (
-        userMenuRef.current &&
-        !userMenuRef.current.contains(e.target as Node)
-      ) {
+      if (userMenuRef.current && !userMenuRef.current.contains(e.target as Node)) {
         setUserMenuOpen(false);
       }
     };
@@ -110,7 +138,6 @@ export default function Layout() {
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
-  /** 全局快捷键：Cmd/Ctrl+K 打开搜索 */
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === "k") {
@@ -122,13 +149,11 @@ export default function Layout() {
     return () => document.removeEventListener("keydown", handleKeyDown);
   }, []);
 
-  /** 当前页面面包屑 */
-  const currentBreadcrumb = breadcrumbMap[location.pathname] || "工作台";
+  const currentBreadcrumb = resolveBreadcrumb(location.pathname);
   const isDark = applied === "dark";
 
   return (
     <div className="flex h-screen bg-gray-50 dark:bg-slate-900">
-      {/* 侧边栏 */}
       <aside
         data-tour="sidebar"
         className={clsx(
@@ -136,7 +161,6 @@ export default function Layout() {
           collapsed ? "w-16" : "w-60"
         )}
       >
-        {/* Logo 区域 */}
         <div
           className={clsx(
             "flex h-14 items-center border-b border-slate-700/50 px-4",
@@ -158,9 +182,8 @@ export default function Layout() {
           )}
         </div>
 
-        {/* 导航列表 */}
-        <nav className="flex-1 space-y-1 px-2 py-3" aria-label="主导航">
-          {navConfig.map((item) => (
+        <nav className="flex-1 space-y-1 overflow-y-auto px-2 py-3" aria-label="主导航">
+          {coreNavConfig.map((item) => (
             <NavItem
               key={item.to}
               to={item.to}
@@ -172,9 +195,75 @@ export default function Layout() {
               dataTour={item.tour}
             />
           ))}
+
+          <NavGroup
+            id="sales"
+            label="销售增长"
+            icon={TrendingUp}
+            collapsed={collapsed}
+            defaultOpen
+            items={[
+              { to: "/sales/flow", icon: GitBranch, label: "自动销售", dataTour: "nav-sales-flow" },
+              { to: "/sales/performance", icon: BarChart3, label: "业绩看板", dataTour: "nav-sales-performance" },
+            ]}
+          />
+          <NavGroup
+            id="content"
+            label="内容矩阵"
+            icon={PenTool}
+            collapsed={collapsed}
+            items={[
+              { to: "/content/studio", icon: PenTool, label: "内容创作" },
+              { to: "/content/analytics", icon: LineChart, label: "效果分析" },
+            ]}
+          />
+          <NavGroup
+            id="scout"
+            label="精准猎手"
+            icon={Crosshair}
+            collapsed={collapsed}
+            items={[
+              { to: "/scout/hunter", icon: Radar, label: "猎手巡检" },
+              { to: "/scout/sentiment", icon: Activity, label: "舆情监控" },
+            ]}
+          />
+          <NavGroup
+            id="flow"
+            label="流程闭环"
+            icon={Workflow}
+            collapsed={collapsed}
+            items={[
+              { to: "/flow/designer", icon: Workflow, label: "流程设计" },
+              { to: "/flow/monitor", icon: Activity, label: "流程监控" },
+              { to: "/flow/templates", icon: LayoutTemplate, label: "模板市场" },
+            ]}
+          />
+          <NavGroup
+            id="finance"
+            label="智能财务"
+            icon={Wallet}
+            collapsed={collapsed}
+            items={[
+              { to: "/finance/dashboard", icon: Wallet, label: "财务看板" },
+              { to: "/finance/ai", icon: Brain, label: "AI 财务" },
+              { to: "/finance/performance", icon: Trophy, label: "绩效看板" },
+            ]}
+          />
+          <NavGroup
+            id="open"
+            label="开放平台"
+            icon={Globe}
+            collapsed={collapsed}
+            items={[
+              { to: "/open", icon: Globe, label: "生态首页" },
+              { to: "/open/plugins", icon: Puzzle, label: "插件市场" },
+              { to: "/open/developer", icon: Code, label: "开发者" },
+              { to: "/open/app-builder", icon: Zap, label: "应用构建" },
+              { to: "/open/docs", icon: BookOpen, label: "API 文档" },
+            ]}
+          />
         </nav>
 
-        {/* 底部折叠按钮 */}
         <div className="border-t border-gray-200 p-2 dark:border-slate-700/50">
           <button
             onClick={() => setCollapsed(!collapsed)}
@@ -193,20 +282,14 @@ export default function Layout() {
         </div>
       </aside>
 
-      {/* 主内容区 */}
       <div className="flex flex-1 flex-col overflow-hidden">
-        {/* 顶部栏 */}
         <header className="flex h-14 shrink-0 items-center justify-between border-b border-gray-200 bg-white px-6 dark:border-slate-700 dark:bg-slate-800">
-          {/* 左侧：面包屑导航 */}
           <div className="flex items-center gap-2 text-sm">
             <Home className="h-4 w-4 text-gray-400 dark:text-slate-500" />
             <span className="text-gray-400 dark:text-slate-500">/</span>
-            <span className="font-medium text-gray-700 dark:text-slate-200">
-              {currentBreadcrumb}
-            </span>
+            <span className="font-medium text-gray-700 dark:text-slate-200">{currentBreadcrumb}</span>
           </div>
 
-          {/* 中间：全局搜索框（点击打开搜索面板） */}
           <button
             onClick={() => setSearchOpen(true)}
             data-tour="topbar-search"
@@ -220,9 +303,7 @@ export default function Layout() {
             </kbd>
           </button>
 
-          {/* 右侧：通知 + 暗色模式 + 用户菜单 */}
           <div className="flex items-center gap-3">
-            {/* 帮助 / 新手教程按钮 */}
             <button
               onClick={() => startOnboarding(true)}
               title="新手教程"
@@ -231,25 +312,15 @@ export default function Layout() {
             >
               <HelpCircle className="h-5 w-5" />
             </button>
-
-            {/* 暗色模式切换按钮 */}
             <button
               onClick={toggle}
               title={isDark ? "切换到浅色模式" : "切换到暗色模式"}
               className="rounded-md p-2 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600 dark:text-slate-400 dark:hover:bg-slate-700 dark:hover:text-slate-200"
               aria-label={isDark ? "切换到浅色模式" : "切换到暗色模式"}
             >
-              {isDark ? (
-                <Sun className="h-5 w-5" />
-              ) : (
-                <Moon className="h-5 w-5" />
-              )}
+              {isDark ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </button>
-
-            {/* 通知铃铛 */}
             <NotificationDropdown />
-
-            {/* 用户头像下拉菜单 */}
             <div className="relative" ref={userMenuRef}>
               <button
                 onClick={() => setUserMenuOpen(!userMenuOpen)}
@@ -270,23 +341,14 @@ export default function Layout() {
                   )}
                 />
               </button>
-
-              {/* 下拉菜单 */}
               {userMenuOpen && (
                 <div className="absolute right-0 top-full z-50 mt-1 w-48 overflow-hidden rounded-lg border border-gray-200 bg-white py-1 shadow-lg dark:border-slate-700 dark:bg-slate-800">
                   <div className="border-b border-gray-100 px-4 py-2.5 dark:border-slate-700">
-                    <p className="text-sm font-medium text-gray-900 dark:text-slate-100">
-                      {user?.name || "用户"}
-                    </p>
-                    <p className="text-xs text-gray-500 dark:text-slate-400">
-                      {user?.email || ""}
-                    </p>
+                    <p className="text-sm font-medium text-gray-900 dark:text-slate-100">{user?.name || "用户"}</p>
+                    <p className="text-xs text-gray-500 dark:text-slate-400">{user?.email || ""}</p>
                   </div>
                   <button
-                    onClick={() => {
-                      setUserMenuOpen(false);
-                      navigate("/settings");
-                    }}
+                    onClick={() => { setUserMenuOpen(false); navigate("/settings"); }}
                     aria-label="个人信息"
                     className="flex w-full items-center gap-2 px-4 py-2 text-sm text-gray-700 transition-colors hover:bg-gray-50 dark:text-slate-200 dark:hover:bg-slate-700"
                   >
@@ -307,10 +369,6 @@ export default function Layout() {
           </div>
         </header>
 
-        {/* 页面内容
-            - main 自身 overflow-hidden，h 由 flex-1 决定
-            - 内层 wrapper 用 h-full flex flex-col：让子页面的 h-full 真正拿到这个受限高度
-              （之前 wrapper 没有 height，导致 AI/Settings/Messages 的 h-full = auto，内容自由撑高 main） */}
         <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
           <div className="mx-auto flex h-full w-full max-w-7xl flex-1 flex-col p-6">
             <Outlet />
@@ -318,10 +376,7 @@ export default function Layout() {
         </main>
       </div>
 
-      {/* 全局搜索面板 */}
       <SearchModal open={searchOpen} onClose={() => setSearchOpen(false)} />
-
-      {/* 新手教程控制器：放在 Layout 内部，能用 useNavigate 跳路由 */}
       <OnboardingStartPanel />
       <OnboardingTutorial />
       <VirtualCursor />

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useOnboardingStore } from "../stores/onboarding";
-import { Sparkles, Play, X, Check } from "lucide-react";
+import { X, ChevronRight } from "lucide-react";
 
 /**
  * 教程启动面板
@@ -16,7 +16,6 @@ export default function OnboardingStartPanel() {
   const [show, setShow] = useState(false);
   const [visible, setVisible] = useState(false);
 
-  // 首次进入：1.2s 后淡入
   useEffect(() => {
     if (state !== "not_started") {
       setShow(false);
@@ -24,15 +23,12 @@ export default function OnboardingStartPanel() {
       return;
     }
     if (active) {
-      // 教程已经在跑，隐藏面板
       setShow(false);
       setVisible(false);
       return;
     }
-    // 1.2s 延迟弹，让 dashboard 先渲染
     const t = window.setTimeout(() => {
       setShow(true);
-      // 下一帧加 visible 触发过渡
       requestAnimationFrame(() => setVisible(true));
     }, 1200);
     return () => window.clearTimeout(t);
@@ -59,7 +55,6 @@ export default function OnboardingStartPanel() {
   const handleLater = () => {
     setVisible(false);
     window.setTimeout(() => setShow(false), 200);
-    // 24h 后再弹（如果还是 not_started）
     window.setTimeout(() => {
       const s = useOnboardingStore.getState();
       if (s.state === "not_started" && !s.active) {
@@ -71,12 +66,11 @@ export default function OnboardingStartPanel() {
 
   return (
     <>
-      {/* 背景遮罩（轻一点） */}
       <div
         style={{
           position: "fixed",
           inset: 0,
-          background: visible ? "rgba(15, 23, 42, 0.45)" : "rgba(15, 23, 42, 0)",
+          background: visible ? "rgba(15, 23, 42, 0.4)" : "rgba(15, 23, 42, 0)",
           backdropFilter: visible ? "blur(2px)" : "none",
           zIndex: 999998,
           transition: "background .25s",
@@ -84,7 +78,6 @@ export default function OnboardingStartPanel() {
         onClick={handleLater}
       />
 
-      {/* 中心卡片 */}
       <div
         role="dialog"
         aria-label="新手教程"
@@ -98,98 +91,138 @@ export default function OnboardingStartPanel() {
           opacity: visible ? 1 : 0,
           transition: "transform .3s cubic-bezier(.34, 1.56, .64, 1), opacity .2s",
           zIndex: 999999,
-          width: "min(440px, calc(100vw - 32px))",
+          width: "min(420px, calc(100vw - 32px))",
           background: "white",
-          borderRadius: 16,
-          boxShadow: "0 20px 60px rgba(0, 0, 0, 0.3)",
+          borderRadius: 12,
+          boxShadow: "0 12px 40px rgba(0, 0, 0, 0.15)",
           padding: 0,
           overflow: "hidden",
           fontFamily: "inherit",
         }}
       >
-        {/* 顶部渐变 banner */}
+        {/* 顶部区域 */}
         <div
           style={{
-            background: "linear-gradient(135deg, #3b82f6 0%, #6366f1 50%, #8b5cf6 100%)",
-            padding: "28px 24px 22px",
-            color: "white",
-            position: "relative",
+            padding: "24px 24px 0",
           }}
         >
           <div
             style={{
-              position: "absolute",
-              top: 12,
-              right: 12,
-              cursor: "pointer",
-              padding: 4,
-              borderRadius: 6,
-              opacity: 0.7,
-              transition: "opacity .15s, background .15s",
+              position: "relative",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
             }}
-            onClick={handleLater}
-            onMouseEnter={(e) => {
-              e.currentTarget.style.opacity = "1";
-              e.currentTarget.style.background = "rgba(255,255,255,.15)";
-            }}
-            onMouseLeave={(e) => {
-              e.currentTarget.style.opacity = "0.7";
-              e.currentTarget.style.background = "transparent";
-            }}
-            aria-label="关闭"
           >
-            <X size={18} />
+            <span
+              style={{
+                fontSize: 12,
+                fontWeight: 500,
+                color: "#6366f1",
+                background: "#eef2ff",
+                padding: "2px 8px",
+                borderRadius: 4,
+              }}
+            >
+              新手引导
+            </span>
+            <div
+              style={{
+                cursor: "pointer",
+                padding: 4,
+                borderRadius: 6,
+                color: "#94a3b8",
+                transition: "color .15s",
+              }}
+              onClick={handleLater}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.color = "#475569";
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.color = "#94a3b8";
+              }}
+              aria-label="关闭"
+            >
+              <X size={16} />
+            </div>
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
-            <Sparkles size={24} />
-            <span style={{ fontSize: 13, opacity: 0.9, fontWeight: 500 }}>新手教程 · 1.0</span>
-          </div>
-          <h1 style={{ margin: 0, fontSize: 24, fontWeight: 700, lineHeight: 1.3 }}>
-            30 秒带你玩转 客来来
+          <h1
+            style={{
+              margin: "12px 0 4px",
+              fontSize: 20,
+              fontWeight: 600,
+              lineHeight: 1.4,
+              color: "#0f172a",
+            }}
+          >
+            60 秒了解客来来
           </h1>
-          <p style={{ margin: "6px 0 0", fontSize: 14, opacity: 0.95 }}>
-            我会亲自动手演示 5 大核心功能
+          <p style={{ margin: 0, fontSize: 14, color: "#64748b" }}>
+            跟随引导完成核心功能配置
           </p>
         </div>
 
-        {/* 内容区 */}
-        <div style={{ padding: "20px 24px" }}>
+        {/* 功能列表 */}
+        <div style={{ padding: "16px 24px" }}>
           <div
             style={{
               display: "flex",
               flexDirection: "column",
-              gap: 12,
-              marginBottom: 20,
+              gap: 1,
+              background: "#f1f5f9",
+              borderRadius: 8,
+              overflow: "hidden",
             }}
           >
             {[
-              { icon: "🌪️", text: "拖拽客户卡片，5 秒更新状态" },
-              { icon: "💬", text: "AI 自动写话术，省 3 分钟" },
-              { icon: "👤", text: "客户 360° 画像，沟通更准" },
-              { icon: "🤖", text: "智能分析意图，1 秒看穿客户" },
-              { icon: "🔍", text: "⌘K 全局搜索，5 秒跳转" },
+              { text: "接入渠道，接收客户消息", tag: "必选" },
+              { text: "配置 AI 助手，启用智能功能", tag: "必选" },
+              { text: "工作台与漏斗看板", tag: "核心" },
+              { text: "消息中心与客户详情", tag: "核心" },
+              { text: "自动销售流程与业绩看板 (v3)", tag: "增长" },
+              { text: "开放平台与插件生态 (v8)", tag: "生态" },
+              { text: "全局搜索 ⌘K", tag: "效率" },
             ].map((item, i) => (
               <div
                 key={i}
                 style={{
                   display: "flex",
                   alignItems: "center",
-                  gap: 12,
-                  padding: "8px 12px",
-                  background: "#f8fafc",
-                  borderRadius: 8,
-                  fontSize: 14,
+                  gap: 10,
+                  padding: "10px 12px",
+                  background: "white",
+                  fontSize: 13,
                   color: "#334155",
                 }}
               >
-                <span style={{ fontSize: 18 }}>{item.icon}</span>
+                <span
+                  style={{
+                    fontSize: 11,
+                    fontWeight: 500,
+                    color: item.tag === "必选" ? "#2563eb" : item.tag === "核心" ? "#7c3aed" : item.tag === "增长" ? "#059669" : item.tag === "生态" ? "#d97706" : "#64748b",
+                    background: item.tag === "必选" ? "#eff6ff" : item.tag === "核心" ? "#f5f3ff" : item.tag === "增长" ? "#ecfdf5" : item.tag === "生态" ? "#fffbeb" : "#f1f5f9",
+                    padding: "1px 6px",
+                    borderRadius: 3,
+                    flexShrink: 0,
+                  }}
+                >
+                  {item.tag}
+                </span>
                 <span style={{ flex: 1 }}>{item.text}</span>
-                <Check size={14} style={{ color: "#10b981" }} />
               </div>
             ))}
           </div>
+        </div>
 
-          {/* 主按钮 */}
+        {/* 操作区 */}
+        <div
+          style={{
+            padding: "0 24px 20px",
+            display: "flex",
+            flexDirection: "column",
+            gap: 8,
+          }}
+        >
           <button
             type="button"
             onClick={handleStart}
@@ -197,39 +230,34 @@ export default function OnboardingStartPanel() {
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
-              gap: 8,
+              gap: 6,
               width: "100%",
-              padding: "12px 16px",
-              background: "linear-gradient(135deg, #3b82f6 0%, #6366f1 100%)",
+              padding: "10px 16px",
+              background: "#0f172a",
               color: "white",
               border: "none",
-              borderRadius: 10,
-              fontSize: 15,
-              fontWeight: 600,
+              borderRadius: 8,
+              fontSize: 14,
+              fontWeight: 500,
               cursor: "pointer",
-              boxShadow: "0 4px 14px rgba(59, 130, 246, 0.35)",
-              transition: "transform .15s, box-shadow .15s",
+              transition: "background .15s",
             }}
             onMouseEnter={(e) => {
-              e.currentTarget.style.transform = "translateY(-1px)";
-              e.currentTarget.style.boxShadow = "0 6px 20px rgba(59, 130, 246, 0.5)";
+              e.currentTarget.style.background = "#1e293b";
             }}
             onMouseLeave={(e) => {
-              e.currentTarget.style.transform = "";
-              e.currentTarget.style.boxShadow = "0 4px 14px rgba(59, 130, 246, 0.35)";
+              e.currentTarget.style.background = "#0f172a";
             }}
           >
-            <Play size={16} fill="white" />
-            开始 30 秒教程
+            开始引导
+            <ChevronRight size={14} />
           </button>
 
-          {/* 次要操作 */}
           <div
             style={{
               display: "flex",
-              justifyContent: "space-between",
-              alignItems: "center",
-              marginTop: 12,
+              justifyContent: "center",
+              gap: 16,
               fontSize: 13,
             }}
           >
@@ -259,7 +287,7 @@ export default function OnboardingStartPanel() {
                 fontSize: 13,
               }}
             >
-              不用了，谢谢
+              跳过
             </button>
           </div>
         </div>

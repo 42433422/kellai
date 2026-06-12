@@ -571,40 +571,169 @@ export default function OnboardingTutorial() {
   const navigateRef = useRef(navigate);
   navigateRef.current = navigate;
 
+  /** 教程步骤定义（独立于 driver 实例，避免从 driver 内部读取 steps） */
+  const TOUR_STEPS: DriveStep[] = [
+    /* ===== Step 0 - 欢迎 ===== */
+    {
+      popover: {
+        title: "欢迎使用客来来",
+        description:
+          "接下来 <b>90 秒</b>，按实际使用顺序演示核心功能：\n\n<b>1.</b> 接入渠道 → 配置 AI\n<b>2.</b> 工作台、漏斗、消息\n<b>3.</b> 自动销售流程 (v3)\n<b>4.</b> 开放平台生态 (v8)\n<b>5.</b> ⌘K 搜索\n\n按顺序走完即可上手。",
+        align: "center",
+      },
+    },
+
+    /* ===== Step 1 - 设置·渠道管理 ===== */
+    {
+      element: '[data-tour="settings-channels"]',
+      popover: {
+        title: "第一步：接入渠道",
+        description:
+          "渠道是所有功能的入口，未接入前漏斗和消息中心无数据。\n\n刚才的操作：\n1. 找到「企业微信」卡片\n2. 点击「<b>扫码授权</b>」\n3. 手机扫码 → 自动确认 → 完成\n\n扫码授权比填写凭据更便捷。",
+        side: "left",
+        align: "start",
+      },
+    },
+
+    /* ===== Step 2 - 设置·AI 助手 ===== */
+    {
+      element: '[data-tour="settings-channels"]',
+      popover: {
+        title: "第二步：配置 AI 助手",
+        description:
+          "AI 话术、意图分析、客户画像均依赖此配置。\n\n刚才切换到 <b>AI 助手</b> 页面，包含两个核心区域：\n• <b>模型配置</b>：选择厂商并填写 API Key\n• <b>自动回复策略</b>：设置 AI 自动接管的阶段\n\n配置流程：开通账号 → 获取 Key → 填入 → 测试连通 → 启用。",
+        side: "left",
+        align: "start",
+      },
+    },
+
+    /* ===== Step 3 - 工作台 ===== */
+    {
+      element: '[data-tour="dashboard-todo"]',
+      popover: {
+        title: "工作台",
+        description:
+          "渠道和 AI 配置完成后，工作台开始展示数据。\n\n四个功能入口：\n• <b>今日待办</b>：AI 排序的待跟进客户\n• <b>线索动态</b>：最新消息流\n• <b>漏斗概览</b>：客户阶段分布\n• <b>AI 建议</b>：智能提醒\n\n点击任一模块可进入对应页面。",
+        side: "bottom",
+        align: "center",
+      },
+    },
+
+    /* ===== Step 4 - 漏斗 ===== */
+    {
+      element: '[data-tour="funnel-board"]',
+      popover: {
+        title: "漏斗看板",
+        description:
+          "刚才将一张客户卡片从「<b>已建联</b>拖拽至「<b>需求采集</b>」。\n\n阶段变更已自动保存至客户档案。\n\n拖拽即可更新客户阶段，无需手动填写。",
+        side: "bottom",
+        align: "center",
+      },
+    },
+
+    /* ===== Step 5 - 消息中心 ===== */
+    {
+      element: '[data-tour="messages-contact-list"]',
+      popover: {
+        title: "消息中心",
+        description:
+          "刚才的操作：\n1. 选择一个客户\n2. 点击「<b>AI 推荐</b>」\n3. 将推荐话术填入输入框\n\nAI 话术可减少消息撰写时间。",
+        side: "left",
+        align: "start",
+      },
+    },
+
+    /* ===== Step 6 - 客户详情 ===== */
+    {
+      element: '[data-tour="customer-detail"]',
+      popover: {
+        title: "客户详情",
+        description:
+          "刚才自动滚动至「<b>AI 画像</b>」区域。\n\n该区域聚合客户的需求、预算、决策角色及全部跟进记录。\n\n沟通前可快速了解客户全貌。",
+        side: "right",
+        align: "start",
+      },
+    },
+
+    /* ===== Step 7 - AI 助手 ===== */
+    {
+      element: '[data-tour="ai-analyze"]',
+      popover: {
+        title: "AI 助手",
+        description:
+          "刚才的操作：\n1. 选择一个客户\n2. 输入：「<i>老板在考虑换更便宜的供应商</i>」\n3. 点击「<b>分析意图</b>」\n\nAI 返回分析结论（如客户正在比价）及对应推荐话术。\n\n将经验判断转化为即时结论。",
+        side: "left",
+        align: "start",
+      },
+    },
+
+    /* ===== Step 8 - 自动销售流程 (v3) ===== */
+    {
+      element: '[data-tour="sales-flow-wizard"]',
+      popover: {
+        title: "自动销售流程 (v3)",
+        description:
+          "AI 从对话者升级为成交者。\n\n四步自动化：\n• <b>需求确认</b> → <b>方案推荐</b>\n• <b>促单</b> → <b>签约</b>\n\n右侧可查看 LTV 预测、智能报价，并一键生成合同。",
+        side: "bottom",
+        align: "center",
+      },
+    },
+
+    /* ===== Step 9 - 开放平台 (v8) ===== */
+    {
+      element: '[data-tour="open-platform-home"]',
+      popover: {
+        title: "开放平台 (v8)",
+        description:
+          "客来来生态入口：\n\n• <b>插件市场</b>：安装第三方扩展\n• <b>开发者门户</b>：API 密钥与 Webhook\n• <b>应用构建器</b>：低代码自定义应用\n\n侧栏还有内容矩阵、精准猎手、流程闭环、智能财务等模块。",
+        side: "bottom",
+        align: "center",
+      },
+    },
+
+    /* ===== Step 10 - 全局搜索 ===== */
+    {
+      element: '[data-tour="topbar-search"]',
+      popover: {
+        title: "全局搜索",
+        description:
+          "刚才按下 <kbd>⌘K</kbd>，输入「<b>销售</b>」或「<b>开放</b>」。\n\n任意页面可用，支持搜索全部 v3–v8 新页面。\n\n快捷键直达，无需记忆菜单位置。",
+        side: "bottom",
+        align: "end",
+      },
+    },
+
+    /* ===== Step 11 - 收尾 ===== */
+    {
+      popover: {
+        title: "引导完成",
+        description:
+          "核心使用流程：\n\n<b>①</b> 接入渠道 → <b>②</b> 配置 AI → <b>③</b> 工作台/漏斗/消息\n<b>④</b> 自动销售 (v3) → <b>⑤</b> 开放平台 (v8) → <b>⑥</b> ⌘K 搜索\n\n侧栏分组导航可探索：内容矩阵、精准猎手、流程闭环、智能财务。\n\n点击右上角 <b>?</b> 可重新查看引导。",
+        align: "center",
+      },
+    },
+  ];
+
   /** 构造一个新的 driver.js 实例（每次教程启动都重新创建，保证状态干净） */
   const buildDriver = (): DriverInstance =>
     driver({
       animate: true,
-      // 教程模式 = 围观模式：用户不能点页面，只能看虚拟光标做演示。
-      // 蒙版拦住下方所有元素，但 popover 自身（×/暂停/跳过/CTA）可点。
       overlayOpacity: 0.55,
       stagePadding: 6,
       stageRadius: 10,
       allowClose: true,
-      // overlay 点击 = no-op（避免误关；关闭走 popover 内的 ×）
       overlayClickBehavior: () => {},
       showProgress: true,
       progressText: "第 {{current}} 步 / 共 {{total}} 步",
       nextBtnText: "下一步 →",
       prevBtnText: "← 上一步",
-      doneBtnText: "完成，开始使用 🚀",
+      doneBtnText: "完成",
       overlayColor: "rgba(15, 23, 42, 0.55)",
       popoverClass: "kellai-tour-popover",
       onDestroyed: () => {
-        // 注意：不在这里调 setActive(false)！
-        // runStep 每步会销毁旧 driver 重建新的，如果这里调 setActive(false)
-        // 会导致 useEffect cleanup 把 cancelled=true，整个教程链断裂。
-        // setActive(false) 只在 onCloseClick（用户点×）和教程自然结束时调用。
         if (timersRef.current) timersRef.current.clear();
       },
       onCloseClick: () => {
-        // 关键修复：× 关闭要"无论如何都能关掉"。
-        // markSkipped() 会改 active=false，触发 useEffect cleanup 收尾。
-        // 但 React 状态更新是异步的，driver.js 紧接着调 destroy() → onDestroyed
-        // 也 setActive(false)，期间可能漏掉一次 cleanup。所以这里同步做一次兜底：
-        // 1) 立刻停掉所有定时器
-        // 2) 立刻隐藏虚拟光标
-        // 3) 把 driver 实例主动 destroy
         if (timersRef.current) timersRef.current.clear();
         try {
           window.virtualCursor?.hide();
@@ -657,10 +786,10 @@ export default function OnboardingTutorial() {
               const ctrl = (driverRef as unknown as { __controls?: { isPaused: () => boolean; resume: () => void; pause: () => void } }).__controls;
               if (!ctrl) return;
               if (ctrl.isPaused()) {
-                pauseBtn.textContent = "▶ 继续";
+                pauseBtn.textContent = "继续";
                 pauseBtn.style.color = "#10b981";
               } else {
-                pauseBtn.textContent = "⏸ 暂停";
+                pauseBtn.textContent = "暂停";
                 pauseBtn.style.color = "#64748b";
               }
             };
@@ -682,7 +811,7 @@ export default function OnboardingTutorial() {
             const skipBtn = document.createElement("button");
             skipBtn.type = "button";
             skipBtn.setAttribute("aria-label", "跳过当前步");
-            skipBtn.textContent = "⏭ 跳过";
+            skipBtn.textContent = "跳过";
             skipBtn.style.cssText = `
               background:transparent; border:none; cursor:pointer;
               font-size:12px; padding:4px 8px; border-radius:4px;
@@ -706,7 +835,7 @@ export default function OnboardingTutorial() {
             const cta = document.createElement("button");
             cta.className = "kellai-tour-cta";
             cta.type = "button";
-            cta.textContent = "🚀 现在去添加你的第一个客户";
+            cta.textContent = "开始使用";
             cta.style.cssText = `
               display:block; width:100%; margin-top:12px; padding:10px 16px;
               background:linear-gradient(135deg, #3b82f6 0%, #6366f1 100%);
@@ -730,123 +859,7 @@ export default function OnboardingTutorial() {
           }
         }, 30);
       },
-      steps: [
-        /* ===== Step 0 - 欢迎 ===== */
-        {
-          popover: {
-            title: "👋 欢迎使用 客来来",
-            description:
-              "<b>60 秒</b>看完<b>真实使用流程</b>，不是 PPT 介绍：\n\n1️⃣ <b>先渠道、配</b>绑定 AI\n2️⃣ <b>再</b>看工作台、漏斗、消息\n3️⃣ 拖卡片 / AI 话术 / ⌘K 搜索\n\n跟着我的顺序走,这就是真实用户的使用路径 🚀",
-            align: "center",
-          },
-        },
-
-        /* ===== Step 1 - 设置·渠道管理（真实工作流第一步） ===== */
-        {
-          element: '[data-tour="settings-channels"]',
-          popover: {
-            title: "🔌 ① 第一步：扫码授权接渠道",
-            description:
-              "没有渠道,客户消息进不来,后面的<b>漏斗</b>、<b>消息中心</b>全是空的。\n\n👀 我刚：\n1️⃣ 找到「企业微信」卡片\n2️⃣ 点了<b>「扫码授权」</b>\n3️⃣ 弹出 QR 码 → 手机扫 → 自动确认 → 完成\n\n💡 <b>比填凭据简单 10 倍</b>,真实工作流就是这样,扫码就行。",
-            side: "left",
-            align: "start",
-          },
-        },
-
-        /* ===== Step 2 - 设置·AI 助手（LLM 配置） ===== */
-        {
-          element: '[data-tour="settings-channels"]',
-          popover: {
-            title: "🤖 ② 第二步:配 LLM",
-            description:
-              "AI 话术 / 意图分析 / 客户画像全靠这一步,没配的话所有 AI 功能 = 摆设。\n\n👀 我刚帮你切到 <b>AI 助手</b> tab,扫了 2 个核心区:\n• <b>模型配置</b>:选厂商 + 填 API Key\n• <b>自动回复策略</b>:哪些阶段让 AI 自动接\n\n💡 真实流程:开通 LLM 账号 → 拿 Key → 回来粘 → 测通 → 启用自动回复。",
-            side: "left",
-            align: "start",
-          },
-        },
-
-        /* ===== Step 3 - 工作台（4 个 KpiTile 总览） ===== */
-        {
-          element: '[data-tour="dashboard-todo"]',
-          popover: {
-            title: "📊 ③ 工作台:业务首页",
-            description:
-              "渠道 + AI 都配好之后,这里开始有数据。\n\n👀 工作台是 4 个<b>方形入口</b>，不是大表格：\n• <b>今日待办</b> = AI 排好序的待跟进客户\n• <b>线索动态</b> = 刚进来的消息流\n• <b>漏斗概览</b> = 客户分布\n• <b>AI 建议</b> = 智能提醒\n\n💡 想看哪个<b>点一下就跳进去</b>，每个方块背后都有一个完整页面。",
-            side: "bottom",
-            align: "center",
-          },
-        },
-
-        /* ===== Step 4 - 漏斗 ===== */
-        {
-          element: '[data-tour="funnel-board"]',
-          popover: {
-            title: "🌪️ ④ 漏斗看板:拖客户就这么简单",
-            description:
-              "👀 我刚把一张客户卡从「<b>已建联</b>」拖到了「<b>需求采集</b>」。\n\n状态已经存到客户档案里,刷新不会丢。\n\n💡 不用手填「下一步是什么」,<b>拖一下就完事</b>。",
-            side: "bottom",
-            align: "center",
-          },
-        },
-
-        /* ===== Step 5 - 消息中心 ===== */
-        {
-          element: '[data-tour="messages-contact-list"]',
-          popover: {
-            title: "💬 ⑤ 消息中心:AI 帮你写话术",
-            description:
-              "👀 我刚:\n1️⃣ 选了一个客户\n2️⃣ 点了「<b>AI 推荐</b>」\n3️⃣ 把推荐的话术<b>填进输入框</b>\n\n💡 <b>省了 3 分钟</b>想词时间,发消息不用再咬笔头。",
-            side: "left",
-            align: "start",
-          },
-        },
-
-        /* ===== Step 6 - 客户详情 ===== */
-        {
-          element: '[data-tour="customer-detail"]',
-          popover: {
-            title: "👤 ⑥ 客户详情:360° 画像",
-            description:
-              "👀 我刚自动滚到「<b>AI 画像</b>」区域。\n\n这里聚合了客户的需求、预算、决策角色、所有跟进记录…\n\n💡 打电话前<b> 5 秒看完</b>,再也不怕被客户问倒。",
-            side: "right",
-            align: "start",
-          },
-        },
-
-        /* ===== Step 7 - AI 助手（分析意图） ===== */
-        {
-          element: '[data-tour="ai-analyze"]',
-          popover: {
-            title: "🚀 ⑦ AI 助手:一秒看懂客户想法",
-            description:
-              "👀 我刚帮你:\n1️⃣ 选了一个客户\n2️⃣ 输入:\"<i>老板在考虑换更便宜的供应商</i>\"\n3️⃣ 点了「<b>分析意图</b>」\n\nAI 会告诉你:<b>客户正在比价</b>,<b>推荐话术</b>也跟着出来。\n\n💡 以前靠经验判断,现在 1 秒看结论。",
-            side: "left",
-            align: "start",
-          },
-        },
-
-        /* ===== Step 8 - 全局搜索 ===== */
-        {
-          element: '[data-tour="topbar-search"]',
-          popover: {
-            title: "🔍 ⑧ 全局搜索:⌘K",
-            description:
-              "👀 我刚按了 <kbd>⌘K</kbd>,输入了「<b>客</b>」。\n\n任意页面都能用:搜客户、消息、订单都行。\n\n💡 不用记菜单在哪,<b>键盘一按就到</b>。",
-            side: "bottom",
-            align: "start",
-          },
-        },
-
-        /* ===== Step 9 - 收尾（带 CTA） ===== */
-        {
-          popover: {
-            title: "🎉 60 秒看完了!",
-            description:
-              "你现在掌握了<b>真实使用流程</b>:\n\n<b>① 先</b>绑渠道 → <b>② 再</b>配 AI\n→ <b>③</b> 工作台看全局 → <b>④~⑦</b> 漏斗/消息/详情/AI\n→ <b>⑧</b> ⌘K 跳转\n\n💡 <b>记住这条主线</b>就行,中间不懂的功能随时问 AI 助手。\n\n右上角 ❓ 随时可以再走一遍。",
-            align: "center",
-          },
-        },
-      ] as DriveStep[],
+      steps: TOUR_STEPS,
     });
 
   /* ---------- 响应 store.active 启动 / 停止 ----------
@@ -872,7 +885,7 @@ export default function OnboardingTutorial() {
       const obj = buildDriver();
       driverRef.current = obj;
       // 把总步数挂到 driver 实例上，给 onPopoverRender 用
-      (obj as unknown as { __totalSteps: number }).__totalSteps = 10;
+      (obj as unknown as { __totalSteps: number }).__totalSteps = 12;
 
       // 3) 链式调度表（v2 压缩到 ~30 秒，SPEED=2 时约 60 秒）
       type StepSchedule = {
@@ -880,7 +893,6 @@ export default function OnboardingTutorial() {
         waitFor: string; // 等这个 selector 出现再跑 demo
         demo: (timers: ReturnType<typeof makeTimerGroup>) => { ok: boolean; fallbackMsg?: string };
         duration: number; // 演示完后等多久进下一步
-        demoFirst?: boolean; // true = 先跑 demo 再显示 popover（避免 popover 挡住操作目标）
       };
       const SCHEDULE: StepSchedule[] = [
         // Step 0: 欢迎 — 给足时间读（之前 1500ms 太短）
@@ -944,20 +956,33 @@ export default function OnboardingTutorial() {
           demo: (t) => demoAiAssistant(t),
           duration: 6000 * SPEED,
         },
-        // Step 8: 全局搜索（⌘K）— 输入关键词 + 看结果
+        // Step 8: 自动销售流程 (v3)
+        {
+          path: "/sales/flow",
+          waitFor: '[data-tour="sales-flow-wizard"]',
+          demo: () => ({ ok: true }),
+          duration: 4000 * SPEED,
+        },
+        // Step 9: 开放平台 (v8)
+        {
+          path: "/open",
+          waitFor: '[data-tour="open-platform-home"]',
+          demo: () => ({ ok: true }),
+          duration: 4000 * SPEED,
+        },
+        // Step 10: 全局搜索（⌘K）
         {
           path: "/",
           waitFor: '[data-tour="topbar-search"]',
           demo: (t) => demoGlobalSearch(t),
           duration: 2500 * SPEED,
-          demoFirst: true, // 先按 ⌘K + 输入，再显示 popover（避免面板挡搜索框）
         },
-        // Step 9: 收尾（带 CTA）
+        // Step 11: 收尾（带 CTA）
         {
           path: "/",
           waitFor: "body",
           demo: () => ({ ok: true }),
-          duration: 999999, // 不自动关闭，等用户点 CTA
+          duration: 999999,
         },
       ];
 
@@ -1021,65 +1046,161 @@ export default function OnboardingTutorial() {
           console.warn(`[onboarding] step ${idx}: element "${step.waitFor}" not found after ${timeout}ms`);
         }
 
-        // d) ★ 推进 driver.js 到当前步骤 + 跑 demo
-        //    demoFirst=true 时：先跑 demo 再显示 popover（避免面板挡住操作目标）
-        //    否则：先显示 popover 再跑 demo（默认，用户能边看说明边看演示）
+        // d) ★ 每步销毁旧 driver + 重建单步 driver + drive()
+        const stepDef = TOUR_STEPS[idx];
 
-        const runDemo = async () => {
-          const t = makeTimerGroup();
-          timersRef.current = t;
-          let demoResult: DemoResult = { ok: true };
-          try {
-            demoResult = step.demo(t);
-          } catch (e) {
-            console.warn(`[onboarding] step ${idx} demo failed`, e);
-            demoResult = { ok: false, fallbackMsg: "演示遇到问题，已跳过这一步。" };
-          }
-          // demo 失败 → 改气泡文案
-          if (!demoResult.ok && demoResult.fallbackMsg) {
-            const desc = document.querySelector(
-              ".driver-popover.kellai-tour-popover .driver-popover-description"
-            );
-            if (desc) {
-              desc.innerHTML = `<div style="color:#f59e0b;font-weight:600">⚠️ 这一步的演示没成功</div><div style="margin-top:4px;font-size:12px">${demoResult.fallbackMsg}</div>`;
-            }
-          }
-          return demoResult;
-        };
+        // 销毁旧 driver
+        if (driverRef.current) {
+          try { driverRef.current.destroy(); } catch { /* ignore */ }
+          driverRef.current = null;
+        }
 
-        const advanceDriver = () => {
-          if (idx === 0) {
-            try {
-              obj.drive(0);
-              console.log(`[onboarding] step ${idx}: drive(0) OK`);
-            } catch (e) {
-              console.warn(`[onboarding] step ${idx}: drive(0) failed`, e);
-            }
-          } else {
-            try {
-              (obj as unknown as { moveNext: () => void }).moveNext();
-              console.log(`[onboarding] step ${idx}: moveNext() OK`);
-            } catch (e) {
-              console.warn(`[onboarding] step ${idx}: moveNext() failed, fallback to drive`, e);
-              try { obj.drive(idx); } catch {}
-            }
-          }
-        };
+        // 构建单步 driver
+        const stepDriver = driver({
+          animate: true,
+          overlayOpacity: 0.55,
+          stagePadding: 6,
+          stageRadius: 10,
+          allowClose: true,
+          overlayClickBehavior: () => {},
+          showProgress: true,
+          progressText: `第 ${idx + 1} 步 / 共 ${SCHEDULE.length} 步`,
+          nextBtnText: "下一步 →",
+          prevBtnText: "← 上一步",
+          doneBtnText: "完成",
+          overlayColor: "rgba(15, 23, 42, 0.55)",
+          popoverClass: "kellai-tour-popover",
+          onDestroyed: () => {
+            if (timersRef.current) timersRef.current.clear();
+          },
+          onCloseClick: () => {
+            if (timersRef.current) timersRef.current.clear();
+            try { window.virtualCursor?.hide(); } catch { /* ignore */ }
+            try { document.body.classList.remove("tutorial-active"); } catch { /* ignore */ }
+            try { driverRef.current?.destroy(); } catch { /* ignore */ }
+            markSkipped();
+            cancelled = true;
+          },
+          onPopoverRender: (popover) => {
+            const popoverEl = popover.wrapper as HTMLElement | undefined;
+            if (!popoverEl) return;
+            window.setTimeout(() => {
+              const totalSteps = SCHEDULE.length;
+              const isLast = idx === totalSteps - 1;
+              const old = popoverEl.querySelector(".kellai-tour-ctl");
+              if (old) old.remove();
+              const oldCta = popoverEl.querySelector(".kellai-tour-cta");
+              if (oldCta) oldCta.remove();
 
-        let demoResult: DemoResult;
-        if (step.demoFirst) {
-          // 先跑 demo（popover 还没出来，不挡操作目标）
-          demoResult = await runDemo();
-          await sleep(300);
-          // 再显示 popover
-          advanceDriver();
-          await sleep(200);
-        } else {
-          // 先显示 popover
-          advanceDriver();
-          await sleep(200);
-          // 再跑 demo
-          demoResult = await runDemo();
+              if (!isLast) {
+                const ctl = document.createElement("div");
+                ctl.className = "kellai-tour-ctl";
+                ctl.style.cssText = `
+                  display:flex; justify-content:space-between; align-items:center;
+                  margin-top:12px; padding-top:10px; border-top:1px dashed #e2e8f0;
+                `;
+                const pauseBtn = document.createElement("button");
+                pauseBtn.className = "kellai-tour-btn-pause";
+                pauseBtn.type = "button";
+                pauseBtn.setAttribute("aria-label", "暂停 / 继续");
+                const updatePauseUI = () => {
+                  if (pausedRef.current) {
+                    pauseBtn.textContent = "继续";
+                    pauseBtn.style.color = "#10b981";
+                  } else {
+                    pauseBtn.textContent = "暂停";
+                    pauseBtn.style.color = "#64748b";
+                  }
+                };
+                pauseBtn.style.cssText = `
+                  background:transparent; border:none; cursor:pointer;
+                  font-size:12px; padding:4px 8px; border-radius:4px;
+                  transition:background .15s;
+                `;
+                pauseBtn.onmouseover = () => (pauseBtn.style.background = "#f1f5f9");
+                pauseBtn.onmouseout = () => (pauseBtn.style.background = "transparent");
+                pauseBtn.onclick = () => {
+                  pausedRef.current = !pausedRef.current;
+                  updatePauseUI();
+                };
+
+                const skipBtn = document.createElement("button");
+                skipBtn.type = "button";
+                skipBtn.setAttribute("aria-label", "跳过当前步");
+                skipBtn.textContent = "跳过";
+                skipBtn.style.cssText = `
+                  background:transparent; border:none; cursor:pointer;
+                  font-size:12px; padding:4px 8px; border-radius:4px;
+                  color:#64748b; transition:background .15s;
+                `;
+                skipBtn.onmouseover = () => (skipBtn.style.background = "#f1f5f9");
+                skipBtn.onmouseout = () => (skipBtn.style.background = "transparent");
+                skipBtn.onclick = () => {
+                  skipRequestedRef.current = true;
+                };
+
+                ctl.appendChild(pauseBtn);
+                ctl.appendChild(skipBtn);
+                popoverEl.appendChild(ctl);
+                updatePauseUI();
+              }
+
+              if (isLast) {
+                const cta = document.createElement("button");
+                cta.className = "kellai-tour-cta";
+                cta.type = "button";
+                cta.textContent = "开始使用";
+                cta.style.cssText = `
+                  display:block; width:100%; margin-top:12px; padding:10px 16px;
+                  background:linear-gradient(135deg, #3b82f6 0%, #6366f1 100%);
+                  color:white; border:none; border-radius:8px; font-size:14px;
+                  font-weight:600; cursor:pointer; box-shadow:0 4px 12px rgba(59,130,246,.35);
+                  transition:transform .15s, box-shadow .15s;
+                `;
+                cta.onmouseover = () => {
+                  cta.style.transform = "translateY(-1px)";
+                  cta.style.boxShadow = "0 6px 18px rgba(59,130,246,.5)";
+                };
+                cta.onmouseout = () => {
+                  cta.style.transform = "";
+                  cta.style.boxShadow = "0 4px 12px rgba(59,130,246,.35)";
+                };
+                cta.onclick = () => {
+                  markCompleted();
+                  try { driverRef.current?.destroy(); } catch { /* ignore */ }
+                  try { navigateRef.current("/funnel"); } catch { /* ignore */ }
+                };
+                popoverEl.appendChild(cta);
+              }
+            }, 30);
+          },
+          steps: stepDef ? [stepDef] : [],
+        });
+        driverRef.current = stepDriver;
+        try { stepDriver.drive(); } catch (e) {
+          console.warn(`[onboarding] step ${idx} drive failed`, e);
+        }
+        // 等 driver.js 渲染完 popover + 蒙版
+        await sleep(100);
+
+        // e) run demo（在正确的蒙版下执行动画）
+        const t = makeTimerGroup();
+        timersRef.current = t;
+        let demoResult: DemoResult = { ok: true };
+        try {
+          demoResult = step.demo(t);
+        } catch (e) {
+          console.warn(`[onboarding] step ${idx} demo failed`, e);
+          demoResult = { ok: false, fallbackMsg: "演示遇到问题，已跳过这一步。" };
+        }
+        // demo 失败 → 改气泡文案
+        if (!demoResult.ok && demoResult.fallbackMsg) {
+          const desc = document.querySelector(
+            ".driver-popover.kellai-tour-popover .driver-popover-description"
+          );
+          if (desc) {
+            desc.innerHTML = `<div style="color:#f59e0b;font-weight:600">⚠️ 这一步的演示没成功</div><div style="margin-top:4px;font-size:12px">${demoResult.fallbackMsg}</div>`;
+          }
         }
 
         // f) 等 duration（期间检查暂停 / 跳过）
@@ -1104,7 +1225,6 @@ export default function OnboardingTutorial() {
       // 启动：200ms 后从 Step 0 开始
       const startTimer = window.setTimeout(() => {
         if (cancelled) return;
-        // runStep(0) 内部会调 obj.drive(0) 启动 driver，这里不需要再调
         runStep(0);
       }, 200);
 

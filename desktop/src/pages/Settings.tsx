@@ -2,10 +2,6 @@ import { useState, useEffect } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import {
   MessageCircle,
-  Briefcase,
-  Phone,
-  Music,
-  Smartphone,
   Users,
   User,
   Bot,
@@ -21,15 +17,13 @@ import {
   AlertCircle,
   X,
   HelpCircle,
-  ShoppingBag,
-  ShoppingCart,
-  Send,
   QrCode,
   RefreshCw,
   ScanLine,
   ShieldCheck,
 } from 'lucide-react';
 import { useOnboardingStore } from '../stores/onboarding';
+import ChannelLogo, { CHANNEL_BRAND_COLOR } from '../components/ChannelLogo';
 import { clsx } from 'clsx';
 import type {
   Channel,
@@ -65,26 +59,6 @@ const TABS = [
 ] as const;
 
 type TabKey = (typeof TABS)[number]['key'];
-
-/** 渠道图标映射 */
-const channelIconMap: Record<string, React.ElementType> = {
-  wework: Briefcase,
-  phone: Phone,
-  douyin: Music,
-  miniprogram: Smartphone,
-  email: MessageCircle,
-  sms: Smartphone,
-  web: Smartphone,
-  // 电商平台
-  pdd: ShoppingBag,
-  taobao: ShoppingCart,
-  jd: ShoppingCart,
-  alibaba: ShoppingBag,
-  // 海外
-  whatsapp: MessageCircle,
-  telegram: Send,
-  line: MessageCircle,
-};
 
 /** 渠道名称映射 */
 const channelNameMap: Record<string, string> = {
@@ -451,7 +425,6 @@ function ChannelTab() {
             </h3>
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
               {groupChannels.map((channel) => {
-                const Icon = channelIconMap[channel.type] ?? MessageCircle;
                 const result = testResult[channel.type];
                 return (
                   <div
@@ -466,8 +439,8 @@ function ChannelTab() {
                     )}
                   >
               <div className="flex items-center gap-3">
-                <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-blue-50">
-                  <Icon className="h-5 w-5 text-blue-600" />
+                <div className="flex h-10 w-10 items-center justify-center rounded-lg" style={{ background: `${CHANNEL_BRAND_COLOR[channel.type] ?? '#3b82f6'}1a` }}>
+                  <ChannelLogo type={channel.type} size={28} />
                 </div>
                 <div className="flex-1">
                   <p className="font-medium text-gray-900">{channelNameMap[channel.type] ?? channel.name}</p>
