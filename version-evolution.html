@@ -1,0 +1,1334 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>客来来 · 版本演进全景</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Noto+Sans+SC:wght@300;400;500;700;900&family=JetBrains+Mono:wght@400;700&display=swap');
+
+:root {
+  --bg-deep: #0a0e1a;
+  --bg-card: rgba(15, 22, 42, 0.85);
+  --bg-card-hover: rgba(20, 30, 55, 0.95);
+  --border-dim: rgba(56, 189, 248, 0.12);
+  --border-glow: rgba(56, 189, 248, 0.35);
+  --cyan: #38bdf8;
+  --cyan-dim: rgba(56, 189, 248, 0.6);
+  --purple: #a78bfa;
+  --purple-dim: rgba(167, 139, 250, 0.5);
+  --gold: #fbbf24;
+  --gold-dim: rgba(251, 191, 36, 0.5);
+  --green: #34d399;
+  --green-dim: rgba(52, 211, 153, 0.5);
+  --red: #f87171;
+  --text-primary: #e2e8f0;
+  --text-secondary: #94a3b8;
+  --text-dim: #64748b;
+  --done-accent: var(--green);
+  --current-accent: var(--gold);
+  --future-accent: var(--purple);
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html {
+  scroll-behavior: smooth;
+  scrollbar-width: thin;
+  scrollbar-color: var(--cyan-dim) var(--bg-deep);
+}
+
+body {
+  font-family: 'Noto Sans SC', sans-serif;
+  background: var(--bg-deep);
+  color: var(--text-primary);
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+/* === BACKGROUND EFFECTS === */
+.bg-grid {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  background-image:
+    linear-gradient(rgba(56,189,248,0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(56,189,248,0.03) 1px, transparent 1px);
+  background-size: 60px 60px;
+  pointer-events: none;
+}
+
+.bg-glow-1 {
+  position: fixed;
+  top: -20%;
+  left: -10%;
+  width: 50vw;
+  height: 50vw;
+  background: radial-gradient(circle, rgba(56,189,248,0.06) 0%, transparent 70%);
+  pointer-events: none;
+  z-index: 0;
+  animation: drift1 20s ease-in-out infinite;
+}
+
+.bg-glow-2 {
+  position: fixed;
+  bottom: -20%;
+  right: -10%;
+  width: 60vw;
+  height: 60vw;
+  background: radial-gradient(circle, rgba(167,139,250,0.05) 0%, transparent 70%);
+  pointer-events: none;
+  z-index: 0;
+  animation: drift2 25s ease-in-out infinite;
+}
+
+@keyframes drift1 {
+  0%, 100% { transform: translate(0, 0); }
+  50% { transform: translate(5vw, 3vh); }
+}
+
+@keyframes drift2 {
+  0%, 100% { transform: translate(0, 0); }
+  50% { transform: translate(-4vw, -5vh); }
+}
+
+/* === NAV === */
+.version-nav {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 100;
+  background: rgba(10, 14, 26, 0.88);
+  backdrop-filter: blur(20px);
+  border-bottom: 1px solid var(--border-dim);
+  padding: 0 2rem;
+  height: 56px;
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+}
+
+.nav-brand {
+  font-family: 'Orbitron', monospace;
+  font-weight: 900;
+  font-size: 1.1rem;
+  background: linear-gradient(135deg, var(--cyan), var(--purple));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  letter-spacing: 2px;
+  white-space: nowrap;
+}
+
+.nav-track {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  flex: 1;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.nav-track::-webkit-scrollbar { display: none; }
+
+.nav-node {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: all 0.3s;
+}
+
+.nav-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  transition: all 0.3s;
+}
+
+.nav-dot.done { background: var(--green); box-shadow: 0 0 6px var(--green-dim); }
+.nav-dot.current { background: var(--gold); box-shadow: 0 0 10px var(--gold-dim); animation: pulse-dot 2s ease-in-out infinite; }
+.nav-dot.future { background: var(--purple-dim); border: 1.5px dashed var(--purple); }
+
+@keyframes pulse-dot {
+  0%, 100% { box-shadow: 0 0 6px var(--gold-dim); }
+  50% { box-shadow: 0 0 18px var(--gold); }
+}
+
+.nav-line {
+  width: 24px;
+  height: 2px;
+  flex-shrink: 0;
+}
+
+.nav-line.done { background: var(--green-dim); }
+.nav-line.current { background: linear-gradient(90deg, var(--green-dim), var(--gold-dim)); }
+.nav-line.future { background: var(--purple-dim); opacity: 0.4; border-top: 1.5px dashed var(--purple); height: 0; }
+
+.nav-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  color: var(--text-dim);
+  margin-left: 4px;
+  transition: color 0.3s;
+}
+
+.nav-node:hover .nav-label { color: var(--text-primary); }
+.nav-node:hover .nav-dot { transform: scale(1.4); }
+
+.nav-stats {
+  display: flex;
+  gap: 1.2rem;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.nav-stat-val {
+  color: var(--cyan);
+  font-weight: 700;
+}
+
+/* === HERO === */
+.hero {
+  position: relative;
+  z-index: 1;
+  padding: 7rem 2rem 3rem;
+  max-width: 1200px;
+  margin: 0 auto;
+  text-align: center;
+}
+
+.hero-overline {
+  font-family: 'Orbitron', monospace;
+  font-size: 0.75rem;
+  letter-spacing: 6px;
+  text-transform: uppercase;
+  color: var(--cyan-dim);
+  margin-bottom: 1rem;
+  animation: fadeInDown 0.8s ease-out;
+}
+
+.hero-title {
+  font-family: 'Orbitron', monospace;
+  font-weight: 900;
+  font-size: clamp(2rem, 5vw, 3.5rem);
+  line-height: 1.15;
+  margin-bottom: 1.2rem;
+  animation: fadeInDown 0.8s ease-out 0.15s both;
+}
+
+.hero-title .highlight {
+  background: linear-gradient(135deg, var(--cyan), var(--purple), var(--gold));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-size: 200% 200%;
+  animation: gradientShift 6s ease-in-out infinite;
+}
+
+@keyframes gradientShift {
+  0%, 100% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+}
+
+.hero-subtitle {
+  font-size: 1rem;
+  color: var(--text-secondary);
+  max-width: 700px;
+  margin: 0 auto 2rem;
+  line-height: 1.8;
+  animation: fadeInDown 0.8s ease-out 0.3s both;
+}
+
+.hero-subtitle .accent { color: var(--cyan); font-weight: 700; }
+.hero-subtitle .gold { color: var(--gold); font-weight: 700; }
+.hero-subtitle .purple { color: var(--purple); font-weight: 700; }
+
+.hero-metrics {
+  display: flex;
+  justify-content: center;
+  gap: 2.5rem;
+  flex-wrap: wrap;
+  animation: fadeInUp 0.8s ease-out 0.5s both;
+}
+
+.hero-metric {
+  text-align: center;
+}
+
+.hero-metric-val {
+  font-family: 'Orbitron', monospace;
+  font-size: 1.8rem;
+  font-weight: 900;
+  background: linear-gradient(180deg, var(--text-primary), var(--cyan));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.hero-metric-label {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  margin-top: 0.2rem;
+  letter-spacing: 1px;
+}
+
+/* === SECTION === */
+.section {
+  position: relative;
+  z-index: 1;
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 2rem 2rem 4rem;
+}
+
+.section-header {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 2.5rem;
+}
+
+.section-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.2rem;
+  flex-shrink: 0;
+}
+
+.section-icon.product {
+  background: linear-gradient(135deg, rgba(56,189,248,0.15), rgba(56,189,248,0.05));
+  border: 1px solid rgba(56,189,248,0.2);
+}
+
+.section-icon.market {
+  background: linear-gradient(135deg, rgba(251,191,36,0.15), rgba(251,191,36,0.05));
+  border: 1px solid rgba(251,191,36,0.2);
+}
+
+.section-title {
+  font-family: 'Orbitron', monospace;
+  font-size: 1.1rem;
+  font-weight: 700;
+  letter-spacing: 2px;
+}
+
+.section-title.product { color: var(--cyan); }
+.section-title.market { color: var(--gold); }
+
+.section-tagline {
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  margin-left: auto;
+  font-style: italic;
+}
+
+/* === TIMELINE === */
+.timeline {
+  position: relative;
+  padding-left: 3rem;
+}
+
+.timeline::before {
+  content: '';
+  position: absolute;
+  left: 14px;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: linear-gradient(180deg, var(--green-dim), var(--gold-dim) 40%, var(--purple-dim) 70%, transparent);
+}
+
+/* === VERSION CARD === */
+.v-card {
+  position: relative;
+  margin-bottom: 2rem;
+  border-radius: 16px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-dim);
+  padding: 1.5rem 1.8rem;
+  transition: all 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+  opacity: 0;
+  transform: translateY(30px);
+}
+
+.v-card.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.v-card:hover {
+  background: var(--bg-card-hover);
+  border-color: var(--border-glow);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 32px rgba(56, 189, 248, 0.08);
+}
+
+.v-card.current {
+  border-color: rgba(251, 191, 36, 0.3);
+  box-shadow: 0 0 30px rgba(251, 191, 36, 0.06), inset 0 0 30px rgba(251, 191, 36, 0.02);
+}
+
+.v-card.current:hover {
+  border-color: rgba(251, 191, 36, 0.5);
+  box-shadow: 0 0 40px rgba(251, 191, 36, 0.1), inset 0 0 30px rgba(251, 191, 36, 0.03);
+}
+
+.v-card.future {
+  border-style: dashed;
+  border-color: rgba(167, 139, 250, 0.2);
+  opacity: 0;
+}
+
+.v-card.future.visible {
+  opacity: 0.75;
+}
+
+.v-card.future:hover {
+  opacity: 1;
+  border-color: rgba(167, 139, 250, 0.4);
+}
+
+/* Timeline node dot */
+.v-card::before {
+  content: '';
+  position: absolute;
+  left: -2.35rem;
+  top: 1.7rem;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  z-index: 2;
+}
+
+.v-card.done::before {
+  background: var(--green);
+  box-shadow: 0 0 8px var(--green-dim);
+}
+
+.v-card.current::before {
+  background: var(--gold);
+  box-shadow: 0 0 12px var(--gold-dim);
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+
+.v-card.future::before {
+  background: transparent;
+  border: 2px dashed var(--purple);
+}
+
+/* Card header */
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  margin-bottom: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.v-version {
+  font-family: 'Orbitron', monospace;
+  font-weight: 900;
+  font-size: 1.3rem;
+  letter-spacing: 1px;
+}
+
+.v-version.done { color: var(--green); }
+.v-version.current { color: var(--gold); }
+.v-version.future { color: var(--purple); }
+
+.v-badge {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  padding: 3px 10px;
+  border-radius: 20px;
+  line-height: 1.4;
+}
+
+.v-badge.done {
+  background: rgba(52, 211, 153, 0.1);
+  color: var(--green);
+  border: 1px solid rgba(52, 211, 153, 0.25);
+}
+
+.v-badge.current {
+  background: rgba(251, 191, 36, 0.1);
+  color: var(--gold);
+  border: 1px solid rgba(251, 191, 36, 0.3);
+  animation: badge-glow 3s ease-in-out infinite;
+}
+
+.v-badge.future {
+  background: rgba(167, 139, 250, 0.08);
+  color: var(--purple);
+  border: 1px dashed rgba(167, 139, 250, 0.25);
+}
+
+@keyframes badge-glow {
+  0%, 100% { box-shadow: 0 0 4px rgba(251, 191, 36, 0.1); }
+  50% { box-shadow: 0 0 12px rgba(251, 191, 36, 0.25); }
+}
+
+.v-stage {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  margin-left: auto;
+  font-style: italic;
+  letter-spacing: 1px;
+}
+
+/* Card summary */
+.card-summary {
+  font-size: 0.95rem;
+  color: var(--text-secondary);
+  margin-bottom: 1rem;
+  line-height: 1.6;
+}
+
+.card-summary .keyword {
+  font-weight: 700;
+}
+
+.card-summary .keyword.done { color: var(--green); }
+.card-summary .keyword.current { color: var(--gold); }
+.card-summary .keyword.future { color: var(--purple); }
+
+/* Feature list */
+.card-features {
+  list-style: none;
+  margin-bottom: 1.2rem;
+}
+
+.card-features li {
+  position: relative;
+  padding-left: 1.2rem;
+  margin-bottom: 0.4rem;
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+
+.card-features li::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0.55em;
+  width: 6px;
+  height: 6px;
+  border-radius: 2px;
+  transform: rotate(45deg);
+}
+
+.v-card.done .card-features li::before { background: var(--green-dim); }
+.v-card.current .card-features li::before { background: var(--gold-dim); }
+.v-card.future .card-features li::before { background: var(--purple-dim); }
+
+/* Metrics row */
+.card-metrics {
+  display: flex;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border-dim);
+}
+
+.metric {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.metric-val {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 1rem;
+  font-weight: 700;
+}
+
+.metric-val.done { color: var(--green); }
+.metric-val.current { color: var(--gold); }
+.metric-val.future { color: var(--purple-dim); }
+
+.metric-label {
+  font-size: 0.65rem;
+  color: var(--text-dim);
+  letter-spacing: 0.5px;
+}
+
+/* === EVOLUTION CHART === */
+.chart-section {
+  position: relative;
+  z-index: 1;
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 2rem 2rem 5rem;
+}
+
+.chart-container {
+  background: var(--bg-card);
+  border: 1px solid var(--border-dim);
+  border-radius: 16px;
+  padding: 2rem;
+  overflow: hidden;
+}
+
+.chart-title {
+  font-family: 'Orbitron', monospace;
+  font-size: 0.9rem;
+  color: var(--cyan);
+  letter-spacing: 2px;
+  margin-bottom: 1.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.chart-legend {
+  display: flex;
+  gap: 1.5rem;
+  margin-left: auto;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--text-dim);
+}
+
+.legend-line {
+  width: 20px;
+  height: 3px;
+  border-radius: 2px;
+}
+
+.legend-line.code { background: var(--cyan); }
+.legend-line.test { background: var(--green); }
+
+.chart-svg {
+  width: 100%;
+  height: 300px;
+}
+
+/* === ANIMATIONS === */
+@keyframes fadeInDown {
+  from { opacity: 0; transform: translateY(-20px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(20px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* === RESPONSIVE === */
+@media (max-width: 768px) {
+  .hero { padding: 6rem 1.2rem 2rem; }
+  .hero-metrics { gap: 1.5rem; }
+  .section { padding: 1.5rem 1rem 3rem; }
+  .timeline { padding-left: 2.5rem; }
+  .v-card { padding: 1.2rem; }
+  .v-stage { margin-left: 0; }
+  .card-metrics { gap: 1rem; }
+  .nav-stats { display: none; }
+  .section-tagline { display: none; }
+  .chart-container { padding: 1.2rem; }
+}
+
+/* === SCROLL PROGRESS === */
+.scroll-progress {
+  position: fixed;
+  top: 56px;
+  left: 0;
+  height: 2px;
+  background: linear-gradient(90deg, var(--cyan), var(--purple), var(--gold));
+  z-index: 101;
+  transition: width 0.1s;
+  width: 0%;
+}
+
+/* === PHASE TAGLINE BAR === */
+.phase-bar {
+  display: flex;
+  justify-content: center;
+  gap: 0;
+  margin: 2rem auto 3rem;
+  max-width: 900px;
+  animation: fadeInUp 0.8s ease-out 0.7s both;
+}
+
+.phase-step {
+  display: flex;
+  align-items: center;
+  gap: 0;
+}
+
+.phase-text {
+  font-family: 'Orbitron', monospace;
+  font-size: 0.7rem;
+  letter-spacing: 2px;
+  padding: 6px 16px;
+  border-radius: 20px;
+  white-space: nowrap;
+}
+
+.phase-text.tool {
+  background: rgba(52, 211, 153, 0.08);
+  color: var(--green);
+  border: 1px solid rgba(52, 211, 153, 0.2);
+}
+
+.phase-text.platform {
+  background: rgba(56, 189, 248, 0.08);
+  color: var(--cyan);
+  border: 1px solid rgba(56, 189, 248, 0.2);
+}
+
+.phase-text.assistant {
+  background: rgba(251, 191, 36, 0.08);
+  color: var(--gold);
+  border: 1px solid rgba(251, 191, 36, 0.2);
+}
+
+.phase-text.ecosystem {
+  background: rgba(167, 139, 250, 0.08);
+  color: var(--purple);
+  border: 1px solid rgba(167, 139, 250, 0.2);
+}
+
+.phase-arrow {
+  font-family: 'Orbitron', monospace;
+  color: var(--text-dim);
+  font-size: 0.7rem;
+  margin: 0 6px;
+  letter-spacing: 0;
+}
+</style>
+</head>
+<body>
+
+<div class="bg-grid"></div>
+<div class="bg-glow-1"></div>
+<div class="bg-glow-2"></div>
+
+<!-- Scroll Progress -->
+<div class="scroll-progress" id="scrollProgress"></div>
+
+<!-- Navigation -->
+<nav class="version-nav">
+  <div class="nav-brand">KELAILAI</div>
+  <div class="nav-track" id="navTrack"></div>
+  <div class="nav-stats">
+    <span>版本 <span class="nav-stat-val" id="statVersions">8</span></span>
+    <span>当前 <span class="nav-stat-val" id="statCurrent">v3.0</span></span>
+    <span>规划 <span class="nav-stat-val" id="statFuture">5</span></span>
+  </div>
+</nav>
+
+<!-- Hero -->
+<section class="hero">
+  <div class="hero-overline">VERSION EVOLUTION ROADMAP</div>
+  <h1 class="hero-title">
+    <span class="highlight">v1.0 → v3.0 → v8.0</span>
+  </h1>
+  <p class="hero-subtitle">
+    <span class="accent">8 个里程碑</span> · 从<span class="accent">全渠道工具</span>到<span class="gold">智能助手</span>再到<span class="purple">开放生态</span><br>
+    核心指标：发布版本 <span class="accent">8</span> / 当前版本 <span class="gold">v3.0</span> / 规划版本 <span class="purple">5</span>
+  </p>
+  <div class="hero-metrics">
+    <div class="hero-metric">
+      <div class="hero-metric-val">8</div>
+      <div class="hero-metric-label">产品版本</div>
+    </div>
+    <div class="hero-metric">
+      <div class="hero-metric-val">5</div>
+      <div class="hero-metric-label">市场阶段</div>
+    </div>
+    <div class="hero-metric">
+      <div class="hero-metric-val">v3.0</div>
+      <div class="hero-metric-label">当前版本</div>
+    </div>
+    <div class="hero-metric">
+      <div class="hero-metric-val">13</div>
+      <div class="hero-metric-label">总里程碑</div>
+    </div>
+  </div>
+
+  <div class="phase-bar">
+    <div class="phase-step">
+      <span class="phase-text tool">🔧 工具</span>
+      <span class="phase-arrow">→</span>
+    </div>
+    <div class="phase-step">
+      <span class="phase-text platform">⚡ 平台</span>
+      <span class="phase-arrow">→</span>
+    </div>
+    <div class="phase-step">
+      <span class="phase-text assistant">🤖 助手</span>
+      <span class="phase-arrow">→</span>
+    </div>
+    <div class="phase-step">
+      <span class="phase-text ecosystem">🌐 生态</span>
+    </div>
+  </div>
+</section>
+
+<!-- Product Versions -->
+<section class="section" id="productSection">
+  <div class="section-header">
+    <div class="section-icon product">🚀</div>
+    <div class="section-title product">PRODUCT ROADMAP</div>
+    <div class="section-tagline">工具 → 平台 → 助手 → 生态</div>
+  </div>
+  <div class="timeline" id="productTimeline"></div>
+</section>
+
+<!-- Market Versions -->
+<section class="section" id="marketSection">
+  <div class="section-header">
+    <div class="section-icon market">📈</div>
+    <div class="section-title market">MARKET ROADMAP</div>
+    <div class="section-tagline">验证 → 量化 → 扩张 → 商业 → 资本</div>
+  </div>
+  <div class="timeline" id="marketTimeline"></div>
+</section>
+
+<!-- Evolution Chart -->
+<section class="chart-section">
+  <div class="chart-container">
+    <div class="chart-title">
+      <span>EVOLUTION CURVE</span>
+      <div class="chart-legend">
+        <div class="legend-item"><div class="legend-line code"></div>代码规模</div>
+        <div class="legend-item"><div class="legend-line test"></div>测试通过率</div>
+      </div>
+    </div>
+    <svg class="chart-svg" id="chartSvg" viewBox="0 0 1000 300" preserveAspectRatio="xMidYMid meet"></svg>
+  </div>
+</section>
+
+<script>
+// === DATA ===
+const productVersions = [
+  {
+    version: 'v1.0.0',
+    status: 'done',
+    badge: '已发布',
+    summary: '全渠道统一回复管理，打通各个开放平台',
+    keyword: '基础奠基',
+    stage: '工具期',
+    features: [
+      '多平台消息聚合：微信/抖音/小红书/快手统一收件箱',
+      '统一回复模板库，一键快捷回复',
+      '客户基础画像：来源渠道 / 首次接触时间 / 标签',
+      '消息自动分类：咨询 / 投诉 / 售后智能路由',
+      '基础数据看板：消息量 / 响应时长 / 客户增长',
+      '团队协作：分配客户 / 内部备注 / 转接'
+    ],
+    metrics: [
+      { val: '42', label: '代码文件' },
+      { val: '6', label: '核心模块' },
+      { val: '180+', label: '测试用例' },
+      { val: '78%', label: '覆盖率' }
+    ]
+  },
+  {
+    version: 'v2.0.0',
+    status: 'done',
+    badge: '已发布',
+    summary: '逐步实现 AI 自动对话获客，从人工应答到智能接客',
+    keyword: '智能萌芽',
+    stage: '工具期',
+    features: [
+      'AI 意图识别引擎：自动判断客户咨询意图',
+      '智能话术推荐：基于上下文生成回复建议',
+      '自动跟进提醒：客户沉默超时自动触发跟进任务',
+      '对话质量评分：AI 评估对话效果并给出优化建议',
+      '多轮对话记忆：跨会话保持客户上下文',
+      'A/B 话术测试：不同话术版本效果对比',
+      'AI 训练数据标注后台'
+    ],
+    metrics: [
+      { val: '128', label: '代码文件' },
+      { val: '14', label: '核心模块' },
+      { val: '520+', label: '测试用例' },
+      { val: '85%', label: '覆盖率' },
+      { val: '3', label: 'CI 流水线' }
+    ]
+  },
+  {
+    version: 'v3.0.0',
+    status: 'current',
+    badge: '当前版本',
+    summary: '实现自动销售，AI 从对话者升级为成交者',
+    keyword: '增长引擎',
+    stage: '平台期',
+    features: [
+      'AI 自动销售流程：需求确认 → 方案推荐 → 促单 → 签约',
+      '智能报价引擎：根据客户画像动态生成报价方案',
+      '销售漏斗可视化：从线索到成交全链路追踪',
+      '自动合同生成与电子签约集成',
+      '客户生命周期价值 (LTV) 预测模型',
+      '销售话术实时辅助：关键节点话术弹窗提示',
+      '业绩目标自动拆解与进度追踪',
+      '跨渠道客户归因分析'
+    ],
+    metrics: [
+      { val: '256', label: '代码文件' },
+      { val: '22', label: '核心模块' },
+      { val: '1200+', label: '测试用例' },
+      { val: '91%', label: '覆盖率' },
+      { val: '5', label: 'CI 流水线' },
+      { val: '68%', label: '自动化率' }
+    ]
+  },
+  {
+    version: 'v4.0.0',
+    status: 'future',
+    badge: '规划中',
+    summary: 'AIGC 多平台推送，图文视频宣传自动获客',
+    keyword: '内容矩阵',
+    stage: '平台期',
+    features: [
+      'AIGC 图文生成：自动创作营销推文 / 海报 / 长图文',
+      'AI 视频脚本生成与短视频自动剪辑',
+      '多平台内容一键分发：微信 / 抖音 / 小红书 / 快手',
+      '智能投放策略：基于受众画像自动选择投放渠道与时段',
+      '内容效果追踪：阅读 / 点赞 / 转化全链路归因',
+      'A/B 内容测试与自动优选'
+    ],
+    metrics: [
+      { val: '~380', label: '代码文件' },
+      { val: '~30', label: '核心模块' },
+      { val: '~2000', label: '测试用例' },
+      { val: '~93%', label: '覆盖率' }
+    ]
+  },
+  {
+    version: 'v5.0.0',
+    status: 'future',
+    badge: '规划中',
+    summary: '自动评论区寻找意向客户，主动出击精准猎手',
+    keyword: '精准猎手',
+    stage: '助手期',
+    features: [
+      '评论区 AI 巡检：自动扫描竞品 / 行业相关内容评论区',
+      '意向度评分模型：从评论内容判断购买意向等级',
+      '自动私信触达：高意向客户自动发送定制化私信',
+      '舆情监控与商机预警：行业热点 / 竞品动态实时推送',
+      '客户来源逆向追踪：从评论到成交全链路归因',
+      '智能话术匹配：根据评论内容自动匹配最佳破冰话术'
+    ],
+    metrics: [
+      { val: '~460', label: '代码文件' },
+      { val: '~36', label: '核心模块' },
+      { val: '~2800', label: '测试用例' },
+      { val: '~95%', label: '覆盖率' }
+    ]
+  },
+  {
+    version: 'v6.0.0',
+    status: 'future',
+    badge: '规划中',
+    summary: '全流程全覆盖简化，从获客到成交一站式闭环',
+    keyword: '极致闭环',
+    stage: '助手期',
+    features: [
+      '全流程自动化编排：获客 → 沟通 → 销售 → 售后一键配置',
+      '流程可视化拖拽设计器',
+      '跨系统数据打通：CRM / ERP / 财务系统无缝集成',
+      '智能异常处理：流程卡点自动识别与修复建议',
+      '一键部署行业模板：不同赛道开箱即用流程方案',
+      '自动化率仪表盘：全流程自动化程度实时监控',
+      '低代码扩展：自定义节点与 Webhook 集成'
+    ],
+    metrics: [
+      { val: '~580', label: '代码文件' },
+      { val: '~44', label: '核心模块' },
+      { val: '~3800', label: '测试用例' },
+      { val: '~96%', label: '覆盖率' },
+      { val: '~85%', label: '自动化率' }
+    ]
+  },
+  {
+    version: 'v7.0.0',
+    status: 'future',
+    badge: '规划中',
+    summary: '多平台数据财务统计与负责管理，从工具到助手跃迁',
+    keyword: '智能助手',
+    stage: '助手期',
+    features: [
+      '多平台数据统一看板：跨渠道营收 / 成本 / 利润实时汇总',
+      'AI 财务分析助手：自然语言查询财务数据与趋势',
+      '智能预算分配：基于 ROI 自动建议各渠道预算配比',
+      '负责人绩效看板：团队 / 个人多维度业绩追踪',
+      '异常预警：成本超标 / 利润下滑 / 渠道异常自动告警',
+      '自动化财务报表生成与导出',
+      'AI 决策建议：基于数据给出下一步行动建议'
+    ],
+    metrics: [
+      { val: '~700', label: '代码文件' },
+      { val: '~52', label: '核心模块' },
+      { val: '~5000', label: '测试用例' },
+      { val: '~97%', label: '覆盖率' },
+      { val: '~90%', label: '自动化率' }
+    ]
+  },
+  {
+    version: 'v8.0.0',
+    status: 'future',
+    badge: '规划中',
+    summary: '开放平台，构建客来来生态，从产品到基础设施',
+    keyword: '生态纪元',
+    stage: '生态期',
+    features: [
+      '开放 API 平台：客户 / 对话 / 营销 / 数据全接口开放',
+      '插件市场：第三方开发者发布和销售插件',
+      'ISV 合作计划：认证合作伙伴与解决方案市场',
+      'Webhook & 事件订阅：实时数据推送与系统集成',
+      '低代码应用构建器：合作伙伴自定义业务应用',
+      '开放数据标准：行业数据模型与交换协议',
+      '开发者社区与文档中心',
+      '应用审核与安全沙箱机制'
+    ],
+    metrics: [
+      { val: '~900+', label: '代码文件' },
+      { val: '~65+', label: '核心模块' },
+      { val: '~7000+', label: '测试用例' },
+      { val: '~98%', label: '覆盖率' },
+      { val: '~95%', label: '自动化率' }
+    ]
+  }
+];
+
+const marketVersions = [
+  {
+    version: 'M1.0',
+    status: 'done',
+    badge: '已完成',
+    summary: '跑通单个赛道客户获取，验证核心假设与初步数据',
+    keyword: '验证期',
+    stage: '0→1',
+    features: [
+      '选定单一垂直赛道（如教育培训 / 本地生活）',
+      '完成首批 3-5 个种子客户交付',
+      '验证 AI 获客核心链路：触达 → 对话 → 转化',
+      '收集客户反馈，打磨产品核心体验',
+      '建立基础运营 SOP 与客户成功流程'
+    ],
+    metrics: [
+      { val: '5', label: '种子客户' },
+      { val: '¥2.8K', label: '月均获客成本' },
+      { val: '32%', label: '转化率' }
+    ]
+  },
+  {
+    version: 'M2.0',
+    status: 'current',
+    badge: '当前阶段',
+    summary: '3-5 个客户量化数据对标，证明效率优势',
+    keyword: '量化期',
+    stage: '1→10',
+    features: [
+      '拓展至 3-5 个付费客户，覆盖 2-3 个细分赛道',
+      '建立量化数据体系：获客成本 / 转化率 / ROI 对标',
+      '与传统获客方式（人工 / 广告）做 A/B 效率对比',
+      '客户案例包装与标杆打造',
+      '建立可复制的客户获取与交付流程',
+      '产品定价模型验证与优化'
+    ],
+    metrics: [
+      { val: '5', label: '付费客户' },
+      { val: '↓45%', label: '获客成本降低' },
+      { val: '2.8x', label: '效率提升' },
+      { val: '¥180K', label: '月营收' }
+    ]
+  },
+  {
+    version: 'M3.0',
+    status: 'future',
+    badge: '规划中',
+    summary: '生态合作与对接更多客户，规模化增长启动',
+    keyword: '扩张期',
+    stage: '10→100',
+    features: [
+      '建立渠道合作网络：代理商 / ISV / 行业解决方案商',
+      '客户规模突破 50+，覆盖 5+ 垂直行业',
+      '推出合作伙伴计划与分成体系',
+      '行业解决方案标准化：不同赛道开箱即用方案',
+      '品牌建设：行业峰会 / 白皮书 / 案例分享'
+    ],
+    metrics: [
+      { val: '50+', label: '客户数' },
+      { val: '5+', label: '行业覆盖' },
+      { val: '¥1.5M', label: '月营收' }
+    ]
+  },
+  {
+    version: 'M4.0',
+    status: 'future',
+    badge: '规划中',
+    summary: '完成成本利润闭环，实现可持续盈利模型',
+    keyword: '商业期',
+    stage: '100→1000',
+    features: [
+      '精细化成本结构：边际成本持续下降',
+      '多维度盈利模型：SaaS 订阅 + 增值服务 + API 调用',
+      '客户成功体系成熟：续费率 > 90%',
+      '净收入留存率 (NRR) > 120%',
+      '运营效率指标全面达标：LTV/CAC > 5',
+      '财务模型可预测：季度偏差 < 10%'
+    ],
+    metrics: [
+      { val: '200+', label: '客户数' },
+      { val: '>90%', label: '续费率' },
+      { val: '>5x', label: 'LTV/CAC' },
+      { val: '盈利', label: '财务状态' }
+    ]
+  },
+  {
+    version: 'M5.0',
+    status: 'future',
+    badge: '规划中',
+    summary: '路演 ABCD 轮融资，最终 IPO 或战略并购',
+    keyword: '资本期',
+    stage: '1000+',
+    features: [
+      'A 轮：产品-市场匹配验证，规模化增长启动',
+      'B 轮：行业领导地位确立，跨赛道扩张',
+      'C 轮：生态平台成型，开放平台上线',
+      'D 轮：国际化布局，全球市场拓展',
+      'IPO / 并购：资本市场退出或战略整合',
+      '长期愿景：成为智能获客基础设施'
+    ],
+    metrics: [
+      { val: '1000+', label: '客户数' },
+      { val: '¥100M+', label: '年营收' },
+      { val: 'IPO', label: '目标' }
+    ]
+  }
+];
+
+// === RENDER FUNCTIONS ===
+function renderCard(v, index) {
+  const statusClass = v.status;
+  const delay = index * 0.1;
+
+  let metricsHtml = v.metrics.map(m =>
+    `<div class="metric">
+      <div class="metric-val ${statusClass}">${m.val}</div>
+      <div class="metric-label">${m.label}</div>
+    </div>`
+  ).join('');
+
+  let featuresHtml = v.features.map(f => `<li>${f}</li>`).join('');
+
+  return `<div class="v-card ${statusClass}" data-delay="${delay}" id="${v.version.replace('.', '_')}">
+    <div class="card-head">
+      <span class="v-version ${statusClass}">${v.version}</span>
+      <span class="v-badge ${statusClass}">${v.badge}</span>
+      <span class="v-stage">${v.stage}</span>
+    </div>
+    <div class="card-summary">
+      ${v.summary} · <span class="keyword ${statusClass}">${v.keyword}</span>
+    </div>
+    <ul class="card-features">${featuresHtml}</ul>
+    <div class="card-metrics">${metricsHtml}</div>
+  </div>`;
+}
+
+function renderTimeline(containerId, versions) {
+  const container = document.getElementById(containerId);
+  container.innerHTML = versions.map((v, i) => renderCard(v, i)).join('');
+}
+
+function renderNav() {
+  const track = document.getElementById('navTrack');
+  const allVersions = [
+    ...productVersions.map(v => ({ ...v, short: v.version.replace('v', '').replace('.0.0', '') })),
+    { version: '|', status: 'divider' },
+    ...marketVersions.map(v => ({ ...v, short: v.version.replace('M', 'M') }))
+  ];
+
+  let html = '';
+  allVersions.forEach((v, i) => {
+    if (v.status === 'divider') {
+      html += `<span style="color:var(--text-dim);margin:0 6px;font-size:0.7rem">|</span>`;
+      return;
+    }
+    const lineStatus = v.status === 'done' ? 'done' : v.status === 'current' ? 'current' : 'future';
+    if (i > 0 && allVersions[i-1].status !== 'divider') {
+      html += `<div class="nav-line ${lineStatus}"></div>`;
+    }
+    html += `<div class="nav-node" onclick="document.getElementById('${v.version.replace(/\./g, '_')}')?.scrollIntoView({behavior:'smooth',block:'center'})">
+      <div class="nav-dot ${v.status}"></div>
+      <span class="nav-label">${v.short}</span>
+    </div>`;
+  });
+  track.innerHTML = html;
+}
+
+// === CHART ===
+function renderChart() {
+  const svg = document.getElementById('chartSvg');
+  const w = 1000, h = 300;
+  const padL = 60, padR = 60, padT = 30, padB = 50;
+  const chartW = w - padL - padR;
+  const chartH = h - padT - padB;
+
+  // Data points (code scale and test pass rate)
+  const codeData = [42, 128, 256, 380, 460, 580, 700, 900];
+  const testData = [78, 85, 91, 93, 95, 96, 97, 98];
+  const labels = ['v1.0', 'v2.0', 'v3.0', 'v4.0', 'v5.0', 'v6.0', 'v7.0', 'v8.0'];
+
+  const maxCode = 1000;
+  const minTest = 70, maxTest = 100;
+
+  function xPos(i) { return padL + (i / (codeData.length - 1)) * chartW; }
+  function yCode(val) { return padT + chartH - (val / maxCode) * chartH; }
+  function yTest(val) { return padT + chartH - ((val - minTest) / (maxTest - minTest)) * chartH; }
+
+  // Grid lines
+  let gridLines = '';
+  for (let i = 0; i <= 5; i++) {
+    const y = padT + (i / 5) * chartH;
+    gridLines += `<line x1="${padL}" y1="${y}" x2="${w - padR}" y2="${y}" stroke="rgba(56,189,248,0.06)" stroke-width="1"/>`;
+  }
+
+  // Code area fill
+  let codeArea = `M${xPos(0)},${yCode(0)}`;
+  codeData.forEach((v, i) => { codeArea += ` L${xPos(i)},${yCode(v)}`; });
+  codeArea += ` L${xPos(codeData.length - 1)},${yCode(0)} Z`;
+
+  // Code line
+  let codeLine = '';
+  codeData.forEach((v, i) => {
+    codeLine += (i === 0 ? 'M' : 'L') + `${xPos(i)},${yCode(v)}`;
+  });
+
+  // Test line
+  let testLine = '';
+  testData.forEach((v, i) => {
+    testLine += (i === 0 ? 'M' : 'L') + `${xPos(i)},${yTest(v)}`;
+  });
+
+  // Dots
+  let codeDots = codeData.map((v, i) => {
+    const isCurrent = i === 2;
+    const color = i < 2 ? '#34d399' : i === 2 ? '#fbbf24' : '#a78bfa';
+    const r = isCurrent ? 6 : 4;
+    return `<circle cx="${xPos(i)}" cy="${yCode(v)}" r="${r}" fill="${color}" stroke="rgba(10,14,26,0.8)" stroke-width="2">
+      <animate attributeName="r" values="${r};${r+2};${r}" dur="3s" repeatCount="indefinite" begin="${i*0.3}s"/>
+    </circle>`;
+  }).join('');
+
+  let testDots = testData.map((v, i) => {
+    const color = i < 2 ? '#34d399' : i === 2 ? '#fbbf24' : '#a78bfa';
+    return `<circle cx="${xPos(i)}" cy="${yTest(v)}" r="3.5" fill="${color}" stroke="rgba(10,14,26,0.8)" stroke-width="2"/>`;
+  }).join('');
+
+  // Labels
+  let xLabels = labels.map((l, i) =>
+    `<text x="${xPos(i)}" y="${h - padB + 20}" text-anchor="middle" fill="#64748b" font-size="11" font-family="JetBrains Mono, monospace">${l}</text>`
+  ).join('');
+
+  // Y axis labels
+  let yLabelsCode = '';
+  for (let i = 0; i <= 5; i++) {
+    const val = Math.round((maxCode / 5) * (5 - i));
+    const y = padT + (i / 5) * chartH;
+    yLabelsCode += `<text x="${padL - 10}" y="${y + 4}" text-anchor="end" fill="#38bdf8" font-size="10" font-family="JetBrains Mono, monospace">${val}</text>`;
+  }
+
+  let yLabelsTest = '';
+  for (let i = 0; i <= 5; i++) {
+    const val = Math.round(minTest + ((maxTest - minTest) / 5) * (5 - i));
+    const y = padT + (i / 5) * chartH;
+    yLabelsTest += `<text x="${w - padR + 10}" y="${y + 4}" text-anchor="start" fill="#34d399" font-size="10" font-family="JetBrains Mono, monospace">${val}%</text>`;
+  }
+
+  // Current version vertical line
+  const currentX = xPos(2);
+  const currentLine = `<line x1="${currentX}" y1="${padT}" x2="${currentX}" y2="${padT + chartH}" stroke="rgba(251,191,36,0.3)" stroke-width="1.5" stroke-dasharray="6,4"/>
+    <text x="${currentX}" y="${padT - 8}" text-anchor="middle" fill="#fbbf24" font-size="10" font-family="JetBrains Mono, monospace">CURRENT</text>`;
+
+  svg.innerHTML = `
+    <defs>
+      <linearGradient id="codeGrad" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="rgba(56,189,248,0.2)"/>
+        <stop offset="100%" stop-color="rgba(56,189,248,0)"/>
+      </linearGradient>
+      <linearGradient id="codeStroke" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0%" stop-color="#34d399"/>
+        <stop offset="35%" stop-color="#fbbf24"/>
+        <stop offset="100%" stop-color="#a78bfa"/>
+      </linearGradient>
+      <linearGradient id="testStroke" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0%" stop-color="#34d399"/>
+        <stop offset="35%" stop-color="#fbbf24"/>
+        <stop offset="100%" stop-color="#a78bfa"/>
+      </linearGradient>
+    </defs>
+    ${gridLines}
+    <path d="${codeArea}" fill="url(#codeGrad)"/>
+    <path d="${codeLine}" fill="none" stroke="url(#codeStroke)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="${testLine}" fill="none" stroke="url(#testStroke)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="8,4"/>
+    ${codeDots}
+    ${testDots}
+    ${currentLine}
+    ${xLabels}
+    ${yLabelsCode}
+    ${yLabelsTest}
+  `;
+}
+
+// === SCROLL ANIMATIONS ===
+function initScrollAnimations() {
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        const delay = parseFloat(entry.target.dataset.delay) || 0;
+        setTimeout(() => {
+          entry.target.classList.add('visible');
+        }, delay * 1000);
+        observer.unobserve(entry.target);
+      }
+    });
+  }, { threshold: 0.15, rootMargin: '0px 0px -50px 0px' });
+
+  document.querySelectorAll('.v-card').forEach(card => observer.observe(card));
+}
+
+function initScrollProgress() {
+  const bar = document.getElementById('scrollProgress');
+  window.addEventListener('scroll', () => {
+    const scrollTop = window.scrollY;
+    const docHeight = document.documentElement.scrollHeight - window.innerHeight;
+    const progress = docHeight > 0 ? (scrollTop / docHeight) * 100 : 0;
+    bar.style.width = progress + '%';
+  });
+}
+
+// === INIT ===
+document.addEventListener('DOMContentLoaded', () => {
+  renderTimeline('productTimeline', productVersions);
+  renderTimeline('marketTimeline', marketVersions);
+  renderNav();
+  renderChart();
+  initScrollAnimations();
+  initScrollProgress();
+});
+</script>
+
+</body>
+</html>
