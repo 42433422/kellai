@@ -7,6 +7,8 @@ import type {
   EventSubscription,
   AppTemplate,
   ReviewStatus,
+  PlatformStats,
+  ApiEndpointDoc,
 } from '../types';
 
 export const getAPIKeys = () =>
@@ -14,6 +16,15 @@ export const getAPIKeys = () =>
 
 export const createAPIKey = (name: string, scopes: string[]) =>
   request<APIKey>('post', '/api/kellai/open/api-keys', { name, scopes });
+
+export const revokeAPIKey = (id: string) =>
+  request<{ revoked: boolean }>('post', '/api/kellai/open/api-keys/revoke', { id });
+
+export const getPlatformStats = () =>
+  request<PlatformStats>('get', '/api/kellai/open/stats');
+
+export const getWebhooks = () =>
+  request<WebhookConfig[]>('get', '/api/kellai/open/webhooks');
 
 export const getPlugins = () =>
   request<Plugin[]>('get', '/api/kellai/open/plugins');
@@ -37,7 +48,7 @@ export const getAppTemplates = () =>
   request<AppTemplate[]>('get', '/api/kellai/open/app-builder');
 
 export const getAPIDocs = () =>
-  request<{ endpoints: { method: string; path: string; description: string }[] }>('get', '/api/kellai/open/docs');
+  request<{ endpoints: ApiEndpointDoc[] }>('get', '/api/kellai/open/docs');
 
 export const submitAppReview = (appName: string) =>
   request<ReviewStatus>('post', '/api/kellai/open/review', { app_name: appName });

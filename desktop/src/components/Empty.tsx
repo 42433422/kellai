@@ -31,7 +31,7 @@ export default function Empty({
   return (
     <div
       className={clsx(
-        "flex flex-col items-center justify-center py-10 text-center",
+        "flex flex-1 flex-col items-center justify-center py-10 text-center",
         className
       )}
     >

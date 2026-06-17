@@ -13,6 +13,8 @@ import {
   type RememberedAccount,
 } from "../stores/auth";
 import { clsx } from "clsx";
+import { sendSmsCode, resetPasswordByPhone } from "../api/auth";
+import { toastStore } from "../stores/toast";
 import {
   Mail,
   Phone,
@@ -21,6 +23,7 @@ import {
   Eye,
   EyeOff,
   ArrowRight,
+  ArrowLeft,
   ChevronDown,
   X,
   KeyRound,
@@ -212,7 +215,8 @@ function AvatarBadge({
 
 const isValidEmail = (v: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
 const isValidPhone = (v: string) => /^1[3-9]\d{9}$/.test(v);
-const isPasswordLongEnough = (v: string) => v.length >= 6;
+const isValidPassword = (v: string) => v.length >= 8 && /[A-Za-z]/.test(v) && /\d/.test(v);
+const passwordRuleText = "密码至少 8 位，且包含字母和数字";
 
 /** 取首字符做头像。用 Array.from 处理 surrogate pair（emoji、CJK 扩展 B 等）。 */
 function avatarChar(label: string): string {
@@ -225,7 +229,7 @@ function avatarChar(label: string): string {
 /* ============ 主组件 ============ */
 
 type LoginTab = "email" | "phone";
-type AuthMode = "login" | "register";
+type AuthMode = "login" | "register" | "forgot";
 
 export default function Login() {
   const [tab, setTab] = useState<LoginTab>("email");
@@ -260,6 +264,12 @@ export default function Login() {
   const [phone, setPhone] = useState("");
   const [code, setCode] = useState("");
   const [countdown, setCountdown] = useState(0);
+
+  // 找回密码表单
+  const [forgotPhone, setForgotPhone] = useState("");
+  const [forgotCode, setForgotCode] = useState("");
+  const [forgotPassword, setForgotPassword] = useState("");
+  const [showForgotPassword, setShowForgotPassword] = useState(false);
 
   // 注册表单
   const [regEmail, setRegEmail] = useState("");
@@ -388,8 +398,8 @@ export default function Login() {
     if (!email) errors.email = "请输入邮箱";
     else if (!isValidEmail(email)) errors.email = "邮箱格式不正确";
     if (!password) errors.password = "请输入密码";
-    else if (!isPasswordLongEnough(password))
-      errors.password = "密码至少 6 位";
+    else if (!isValidPassword(password))
+      errors.password = passwordRuleText;
     setFieldErrors(errors);
     return Object.keys(errors).length === 0;
   };
@@ -408,8 +418,8 @@ export default function Login() {
     if (!regEmail) errors.regEmail = "请输入邮箱";
     else if (!isValidEmail(regEmail)) errors.regEmail = "邮箱格式不正确";
     if (!regPassword) errors.regPassword = "请输入密码";
-    else if (!isPasswordLongEnough(regPassword))
-      errors.regPassword = "密码至少 6 位";
+    else if (!isValidPassword(regPassword))
+      errors.regPassword = passwordRuleText;
     if (!regConfirmPassword) errors.regConfirmPassword = "请确认密码";
     else if (regPassword !== regConfirmPassword)
       errors.regConfirmPassword = "两次密码不一致";
@@ -488,7 +498,7 @@ export default function Login() {
       await register({
         email: regEmail,
         password: regPassword,
-        name: regName,
+        display_name: regName,
       });
       // 注册成功：保存凭据（默认勾选"记住密码"）
       if (rememberPassword) {
@@ -505,11 +515,66 @@ export default function Login() {
     }, "注册失败，请稍后重试");
   };
 
+  /* ====== 发送短信验证码（手机登录 / 找回密码共用） ====== */
+  const sendCode = async (targetPhone: string, field: "phone" | "forgotPhone") => {
+    if (countdown > 0) return;
+    if (!isValidPhone(targetPhone)) {
+      setFieldErrors((prev) => ({ ...prev, [field]: "请输入正确的手机号" }));
+      return;
+    }
+    clearFieldError(field);
+    try {
+      const res = await sendSmsCode(targetPhone);
+      setCountdown(60);
+      toastStore.success(
+        res?.code ? `验证码已发送（开发模式：${res.code}）` : "验证码已发送，请注意查收"
+      );
+    } catch {
+      /* 全局响应拦截器已弹出错误提示 */
+    }
+  };
+
+  /* ====== 校验：找回密码 ====== */
+  const validateForgot = () => {
+    const errors: Record<string, string> = {};
+    if (!forgotPhone) errors.forgotPhone = "请输入手机号";
+    else if (!isValidPhone(forgotPhone)) errors.forgotPhone = "手机号格式不正确";
+    if (!forgotCode) errors.forgotCode = "请输入验证码";
+    if (!forgotPassword) errors.forgotPassword = "请输入新密码";
+    else if (!isValidPassword(forgotPassword))
+      errors.forgotPassword = passwordRuleText;
+    setFieldErrors(errors);
+    return Object.keys(errors).length === 0;
+  };
+
+  /* ====== 提交：找回密码 ====== */
+  const handleForgotPassword = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!validateForgot()) return;
+    void run(async () => {
+      await resetPasswordByPhone(forgotPhone, forgotCode, forgotPassword);
+      toastStore.success("密码已重置，请使用新密码登录");
+      // 重置成功 → 回到登录页（手机号 tab 预填）
+      setMode("login");
+      setTab("phone");
+      setPhone(forgotPhone);
+      setCode("");
+      setForgotCode("");
+      setForgotPassword("");
+      setCountdown(0);
+      clearMessages();
+    }, "重置失败，请检查验证码或稍后重试");
+  };
+
   /* ====== 切模式 / 切 tab ====== */
   const switchMode = (newMode: AuthMode) => {
     setMode(newMode);
     if (newMode === "login") {
       setPassword("");
+    } else if (newMode === "forgot") {
+      // 找回密码：尽量预填已输入过的手机号，重置验证码倒计时
+      setForgotPhone((prev) => prev || phone || "");
+      setCountdown(0);
     } else {
       // 进注册时清掉所有登录相关的临时状态，避免回切时残留
       setActiveEmail("");
@@ -682,10 +747,7 @@ export default function Login() {
       <div className="flex items-center justify-between text-sm">
         <button
           type="button"
-          onClick={() => {
-            // TODO: 接入后端 /api/kellai/auth/forgot 后跳转到对应流程
-            setError("忘记密码流程暂未上线，请联系管理员重置。");
-          }}
+          onClick={() => switchMode("forgot")}
           className="text-blue-600 transition-colors hover:text-blue-700 hover:underline"
         >
           忘记密码？
@@ -804,12 +866,18 @@ export default function Login() {
 
           <div className="mb-6">
             <h2 className="text-2xl font-bold text-gray-900">
-              {mode === "login" ? "欢迎回来" : "创建账号"}
+              {mode === "login"
+                ? "欢迎回来"
+                : mode === "register"
+                ? "创建账号"
+                : "找回密码"}
             </h2>
             <p className="mt-1 text-sm text-gray-500">
               {mode === "login"
                 ? "登录您的账号以继续使用"
-                : "注册一个新账号开始使用"}
+                : mode === "register"
+                ? "注册一个新账号开始使用"
+                : "通过手机验证码重置您的登录密码"}
             </p>
           </div>
 
@@ -985,19 +1053,7 @@ export default function Login() {
                   </div>
                   <button
                     type="button"
-                    onClick={() => {
-                      if (!phone || countdown > 0) return;
-                      if (!isValidPhone(phone)) {
-                        setFieldErrors((prev) => ({
-                          ...prev,
-                          phone: "请输入正确的手机号",
-                        }));
-                        return;
-                      }
-                      clearFieldError("phone");
-                      setCountdown(60);
-                      // TODO: 调后端发送验证码
-                    }}
+                    onClick={() => void sendCode(phone, "phone")}
                     disabled={countdown > 0 || !phone}
                     className="shrink-0 rounded-lg border border-blue-600 px-4 py-2.5 text-sm font-medium text-blue-600 transition-colors hover:bg-blue-50 disabled:cursor-not-allowed disabled:border-gray-300 disabled:text-gray-400 disabled:hover:bg-transparent"
                   >
@@ -1042,7 +1098,7 @@ export default function Login() {
                   setRegPassword(v);
                   clearFieldError("regPassword");
                 }}
-                placeholder="请输入密码（至少 6 位）"
+                placeholder="请输入密码（至少 8 位，含字母和数字）"
                 error={fieldErrors.regPassword}
                 rightSlot={
                   <PasswordToggle
@@ -1093,29 +1149,123 @@ export default function Login() {
             </form>
           )}
 
-          <div className="mt-6 text-center text-sm text-gray-500">
-            {mode === "login" ? (
-              <>
-                还没有账号？{" "}
-                <button
-                  onClick={() => switchMode("register")}
-                  className="font-medium text-blue-600 hover:text-blue-700"
-                >
-                  注册账号
-                </button>
-              </>
-            ) : (
-              <>
-                已有账号？{" "}
-                <button
-                  onClick={() => switchMode("login")}
-                  className="font-medium text-blue-600 hover:text-blue-700"
-                >
-                  返回登录
-                </button>
-              </>
-            )}
-          </div>
+          {/* 找回密码表单 */}
+          {mode === "forgot" && (
+            <form onSubmit={handleForgotPassword} className="space-y-4">
+              <FormField
+                label="手机号"
+                icon={<Phone className="h-4 w-4" />}
+                type="tel"
+                value={forgotPhone}
+                onChange={(v) => {
+                  setForgotPhone(v);
+                  clearFieldError("forgotPhone");
+                }}
+                placeholder="请输入注册时使用的手机号"
+                maxLength={11}
+                autoFocus
+                error={fieldErrors.forgotPhone}
+              />
+              <div>
+                <label className="mb-1.5 block text-sm font-medium text-gray-700">
+                  验证码
+                </label>
+                <div className="flex gap-3">
+                  <div className="relative flex-1">
+                    <Lock className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
+                    <input
+                      type="text"
+                      value={forgotCode}
+                      onChange={(e) => {
+                        setForgotCode(e.target.value);
+                        clearFieldError("forgotCode");
+                      }}
+                      placeholder="请输入验证码"
+                      maxLength={6}
+                      className={clsx(
+                        "w-full rounded-lg border py-2.5 pl-10 pr-4 text-sm text-black outline-none transition-colors focus:ring-2 placeholder:text-gray-400 focus:placeholder:text-gray-300",
+                        fieldErrors.forgotCode
+                          ? "border-red-300 focus:border-red-500 focus:ring-red-500/20"
+                          : "border-gray-300 focus:border-blue-500 focus:ring-blue-500/20"
+                      )}
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void sendCode(forgotPhone, "forgotPhone")}
+                    disabled={countdown > 0 || !forgotPhone}
+                    className="shrink-0 rounded-lg border border-blue-600 px-4 py-2.5 text-sm font-medium text-blue-600 transition-colors hover:bg-blue-50 disabled:cursor-not-allowed disabled:border-gray-300 disabled:text-gray-400 disabled:hover:bg-transparent"
+                  >
+                    {countdown > 0 ? `${countdown}s` : "获取验证码"}
+                  </button>
+                </div>
+                {fieldErrors.forgotCode && (
+                  <p className="mt-1 text-xs text-red-500">
+                    {fieldErrors.forgotCode}
+                  </p>
+                )}
+              </div>
+              <FormField
+                label="新密码"
+                icon={<Lock className="h-4 w-4" />}
+                type={showForgotPassword ? "text" : "password"}
+                value={forgotPassword}
+                onChange={(v) => {
+                  setForgotPassword(v);
+                  clearFieldError("forgotPassword");
+                }}
+                placeholder="请输入新密码（至少 8 位，含字母和数字）"
+                error={fieldErrors.forgotPassword}
+                rightSlot={
+                  <PasswordToggle
+                    visible={showForgotPassword}
+                    onChange={setShowForgotPassword}
+                  />
+                }
+              />
+              <button
+                type="submit"
+                disabled={loading}
+                className="w-full rounded-lg bg-gradient-to-r from-blue-600 to-indigo-600 py-2.5 text-sm font-medium text-white shadow-sm transition-all hover:from-blue-700 hover:to-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {loading ? "重置中..." : "重置密码"}
+              </button>
+              <button
+                type="button"
+                onClick={() => switchMode("login")}
+                className="flex w-full items-center justify-center gap-1 text-sm text-gray-500 transition-colors hover:text-gray-700"
+              >
+                <ArrowLeft className="h-3.5 w-3.5" />
+                返回登录
+              </button>
+            </form>
+          )}
+
+          {mode !== "forgot" && (
+            <div className="mt-6 text-center text-sm text-gray-500">
+              {mode === "login" ? (
+                <>
+                  还没有账号？{" "}
+                  <button
+                    onClick={() => switchMode("register")}
+                    className="font-medium text-blue-600 hover:text-blue-700"
+                  >
+                    注册账号
+                  </button>
+                </>
+              ) : (
+                <>
+                  已有账号？{" "}
+                  <button
+                    onClick={() => switchMode("login")}
+                    className="font-medium text-blue-600 hover:text-blue-700"
+                  >
+                    返回登录
+                  </button>
+                </>
+              )}
+            </div>
+          )}
         </div>
       </div>
     </div>

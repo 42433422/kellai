@@ -754,5 +754,74 @@ def test_login_invalidates_other_devices_on_password_change(tmp_db):
     assert verify_token(old_token) is None, "改密后旧 token 仍有效！"
 
 
+def test_reset_password_by_phone_full_flow(tmp_db):
+    """找回密码：发码 → 重置 → 用新密码登录成功，旧密码失效。"""
+    from app.services import auth
+
+    phone = "13900000010"
+    reg = auth.register_user(phone=phone, password="OldPass123")
+    assert reg["success"] is True
+    user_id = reg["user"]["id"]
+
+    # 注册成功后能拿到一个有效会话 token
+    old_token = reg["access_token"]
+    assert auth.verify_token(old_token) is not None
+
+    # 发送验证码并重置密码
+    code = auth.generate_sms_code(phone)
+    assert code is not None
+    result = auth.reset_password_by_phone(phone, code, "BrandNew456")
+    assert result["success"] is True
+
+    # 直接校验数据库里的 hash 已更新为新密码
+    with auth._conn() as conn:  # noqa: SLF001 - 测试内部校验
+        row = conn.execute("SELECT password_hash, token_version FROM kellai_users WHERE id = ?", (user_id,)).fetchone()
+    ok, _ = auth._verify_password("BrandNew456", row["password_hash"])  # noqa: SLF001
+    assert ok is True
+    # 旧密码应失效
+    bad, _ = auth._verify_password("OldPass123", row["password_hash"])  # noqa: SLF001
+    assert bad is False
+    # token_version 被递增 → 旧 token 立即失效
+    assert int(row["token_version"]) > 0
+    assert auth.verify_token(old_token) is None, "重置密码后旧 token 仍有效！"
+
+
+def test_reset_password_rejects_bad_code(tmp_db):
+    """错误验证码不应重置密码。"""
+    from app.services import auth
+
+    phone = "13900000011"
+    auth.register_user(phone=phone, password="OldPass123")
+    auth.generate_sms_code(phone)
+    result = auth.reset_password_by_phone(phone, "000000", "BrandNew456")
+    assert result["success"] is False
+    assert "验证码" in result.get("error", "")
+
+
+def test_reset_password_unknown_phone(tmp_db):
+    """未注册手机号：验证码正确也应提示未注册。"""
+    from app.services import auth
+
+    phone = "13900000012"
+    code = auth.generate_sms_code(phone)
+    assert code is not None
+    result = auth.reset_password_by_phone(phone, code, "BrandNew456")
+    assert result["success"] is False
+    assert "未注册" in result.get("error", "")
+
+
+def test_reset_password_weak_password_rejected(tmp_db):
+    """新密码过弱应被拒绝，且不消费验证码逻辑前置校验。"""
+    from app.services import auth
+
+    phone = "13900000013"
+    auth.register_user(phone=phone, password="OldPass123")
+    code = auth.generate_sms_code(phone)
+    assert code is not None
+    result = auth.reset_password_by_phone(phone, code, "weak")
+    assert result["success"] is False
+    assert "密码" in result.get("error", "")
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

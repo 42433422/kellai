@@ -45,6 +45,8 @@ import {
   updateMemberRole,
   getUserInfo,
   updateUserInfo,
+  initiateWeworkOAuth,
+  checkWeworkOAuthStatus,
 } from '../api/settings';
 
 /* ========== 常量与映射 ========== */
@@ -89,12 +91,12 @@ const channelGroups: Array<{ key: string; title: string; types: string[] }> = [
 ];
 
 /** 渠道认证方式：scan = 扫码授权（推荐，零配置），form = 凭据表单 */
-type ChannelAuthMode = 'scan' | 'form' | 'select' | 'none';
+type ChannelAuthMode = 'scan' | 'form' | 'select' | 'none' | 'both';
 
 /** 渠道认证方式映射：哪些渠道用扫码，哪些用凭据表单 */
 const channelAuthModeMap: Record<string, ChannelAuthMode> = {
   // 即时通讯 → 扫码授权（服务商代配置）
-  wework: 'scan',
+  wework: 'both',
   douyin: 'scan',
   miniprogram: 'scan',
   // 电商平台 → 扫码授权（商家工作台扫码登录）
@@ -311,6 +313,7 @@ function ChannelTab() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [configChannel, setConfigChannel] = useState<Channel | null>(null);
+  const [scanChannel, setScanChannel] = useState<Channel | null>(null);
   const [configValues, setConfigValues] = useState<Record<string, string>>({});
   const [testingChannel, setTestingChannel] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<Record<string, { success: boolean; message: string }>>({});
@@ -464,14 +467,31 @@ function ChannelTab() {
               <div className="mt-4 flex items-center gap-2">
                 {channelAuthModeMap[channel.type] &&
                  channelAuthModeMap[channel.type] !== 'none' && (
-                  <button
-                    onClick={() => openConfig(channel)}
-                    aria-label={`配置 ${channelNameMap[channel.type] ?? channel.name}`}
-                    data-tour="settings-channel-config-btn"
-                    className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-600 transition hover:bg-gray-50"
-                  >
-                    {channelAuthModeMap[channel.type] === 'scan' ? '扫码授权' : '配置'}
-                  </button>
+                  channelAuthModeMap[channel.type] === 'both' ? (
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => openConfig(channel)}
+                        className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-600 transition hover:bg-gray-50"
+                      >
+                        手动配置
+                      </button>
+                      <button
+                        onClick={() => setScanChannel(channel)}
+                        className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-1.5 text-xs font-medium text-blue-600 transition hover:bg-blue-100"
+                      >
+                        扫码授权
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => openConfig(channel)}
+                      aria-label={`配置 ${channelNameMap[channel.type] ?? channel.name}`}
+                      data-tour="settings-channel-config-btn"
+                      className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-600 transition hover:bg-gray-50"
+                    >
+                      {channelAuthModeMap[channel.type] === 'scan' ? '扫码授权' : '配置'}
+                    </button>
+                  )
                 )}
                 <button
                   onClick={() => handleTest(channel.type)}
@@ -498,33 +518,35 @@ function ChannelTab() {
         );
       })}
 
-      {/* 配置弹窗 - 根据认证方式路由到不同弹窗 */}
-      {configChannel && channelAuthModeMap[configChannel.type] === 'scan' && (
-        <ChannelScanModal
-          channel={configChannel}
-          onClose={() => setConfigChannel(null)}
-          onSuccess={() => {
-            // 扫码成功：标记渠道为已连接
-            setChannels((prev) =>
-              prev.map((c) =>
-                c.type === configChannel.type ? { ...c, connected: true, enabled: true } : c
-              )
-            );
-            setTestResult((prev) => ({
-              ...prev,
-              [configChannel.type]: { success: true, message: '扫码授权成功' },
-            }));
-            setConfigChannel(null);
-          }}
-        />
-      )}
-      {configChannel && channelAuthModeMap[configChannel.type] !== 'scan' && (
+      {/* 手动配置弹窗 - both 模式或 form 模式 */}
+      {configChannel && (channelAuthModeMap[configChannel.type] === 'form' || channelAuthModeMap[configChannel.type] === 'both') && (
         <ChannelConfigModal
           channel={configChannel}
           values={configValues}
           onChange={setConfigValues}
           onClose={() => setConfigChannel(null)}
           onSave={handleSaveConfig}
+        />
+      )}
+      {/* 扫码授权弹窗 - scan 模式或 both 模式 */}
+      {(scanChannel || (configChannel && channelAuthModeMap[configChannel.type] === 'scan')) && (
+        <ChannelScanModal
+          channel={(scanChannel || configChannel)!}
+          onClose={() => { setScanChannel(null); setConfigChannel(null); }}
+          onSuccess={() => {
+            const ch = (scanChannel || configChannel)!;
+            setChannels((prev) =>
+              prev.map((c) =>
+                c.type === ch.type ? { ...c, connected: true, enabled: true } : c
+              )
+            );
+            setTestResult((prev) => ({
+              ...prev,
+              [ch.type]: { success: true, message: '扫码授权成功' },
+            }));
+            setScanChannel(null);
+            setConfigChannel(null);
+          }}
         />
       )}
     </div>
@@ -628,113 +650,6 @@ function ChannelConfigModal({
 /** 扫码状态机 */
 type ScanStatus = 'waiting' | 'scanned' | 'success' | 'expired';
 
-/** 用 channel.type 作 seed 生成一个看起来像 QR 码的 21×21 二值矩阵（仅占位演示用） */
-function generateFakeQrMatrix(seed: string): boolean[][] {
-  const N = 21;
-  // 简易 deterministic hash → 0/1
-  const hash = (i: number, j: number): number => {
-    const s = `${seed}:${i}:${j}`;
-    let h = 2166136261;
-    for (let k = 0; k < s.length; k++) {
-      h ^= s.charCodeAt(k);
-      h = Math.imul(h, 16777619);
-    }
-    return ((h >>> 0) % 2);
-  };
-  const grid: boolean[][] = Array.from({ length: N }, () => Array(N).fill(false));
-
-  // 三个角的"定位方框" 7x7（左上、右上、左下）
-  const drawFinder = (cx: number, cy: number) => {
-    for (let i = -3; i <= 3; i++) {
-      for (let j = -3; j <= 3; j++) {
-        const x = cx + i;
-        const y = cy + j;
-        if (x < 0 || y < 0 || x >= N || y >= N) continue;
-        const onEdge = Math.max(Math.abs(i), Math.abs(j)) === 3;
-        const inner = Math.max(Math.abs(i), Math.abs(j)) <= 1;
-        grid[y][x] = onEdge || inner;
-      }
-    }
-  };
-  drawFinder(3, 3);
-  drawFinder(N - 4, 3);
-  drawFinder(3, N - 4);
-
-  // 定位方框之间的"时序图案"和"暗模块"
-  for (let i = 8; i < N - 8; i++) {
-    grid[6][i] = i % 2 === 0;
-    grid[i][6] = i % 2 === 0;
-  }
-  // 中间的数据区（避开三个定位框 + 时序条 + 中心 logo 区域）
-  for (let y = 0; y < N; y++) {
-    for (let x = 0; x < N; x++) {
-      // 跳过定位框 7x7 范围
-      if ((x < 8 && y < 8) || (x > N - 9 && y < 8) || (x < 8 && y > N - 9)) continue;
-      // 跳过第 6 行/列（时序图案）
-      if (x === 6 || y === 6) continue;
-      // 跳过中心 logo 区域 5x5（用白色覆盖）
-      const cx = N / 2 - 0.5;
-      if (Math.abs(x - cx) <= 2.5 && Math.abs(y - cx) <= 2.5) continue;
-      grid[y][x] = hash(x, y) === 1;
-    }
-  }
-  return grid;
-}
-
-/** 把矩阵渲染成 SVG（白底 + 黑块 + 中心 logo 槽位） */
-function QrCodeImage({ matrix, accentColor }: { matrix: boolean[][]; accentColor: string }) {
-  const N = matrix.length;
-  const cell = 10; // 每个模块 10px
-  const size = N * cell;
-  // 计算一个 cell 的 path：把所有"黑模块"合并成一个大 path
-  let rects: JSX.Element[] = [];
-  for (let y = 0; y < N; y++) {
-    for (let x = 0; x < N; x++) {
-      if (matrix[y][x]) {
-        rects.push(
-          <rect key={`${x}-${y}`} x={x * cell} y={y * cell} width={cell} height={cell} fill="#0f172a" />
-        );
-      }
-    }
-  }
-  return (
-    <svg
-      viewBox={`0 0 ${size} ${size}`}
-      width="208"
-      height="208"
-      xmlns="http://www.w3.org/2000/svg"
-      className="rounded-lg"
-      style={{ background: '#fff' }}
-    >
-      {/* 外圈白底 */}
-      <rect x="0" y="0" width={size} height={size} fill="#fff" />
-      {rects}
-      {/* 中心 logo 占位（彩色小方块代表 App 图标） */}
-      <rect
-        x={size / 2 - 22}
-        y={size / 2 - 22}
-        width="44"
-        height="44"
-        rx="10"
-        fill={accentColor}
-        stroke="#fff"
-        strokeWidth="4"
-      />
-      <text
-        x={size / 2}
-        y={size / 2 + 6}
-        textAnchor="middle"
-        fontSize="22"
-        fontWeight="700"
-        fill="#fff"
-        fontFamily="system-ui, -apple-system, sans-serif"
-      >
-        K
-      </text>
-    </svg>
-  );
-}
-
 /** 渠道扫码授权弹窗 */
 function ChannelScanModal({
   channel,
@@ -746,7 +661,6 @@ function ChannelScanModal({
   onSuccess: () => void;
 }) {
   const tip = channelScanTips[channel.type] ?? { app: '对应 App', description: '使用对应 App 扫描二维码' };
-  // 不同渠道的强调色（与 channelIconMap / 现实品牌色对齐）
   const accentByType: Record<string, string> = {
     wework: '#2B7CE9',
     douyin: '#161823',
@@ -758,11 +672,55 @@ function ChannelScanModal({
   };
   const accent = accentByType[channel.type] ?? '#3b82f6';
 
-  // 状态机 + 二维码刷新 tick
   const [status, setStatus] = useState<ScanStatus>('waiting');
-  const [qrSeed, setQrSeed] = useState<string>(`${channel.type}-${Date.now()}`);
-  const [countdown, setCountdown] = useState(120); // 120s 过期
-  const [, setScanTime] = useState(0);
+  const [oauthUrl, setOauthUrl] = useState<string>('');
+  const [oauthState, setOauthState] = useState<string>('');
+  const [countdown, setCountdown] = useState(300); // 5分钟过期
+  const [initError, setInitError] = useState('');
+
+  // 发起 OAuth
+  useEffect(() => {
+    let cancelled = false;
+    const initiate = async () => {
+      try {
+        const res = (await initiateWeworkOAuth()) as any;
+        const data = res?.data ?? res;
+        if (data?.url && data?.state) {
+          if (!cancelled) {
+            setOauthUrl(data.url);
+            setOauthState(data.state);
+          }
+        } else {
+          if (!cancelled) setInitError(data?.error || '获取授权链接失败');
+        }
+      } catch (err: any) {
+        const data = err?.response?.data;
+        if (!cancelled) setInitError(data?.error || data?.message || '获取授权链接失败');
+      }
+    };
+    initiate();
+    return () => { cancelled = true; };
+  }, []);
+
+  // 轮询授权状态
+  useEffect(() => {
+    if (!oauthState || status !== 'waiting') return;
+    const interval = setInterval(async () => {
+      try {
+        const res = (await checkWeworkOAuthStatus(oauthState)) as any;
+        const data = res?.data ?? res;
+        if (data?.authorized) {
+          setStatus('scanned');
+          setTimeout(() => setStatus('success'), 1500);
+        } else if (data?.expired) {
+          setStatus('expired');
+        }
+      } catch {
+        // 忽略轮询错误
+      }
+    }, 2000);
+    return () => clearInterval(interval);
+  }, [oauthState, status]);
 
   // 倒计时
   useEffect(() => {
@@ -775,37 +733,25 @@ function ChannelScanModal({
     return () => window.clearTimeout(t);
   }, [countdown, status]);
 
-  // 等待扫码 → 已扫 → 授权成功（模拟真实授权时序）
-  useEffect(() => {
-    if (status !== 'waiting') return;
-    const t1 = window.setTimeout(() => {
-      setStatus('scanned');
-      setScanTime(Date.now());
-    }, 3500);
-    return () => window.clearTimeout(t1);
-  }, [qrSeed, status]);
-
-  useEffect(() => {
-    if (status !== 'scanned') return;
-    const t2 = window.setTimeout(() => setStatus('success'), 2000);
-    return () => window.clearTimeout(t2);
-  }, [status]);
-
-  // 成功后等 1.2s 再回调 onSuccess，让用户看到成功态
+  // 成功后回调
   useEffect(() => {
     if (status !== 'success') return;
-    const t3 = window.setTimeout(() => onSuccess(), 1200);
-    return () => window.clearTimeout(t3);
+    const t = window.setTimeout(() => onSuccess(), 1200);
+    return () => window.clearTimeout(t);
   }, [status, onSuccess]);
 
-  /** 刷新二维码 */
   const refresh = () => {
     setStatus('waiting');
-    setQrSeed(`${channel.type}-${Date.now()}`);
-    setCountdown(120);
+    setOauthUrl('');
+    setOauthState('');
+    setCountdown(300);
+    setInitError('');
   };
 
   const channelLabel = channelNameMap[channel.type] ?? channel.name;
+
+  // 格式化倒计时
+  const formatCountdown = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 
   return (
     <div data-tour="channel-config-modal" className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm" onClick={onClose}>
@@ -814,10 +760,7 @@ function ChannelScanModal({
         className="relative w-full max-w-sm overflow-hidden rounded-2xl bg-white shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
-        {/* 顶部条：accent 色细条作为视觉锚点 */}
         <div className="h-1.5 w-full" style={{ background: accent }} />
-
-        {/* 关闭按钮 */}
         <button
           onClick={onClose}
           aria-label="关闭配置"
@@ -828,23 +771,16 @@ function ChannelScanModal({
         </button>
 
         <div className="p-7">
-          {/* 标题 */}
           <div className="flex items-center gap-3">
-            <div
-              className="flex h-10 w-10 items-center justify-center rounded-lg"
-              style={{ background: `${accent}1a` }}
-            >
+            <div className="flex h-10 w-10 items-center justify-center rounded-lg" style={{ background: `${accent}1a` }}>
               <QrCode className="h-5 w-5" style={{ color: accent }} />
             </div>
             <div>
-              <h3 className="text-base font-semibold text-gray-900">
-                {tip.app} 扫码授权
-              </h3>
+              <h3 className="text-base font-semibold text-gray-900">{tip.app} 扫码授权</h3>
               <p className="mt-0.5 text-xs text-gray-500">连接 {channelLabel}</p>
             </div>
           </div>
 
-          {/* QR 码主体（动画切换） */}
           <div className="mt-6 flex flex-col items-center">
             <div
               data-tour="channel-qrcode"
@@ -853,14 +789,9 @@ function ChannelScanModal({
                 status === 'success' ? 'border-green-200 bg-green-50/40' : 'border-gray-200 bg-white'
               )}
             >
-              {/* 状态遮罩（已扫、成功） */}
-              {status !== 'waiting' && status !== 'expired' && (
-                <div
-                  className={clsx(
-                    'absolute inset-0 z-10 flex flex-col items-center justify-center rounded-xl bg-white/95 transition-all duration-500',
-                    status === 'scanned' ? 'opacity-100' : 'opacity-0 pointer-events-none'
-                  )}
-                >
+              {/* 已扫描遮罩 */}
+              {status === 'scanned' && (
+                <div className="absolute inset-0 z-10 flex flex-col items-center justify-center rounded-xl bg-white/95">
                   <div className="flex h-16 w-16 animate-pulse items-center justify-center rounded-full bg-blue-100">
                     <ScanLine className="h-8 w-8 text-blue-600" />
                   </div>
@@ -869,6 +800,7 @@ function ChannelScanModal({
                 </div>
               )}
 
+              {/* 成功遮罩 */}
               {status === 'success' && (
                 <div className="absolute inset-0 z-20 flex flex-col items-center justify-center rounded-xl bg-white/95">
                   <div className="flex h-16 w-16 animate-[ping_1.2s_ease-out] items-center justify-center rounded-full bg-green-100">
@@ -879,6 +811,7 @@ function ChannelScanModal({
                 </div>
               )}
 
+              {/* 过期遮罩 */}
               {status === 'expired' && (
                 <div className="absolute inset-0 z-20 flex flex-col items-center justify-center rounded-xl bg-white/95">
                   <XCircle className="h-12 w-12 text-gray-400" />
@@ -892,14 +825,34 @@ function ChannelScanModal({
                 </div>
               )}
 
-              {/* 实际 QR 码（过期时降低 opacity） */}
-              <div
-                className={clsx(
-                  'transition-opacity duration-300',
-                  status === 'expired' ? 'opacity-20' : 'opacity-100'
+              {/* QR 码主体 */}
+              <div className={clsx('transition-opacity duration-300', status === 'expired' ? 'opacity-20' : 'opacity-100')}>
+                {initError ? (
+                  <div className="flex h-[208px] w-[208px] flex-col items-center justify-center rounded-lg bg-gray-50 text-center">
+                    <AlertCircle className="h-8 w-8 text-amber-500" />
+                    <p className="mt-2 text-xs text-gray-600">{initError}</p>
+                    <button
+                      onClick={refresh}
+                      className="mt-2 text-xs text-blue-600 hover:underline"
+                    >
+                      重试
+                    </button>
+                  </div>
+                ) : oauthUrl ? (
+                  <iframe
+                    src={oauthUrl}
+                    width="208"
+                    height="208"
+                    frameBorder="0"
+                    sandbox="allow-scripts allow-same-origin"
+                    style={{ borderRadius: '8px' }}
+                    title={`${channelLabel} 扫码授权`}
+                  />
+                ) : (
+                  <div className="flex h-[208px] w-[208px] items-center justify-center">
+                    <Loader2 className="h-8 w-8 animate-spin text-gray-300" />
+                  </div>
                 )}
-              >
-                <QrCodeImage matrix={generateFakeQrMatrix(qrSeed)} accentColor={accent} />
               </div>
             </div>
 
@@ -909,7 +862,7 @@ function ChannelScanModal({
                 <>
                   <Loader2 className="h-3.5 w-3.5 animate-spin" style={{ color: accent }} />
                   <span>
-                    二维码 <b className="text-gray-700 tabular-nums">{countdown}s</b> 后失效
+                    二维码 <b className="text-gray-700 tabular-nums">{formatCountdown(countdown)}</b> 后失效
                   </span>
                 </>
               )}
@@ -949,7 +902,6 @@ function ChannelScanModal({
             </button>
           </div>
 
-          {/* 说明 */}
           <p className="mt-4 rounded-lg bg-gray-50 px-3 py-2 text-[11px] leading-relaxed text-gray-500">
             💡 {tip.description}
           </p>

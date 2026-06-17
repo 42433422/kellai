@@ -472,7 +472,7 @@ export default function Messages() {
         </div>
 
         {/* 联系人列表 */}
-        <div className="flex-1 overflow-y-auto">
+        <div className="flex-1 overflow-y-auto min-h-0">
           {loading ? (
             // 骨架屏
             Array.from({ length: 6 }).map((_, i) => (
@@ -631,7 +631,7 @@ export default function Messages() {
             </div>
 
             {/* 消息列表 */}
-            <div className="flex-1 overflow-y-auto px-5 py-4">
+            <div className="flex-1 overflow-y-auto px-5 py-4 min-h-0">
               {selectedContact.messages.length === 0 ? (
                 <div className="flex h-full flex-col items-center justify-center text-gray-400 dark:text-slate-500">
                   <MessageCircle className="mb-2 h-10 w-10" />
@@ -847,7 +847,7 @@ export default function Messages() {
             </button>
           </div>
 
-          <div className="flex-1 space-y-4 overflow-y-auto px-4 py-3">
+          <div className="flex-1 space-y-4 overflow-y-auto px-4 py-3 min-h-0">
             {/* 客户画像摘要 */}
             <div className="rounded-lg bg-white p-3 shadow-sm dark:bg-slate-800 dark:shadow-none">
               <h4 className="mb-2 text-xs font-semibold text-gray-500 dark:text-slate-400">客户画像</h4>

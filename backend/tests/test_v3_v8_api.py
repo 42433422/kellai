@@ -65,3 +65,27 @@ class TestOpenAPI:
         r = client.get("/api/kellai/open/docs")
         assert r.status_code == 200
         assert "endpoints" in r.json()["data"]
+
+    def test_open_platform_state_persists(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KELLAI_DATA_DIR", str(tmp_path))
+        from app.api import open as open_api
+
+        created = open_api.create_key(
+            open_api.KeyBody(name="Smoke", scopes=["customers:read", "messages:write"])
+        )["data"]
+        assert created["api_key"].startswith("kl_live_")
+        assert created["key_prefix"].endswith("****")
+        keys = open_api.api_keys()["data"]
+        assert len(keys) == 1
+        assert keys[0]["name"] == "Smoke"
+        assert "api_key" not in keys[0]
+
+        webhook = open_api.webhooks(
+            open_api.WebhookBody(url="https://example.com/kellai", events=["customer.created"])
+        )["data"]
+        assert webhook["secret"].startswith("whsec_")
+        assert open_api.list_webhooks()["data"][0]["url"] == "https://example.com/kellai"
+
+        assert open_api.install_plugin({"plugin_id": "p2"})["data"]["installed"] is True
+        installed = {p["id"]: p["installed"] for p in open_api.plugins()["data"]}
+        assert installed["p2"] is True

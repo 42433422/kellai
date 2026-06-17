@@ -42,6 +42,58 @@ export interface ClientSummary {
   updated_at: string;
 }
 
+/** 客户管理列表记录（在 ClientSummary 基础上含手动维护的资料字段） */
+export interface CustomerRecord extends ClientSummary {
+  name?: string;
+  company?: string;
+  email?: string;
+  phone?: string;
+  owner?: string;
+  note?: string;
+  source?: string;
+  tags?: string[];
+  created_at?: string;
+}
+
+/** 客户列表接口响应 */
+export interface CustomerListResponse {
+  customers: CustomerRecord[];
+  total: number;
+  stage_definitions: { id: string; label: string }[];
+}
+
+/** 客户资料创建/更新入参 */
+export interface CustomerProfileInput {
+  name?: string;
+  company?: string;
+  email?: string;
+  phone?: string;
+  note?: string;
+  owner?: string;
+  source?: string;
+  stage?: string;
+  tags?: string[];
+  channel_sources?: string[];
+}
+
+/** 客户列表查询参数 */
+export interface CustomerQueryParams {
+  stage?: string;
+  channel?: string;
+  q?: string;
+  tag?: string;
+  min_ai_score?: number;
+  limit?: number;
+}
+
+/** 客户批量操作入参 */
+export interface CustomerBatchInput {
+  customer_ids: number[];
+  action: 'delete' | 'set_stage' | 'add_tag' | 'remove_tag';
+  stage?: string;
+  tag?: string;
+}
+
 /** 客户 Pipeline 详情 */
 export interface CustomerPipeline {
   customer_id: number;
@@ -350,7 +402,7 @@ export interface SmsLoginRequest {
 export interface RegisterRequest {
   email: string;
   password: string;
-  name: string;
+  display_name: string;
 }
 
 /** 登录响应 */
@@ -389,6 +441,13 @@ export type SalesFlowStep = 'requirement' | 'proposal' | 'promotion' | 'signing'
 export type SalesFlowStatus = 'idle' | 'running' | 'completed' | 'failed';
 export type ContractStatus = 'draft' | 'pending_sign' | 'signed' | 'cancelled';
 
+export interface SalesFlowTimelineEntry {
+  step: SalesFlowStep;
+  label: string;
+  at: string;
+  note: string;
+}
+
 export interface SalesFlow {
   id: string;
   customer_id: number;
@@ -398,6 +457,22 @@ export interface SalesFlow {
   started_at: string;
   updated_at: string;
   steps_completed: SalesFlowStep[];
+  /** 商机金额（元） */
+  deal_value?: number;
+  /** 赢单概率 0-100 */
+  win_probability?: number;
+  /** 预计成交日期 YYYY-MM-DD */
+  expected_close_date?: string;
+  /** 负责人 */
+  owner?: string;
+  /** AI 给出的下一步最佳行动 */
+  next_action?: string;
+  /** 当前步骤的 AI 洞察 */
+  ai_insight?: string;
+  /** 当前步骤待办清单 */
+  checklist?: string[];
+  /** 流程时间线 */
+  timeline?: SalesFlowTimelineEntry[];
 }
 
 export interface QuoteItem {
@@ -459,6 +534,22 @@ export interface PerformanceGoal {
   breakdown: GoalBreakdown[];
 }
 
+export interface SalesRep {
+  id: number;
+  name: string;
+  revenue: number;
+  target: number;
+  deals: number;
+  win_rate: number;
+  rank: number;
+}
+
+export interface RevenueTrendPoint {
+  period: string;
+  target: number;
+  actual: number;
+}
+
 export interface SalesPerformance {
   period: string;
   revenue_target: number;
@@ -467,6 +558,18 @@ export interface SalesPerformance {
   deals_closed: number;
   avg_deal_size: number;
   goals: PerformanceGoal[];
+  /** 真实环比（百分比，正负） */
+  momentum_pct?: number;
+  /** 赢单率 0-100 */
+  win_rate?: number;
+  /** 进行中商机总额 */
+  pipeline_value?: number;
+  /** 本期预测成交额 */
+  forecast?: number;
+  /** 销售代表排行 */
+  reps?: SalesRep[];
+  /** 营收趋势（目标 vs 实际） */
+  revenue_trend?: RevenueTrendPoint[];
 }
 
 export interface AttributionChannel {
@@ -568,6 +671,8 @@ export interface ABTest {
 }
 
 // === v5 Scout ===
+export type ScoutLeadStatus = 'new' | 'contacted' | 'replied' | 'converted' | 'ignored';
+
 export interface ScoutTarget {
   id: string;
   platform: string;
@@ -578,6 +683,18 @@ export interface ScoutTarget {
   intent_level: 'high' | 'medium' | 'low';
   reason: string;
   scanned_at: string;
+  /** 原帖链接 */
+  source_url?: string;
+  /** 作者粉丝数 */
+  followers?: number;
+  /** 地域 */
+  region?: string;
+  /** 行业标签 */
+  industry?: string;
+  /** 线索状态机 */
+  status?: ScoutLeadStatus;
+  /** 命中标签 */
+  tags?: string[];
 }
 
 export interface IntentScore {
@@ -595,6 +712,34 @@ export interface SentimentItem {
   summary: string;
   severity: 'high' | 'medium' | 'low';
   timestamp: string;
+  /** 情感倾向 */
+  sentiment?: 'positive' | 'neutral' | 'negative';
+  /** 情感分值 0-100 */
+  sentiment_score?: number;
+  /** 声量 */
+  volume?: number;
+  /** 声量环比（百分比，正负） */
+  volume_change?: number;
+  /** 来源平台 */
+  source?: string;
+  /** 原文链接 */
+  url?: string;
+  /** 相关关键词 */
+  keywords?: string[];
+}
+
+export interface SentimentOverview {
+  total: number;
+  positive_pct: number;
+  neutral_pct: number;
+  negative_pct: number;
+  volume_change: number;
+  /** 近 7 日声量趋势 */
+  volume_trend: { date: string; count: number }[];
+  /** 热门关键词 */
+  top_keywords: { word: string; count: number }[];
+  /** 监控词配置 */
+  watch_terms: string[];
 }
 
 export interface ScoutTrace {
@@ -675,6 +820,17 @@ export interface FinanceDashboardData {
   profit_margin: number;
   channel_breakdown: { channel: string; revenue: number; cost: number; profit: number }[];
   monthly_trend: { month: string; revenue: number; cost: number; profit: number }[];
+  /** 当前周期标识 */
+  period?: string;
+  /** 营收/成本/利润环比（百分比，正负） */
+  revenue_growth?: number;
+  cost_growth?: number;
+  profit_growth?: number;
+  /** 经营现金流（元） */
+  cash_flow?: number;
+  /** 应收 / 应付（元） */
+  receivable?: number;
+  payable?: number;
 }
 
 export interface BudgetSuggestion {
@@ -689,6 +845,12 @@ export interface FinancePerformanceMember {
   deals: number;
   conversion_rate: number;
   rank: number;
+  /** 个人目标（元） */
+  target?: number;
+  /** 目标达成率 0-100 */
+  attainment?: number;
+  /** 近 6 期营收走势（用于迷你趋势） */
+  trend?: number[];
 }
 
 export interface FinanceAlert {
@@ -719,6 +881,8 @@ export interface APIKey {
   id: string;
   name: string;
   key_prefix: string;
+  /** 创建后仅返回一次的完整密钥 */
+  api_key?: string;
   scopes: string[];
   created_at: string;
   last_used_at?: string;
@@ -734,6 +898,39 @@ export interface Plugin {
   installs: number;
   price: number;
   installed: boolean;
+  /** 图标 emoji */
+  icon?: string;
+  /** 版本号 */
+  version?: string;
+  /** 标签 */
+  tags?: string[];
+  /** 是否精选 */
+  featured?: boolean;
+  /** 更新时间 */
+  updated_at?: string;
+  /** 发布者是否认证 */
+  publisher_verified?: boolean;
+}
+
+export interface PlatformStats {
+  api_calls_30d: number;
+  plugins: number;
+  total_installs: number;
+  isv_partners: number;
+  active_webhooks: number;
+  events_today: number;
+  uptime: number;
+  call_trend: { date: string; count: number }[];
+  recent_activity: { id: string; type: string; text: string; timestamp: string }[];
+}
+
+export interface ApiEndpointDoc {
+  method: string;
+  path: string;
+  description: string;
+  category?: string;
+  auth_required?: boolean;
+  sample?: string;
 }
 
 export interface ISVPartner {
@@ -759,11 +956,24 @@ export interface EventSubscription {
   subscribed: boolean;
 }
 
+export interface AppTemplateField {
+  key: string;
+  label: string;
+  type: string;
+  options?: string[];
+  required?: boolean;
+  placeholder?: string;
+}
+
 export interface AppTemplate {
   id: string;
   name: string;
   description: string;
-  fields: { key: string; label: string; type: string }[];
+  fields: AppTemplateField[];
+  /** 图标 emoji */
+  icon?: string;
+  /** 分类 */
+  category?: string;
 }
 
 export interface ReviewStatus {

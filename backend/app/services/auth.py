@@ -900,6 +900,47 @@ def register_user(
         }
 
 
+def reset_password_by_phone(phone: str, code: str, new_password: str) -> dict[str, Any]:
+    """通过手机验证码重置密码。
+
+    流程：校验手机号/新密码格式 → 校验短信验证码（一次性消费）→
+    定位用户 → 写入新 hash → 吊销全部会话并递增 token_version（强制其他端重新登录）。
+    返回 {"success": bool, "error": str?}
+    """
+    phone = (phone or "").strip()
+    if not _validate_phone(phone):
+        return {"success": False, "error": "手机号格式不合法"}
+    pwd_err = _validate_password(new_password)
+    if pwd_err:
+        return {"success": False, "error": pwd_err}
+    if not verify_sms_code(phone, code):
+        return {"success": False, "error": "验证码无效或已过期"}
+
+    try:
+        with _conn() as conn:
+            row = conn.execute(
+                "SELECT id FROM kellai_users WHERE phone = ? AND is_active = 1",
+                (phone,),
+            ).fetchone()
+            if not row:
+                return {"success": False, "error": "该手机号未注册"}
+            user_id = int(row["id"])
+            conn.execute(
+                "UPDATE kellai_users SET password_hash = ?, token_version = token_version + 1, updated_at = ? WHERE id = ?",
+                (_hash_password(new_password), _now_iso(), user_id),
+            )
+            conn.execute(
+                "UPDATE kellai_sessions SET revoked = 1 WHERE user_id = ? AND revoked = 0",
+                (user_id,),
+            )
+    except sqlite3.Error as exc:
+        logger.error("重置密码失败 phone=%s: %s", phone, exc)
+        return {"success": False, "error": "重置失败，请稍后重试"}
+
+    logger.info("密码已通过短信重置: user_id=%s", user_id)
+    return {"success": True, "message": "密码已重置，请使用新密码登录"}
+
+
 def _verify_password_and_upgrade_if_needed(
     conn: sqlite3.Connection,
     email: str,

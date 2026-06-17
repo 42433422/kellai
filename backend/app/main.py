@@ -185,6 +185,13 @@ _SOFT_AUTH_WHITELIST: set[str] = {
     "/docs",
     "/openapi.json",
     "/redoc",
+    # 登录前可访问的公共认证端点（登出 / 未登录状态下必须放行，
+    # 否则开启 KELLAI_STRICT_AUTH=1 后会把登录、注册、找回密码全部挡在门外）
+    "/api/kellai/auth/login",
+    "/api/kellai/auth/register",
+    "/api/kellai/auth/refresh",
+    "/api/kellai/auth/sms/send",
+    "/api/kellai/auth/forgot-password",
 }
 
 

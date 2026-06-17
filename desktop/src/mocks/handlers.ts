@@ -35,6 +35,11 @@ import {
   getMockAiProfile,
   getMockMessages,
   getMockReminders,
+  addMockCustomer,
+  updateMockCustomer,
+  deleteMockCustomer,
+  setMockCustomerStage,
+  mockStageDefinitions,
 } from './customers';
 
 /* -------- 内部可变状态：mock 阶段变更会写回这里 -------- */
@@ -45,6 +50,9 @@ const messageStore: Record<number, ReturnType<typeof getMockMessages>> = {};
 MOCK_CUSTOMERS.forEach((c) => {
   messageStore[c.customer_id] = getMockMessages(c.customer_id);
 });
+
+/** mock 短信验证码存储：phone → code（找回密码 / 验证码登录用） */
+const mockSmsCodes: Record<string, string> = {};
 
 /* ============================================================
  *  渠道 mock 状态（按 channelGroups 分组，跨请求持久化）
@@ -247,6 +255,33 @@ export const mockAdapter: AxiosAdapter = async (config) => {
     return ok(config, { success: true, data: buildMockUser('test@kellai.com') });
   }
 
+  /* 发送短信验证码（mock：固定 123456，并在响应里回带便于联调） */
+  if (url === '/api/kellai/auth/sms/send' && method === 'post') {
+    await sendDelay();
+    const phone = String(data?.phone || '').trim();
+    if (!/^1[3-9]\d{9}$/.test(phone)) {
+      return ok(config, { success: false, error: '手机号格式不正确' });
+    }
+    mockSmsCodes[phone] = '123456';
+    return ok(config, { success: true, message: '验证码已发送（mock：123456）', code: '123456' });
+  }
+
+  /* 找回密码（mock：校验验证码后即成功） */
+  if (url === '/api/kellai/auth/forgot-password' && method === 'post') {
+    await sendDelay();
+    const phone = String(data?.phone || '').trim();
+    const code = String(data?.code || '').trim();
+    const pwd = String(data?.new_password || '');
+    if (!/^1[3-9]\d{9}$/.test(phone)) return badRequest(config, '手机号格式不正确');
+    if (pwd.length < 6 || !/[A-Za-z]/.test(pwd) || !/\d/.test(pwd)) {
+      return badRequest(config, '密码至少 6 位且需包含字母和数字');
+    }
+    const expected = mockSmsCodes[phone];
+    if (!expected || expected !== code) return badRequest(config, '验证码无效或已过期');
+    delete mockSmsCodes[phone];
+    return ok(config, { success: true, message: '密码已重置，请使用新密码登录' });
+  }
+
   if (url === '/api/kellai/auth/register' && method === 'post') {
     await sendDelay();
     const email = (data?.email || '').toString().trim();
@@ -317,7 +352,7 @@ export const mockAdapter: AxiosAdapter = async (config) => {
     const stage = String(data?.stage || '');
     if (cid && stage) {
       stageMap.set(cid, stage);
-      const c = MOCK_CUSTOMERS.find((x) => x.customer_id === cid);
+      const c = setMockCustomerStage(cid, stage);
       return ok(config, { success: true, data: { pipeline: { customer_id: cid, stage, stage_label: c?.stage_label || stage } } });
     }
     return badRequest(config, '参数错误');
@@ -331,7 +366,7 @@ export const mockAdapter: AxiosAdapter = async (config) => {
     const stage = String(data?.stage_id || '');
     if (cid && stage) {
       stageMap.set(cid, stage);
-      const c = MOCK_CUSTOMERS.find((x) => x.customer_id === cid);
+      const c = setMockCustomerStage(cid, stage);
       return ok(config, { success: true, data: { pipeline: { customer_id: cid, stage, stage_label: c?.stage_label || stage } } });
     }
     return badRequest(config, '参数错误');
@@ -538,6 +573,108 @@ export const mockAdapter: AxiosAdapter = async (config) => {
         synced_at: new Date().toISOString(),
       },
     });
+  }
+
+  /* ----- 客户管理 ----- */
+  /* GET /api/kellai/customers —— 列表（搜索 + 多维筛选） */
+  if (url === '/api/kellai/customers' && method === 'get') {
+    await sendDelay();
+    let list = MOCK_CUSTOMERS.map((c) => ({
+      customer_id: c.customer_id,
+      username: c.username,
+      stage: c.stage,
+      stage_label: c.stage_label,
+      display_name: c.display_name,
+      intake_sent: c.intake_sent,
+      last_message_preview: c.last_message_preview,
+      channel_sources: c.channel_sources,
+      ai_score: c.ai_score,
+      ai_tags: c.ai_tags,
+      updated_at: c.updated_at,
+      created_at: c.created_at || c.updated_at,
+      name: c.name || '',
+      company: c.company || '',
+      email: c.email || '',
+      phone: c.phone || '',
+      owner: c.owner || '',
+      note: c.note || '',
+      source: c.source || '',
+      tags: c.tags || [],
+    }));
+    const stage = params?.stage ? String(params.stage) : '';
+    const channel = params?.channel ? String(params.channel) : '';
+    const tag = params?.tag ? String(params.tag) : '';
+    const q = params?.q ? String(params.q).toLowerCase() : '';
+    const minScore = params?.min_ai_score ? Number(params.min_ai_score) : 0;
+    if (stage) list = list.filter((c) => c.stage === stage);
+    if (channel) list = list.filter((c) => (c.channel_sources || []).includes(channel));
+    if (tag) list = list.filter((c) => (c.tags || []).includes(tag) || (c.ai_tags || []).includes(tag));
+    if (q) {
+      list = list.filter((c) =>
+        [c.display_name, c.name, c.company, c.email, c.phone, c.username].some((f) =>
+          String(f || '').toLowerCase().includes(q),
+        ),
+      );
+    }
+    if (minScore > 0) list = list.filter((c) => c.ai_score >= minScore);
+    return ok(config, {
+      success: true,
+      data: { customers: list, total: list.length, stage_definitions: mockStageDefinitions() },
+    });
+  }
+
+  /* POST /api/kellai/customers/batch —— 批量操作 */
+  if (url === '/api/kellai/customers/batch' && method === 'post') {
+    await sendDelay();
+    const ids: number[] = Array.isArray(data?.customer_ids) ? data.customer_ids.map(Number) : [];
+    const action = String(data?.action || '');
+    let affected = 0;
+    for (const id of ids) {
+      if (action === 'delete') {
+        if (deleteMockCustomer(id)) { stageMap.delete(id); affected += 1; }
+      } else if (action === 'set_stage' && data?.stage) {
+        if (setMockCustomerStage(id, String(data.stage))) { stageMap.set(id, String(data.stage)); affected += 1; }
+      } else if (action === 'add_tag' && data?.tag) {
+        const c = MOCK_CUSTOMERS.find((x) => x.customer_id === id);
+        if (c) { c.tags = Array.from(new Set([...(c.tags || []), String(data.tag)])); affected += 1; }
+      } else if (action === 'remove_tag' && data?.tag) {
+        const c = MOCK_CUSTOMERS.find((x) => x.customer_id === id);
+        if (c) { c.tags = (c.tags || []).filter((t) => t !== String(data.tag)); affected += 1; }
+      }
+    }
+    return ok(config, { success: true, data: { affected, action } });
+  }
+
+  /* POST /api/kellai/customers —— 创建 */
+  if (url === '/api/kellai/customers' && method === 'post') {
+    await sendDelay();
+    if (!String(data?.name || '').trim() && !String(data?.company || '').trim()) {
+      return badRequest(config, '请至少填写客户姓名或公司名称');
+    }
+    const rec = addMockCustomer(data || {});
+    stageMap.set(rec.customer_id, rec.stage);
+    return ok(config, { success: true, data: { customer_id: rec.customer_id, pipeline: rec } });
+  }
+
+  /* PUT /api/kellai/customers/:id —— 更新资料 */
+  const customerUpdateMatch = url.match(/^\/api\/kellai\/customers\/(\d+)$/);
+  if (customerUpdateMatch && method === 'put') {
+    await sendDelay();
+    const id = Number(customerUpdateMatch[1]);
+    const rec = updateMockCustomer(id, data || {});
+    if (!rec) return notFound(config, '客户不存在');
+    if (rec.stage) stageMap.set(id, rec.stage);
+    return ok(config, { success: true, data: { customer_id: id, pipeline: rec } });
+  }
+
+  /* DELETE /api/kellai/customers/:id —— 删除 */
+  const customerDeleteMatch = url.match(/^\/api\/kellai\/customers\/(\d+)$/);
+  if (customerDeleteMatch && method === 'delete') {
+    await sendDelay();
+    const id = Number(customerDeleteMatch[1]);
+    const deleted = deleteMockCustomer(id);
+    stageMap.delete(id);
+    return ok(config, { success: true, data: { customer_id: id, deleted } });
   }
 
   /* ----- v3-v8 扩展端点 ----- */

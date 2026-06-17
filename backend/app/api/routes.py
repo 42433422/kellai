@@ -21,6 +21,7 @@ AUTH_WHITELIST: set[str] = {
     "/api/kellai/status",
     "/api/kellai/landing/sync",
     "/api/kellai/webhook/wework",
+    "/api/kellai/channels/wework/oauth/callback",
 }
 
 
@@ -162,6 +163,7 @@ class RegisterBody(BaseModel):
     phone: str = Field(default="", max_length=64)
     password: str = Field(..., min_length=1, max_length=128)
     display_name: str = Field(default="", max_length=128)
+    name: str = Field(default="", max_length=128)
 
 
 class LoginBody(BaseModel):
@@ -173,6 +175,12 @@ class LoginBody(BaseModel):
 
 class RefreshBody(BaseModel):
     refresh_token: str = Field(..., min_length=1, max_length=512)
+
+
+class ResetPasswordBody(BaseModel):
+    phone: str = Field(..., min_length=1, max_length=64)
+    code: str = Field(..., min_length=4, max_length=6)
+    new_password: str = Field(..., min_length=1, max_length=128)
 
 
 class UpdateUserBody(BaseModel):
@@ -231,31 +239,25 @@ class ScoreBody(BaseModel):
 async def list_channels():
     """列出所有已注册渠道及状态（含已保存的配置）。"""
     from app.channels import ChannelRegistry
-    from app.channels.config_store import list_all
+    from app.channels.config_store import get_all
 
     reg = ChannelRegistry()
-    saved = list_all()
     channels = reg.list_channels()
     result = []
     for ch in channels:
-        adapter = reg.get(ch["channel_type"])
-        try:
-            test = await adapter.test_connection()
-        except Exception as exc:  # 单渠道测试异常不影响其他
-            test = {"connected": False, "message": f"测试异常: {exc}"}
-        cfg = saved.get(ch["channel_type"]) or {}
+        cfg = get_all(ch["channel_type"])
         merged_config = dict(cfg.get("config") or {})
-        # env 兜底
-        for k, v in (cfg.get("config") or {}).items():
-            merged_config.setdefault(k, v)
+        has_config = any(str(v).strip() for v in merged_config.values())
+        enabled = bool(cfg.get("enabled", has_config))
+        connected = enabled and has_config
         result.append({
             "id": f"ch_{ch['channel_type']}",
             "name": cfg.get("name") or ch["channel_type"],
             "type": ch["channel_type"],
             "adapter_class": ch["adapter_class"],
-            "enabled": bool(cfg.get("enabled", test.get("connected", False))),
-            "connected": test.get("connected", False),
-            "message": test.get("message", ""),
+            "enabled": enabled,
+            "connected": connected,
+            "message": "已保存配置，点击测试连接验证" if connected else "未配置",
             "config": merged_config,
             "config_schema": ch.get("config_schema") or {},
             "createdAt": cfg.get("createdAt") or "",
@@ -336,6 +338,144 @@ async def delete_channel(channel_type: str):
 
     deleted = delete_config(channel_type)
     return {"success": True, "data": {"type": channel_type, "deleted": deleted}}
+
+
+# ---------------------------------------------------------------------------
+# 企微 OAuth 端点
+# ---------------------------------------------------------------------------
+
+_oauth_states: dict[str, float] = {}  # state → 过期时间戳
+
+
+@router.post("/channels/wework/oauth/initiate")
+async def wework_oauth_initiate(request: Request):
+    """发起企微 OAuth 授权，返回扫码授权 URL。"""
+    import os
+    import secrets
+    import time
+
+    from app.channels.config_store import get_field
+
+    corp_id = get_field("wework", "corp_id") or os.environ.get("WW_CORP_ID", "")
+    agent_id = get_field("wework", "agent_id") or os.environ.get("WW_AGENT_ID", "")
+
+    if not corp_id or not agent_id:
+        return {"success": False, "error": "请先配置 Corp ID 和 Agent ID"}
+
+    state = secrets.token_urlsafe(32)
+    _oauth_states[state] = time.time() + 300  # 5 分钟过期
+
+    redirect_uri = str(request.base_url).rstrip("/") + "/api/kellai/channels/wework/oauth/callback"
+    from urllib.parse import quote_plus
+    encoded_redirect = quote_plus(redirect_uri)
+
+    url = (
+        f"https://open.work.weixin.qq.com/wwopen/sso/qrConnect"
+        f"?appid={corp_id}&agentid={agent_id}"
+        f"&redirect_uri={encoded_redirect}&state={state}"
+    )
+
+    return {"success": True, "data": {"url": url, "state": state, "expires_in": 300}}
+
+
+@router.get("/channels/wework/oauth/callback")
+async def wework_oauth_callback(code: str = "", state: str = ""):
+    """企微 OAuth 回调：用 code 换取用户信息并保存。"""
+    import os
+    import time
+
+    from fastapi.responses import HTMLResponse
+
+    from app.channels.config_store import get_field, save
+
+    # 验证 state
+    if not state or state not in _oauth_states:
+        return HTMLResponse(
+            "<html><body><h3>授权失败：无效的 state 参数</h3></body></html>",
+            status_code=400,
+        )
+
+    expire_at = _oauth_states.pop(state)
+    if time.time() > expire_at:
+        return HTMLResponse(
+            "<html><body><h3>授权失败：state 已过期，请重新发起授权</h3></body></html>",
+            status_code=400,
+        )
+
+    if not code:
+        return HTMLResponse(
+            "<html><body><h3>授权失败：未收到授权码</h3></body></html>",
+            status_code=400,
+        )
+
+    # 用 code 换取 access_token / 用户信息
+    corp_id = get_field("wework", "corp_id") or os.environ.get("WW_CORP_ID", "")
+    corp_secret = (
+        get_field("wework", "secret")
+        or get_field("wework", "corp_secret")
+        or os.environ.get("WW_CORP_SECRET", "")
+    )
+
+    import httpx
+
+    user_info: dict = {}
+    try:
+        # 1) 获取 access_token
+        token_url = (
+            f"https://qyapi.weixin.qq.com/cgi-bin/gettoken"
+            f"?corpid={corp_id}&corpsecret={corp_secret}"
+        )
+        async with httpx.AsyncClient(timeout=10) as client:
+            token_resp = await client.get(token_url)
+            token_data = token_resp.json()
+
+        access_token = token_data.get("access_token", "")
+        if not access_token:
+            logger.warning("企微 OAuth 获取 access_token 失败: %s", token_data)
+        else:
+            # 2) 用 code 换取用户身份
+            user_url = (
+                f"https://qyapi.weixin.qq.com/cgi-bin/auth/getuserinfo"
+                f"?access_token={access_token}&code={code}"
+            )
+            async with httpx.AsyncClient(timeout=10) as client:
+                user_resp = await client.get(user_url)
+                user_info = user_resp.json()
+    except Exception as exc:
+        logger.warning("企微 OAuth 回调请求失败: %s", exc)
+
+    # 保存授权信息到 config_store
+    save("wework", {
+        "oauth_authorized": "true",
+        "oauth_user_id": user_info.get("userid", user_info.get("UserId", "")),
+        "oauth_user_ticket": user_info.get("user_ticket", ""),
+    })
+
+    return HTMLResponse(
+        "<html><body>"
+        "<h3>授权成功，请返回客来来应用</h3>"
+        "<script>window.close();</script>"
+        "</body></html>"
+    )
+
+
+@router.get("/channels/wework/oauth/status")
+async def wework_oauth_status(state: str = ""):
+    """查询 OAuth 授权状态（前端轮询）。"""
+    import time
+
+    if not state:
+        return {"success": True, "data": {"authorized": False, "expired": True}}
+
+    if state not in _oauth_states:
+        # state 已被 callback 消费，说明授权成功
+        return {"success": True, "data": {"authorized": True}}
+
+    expire_at = _oauth_states[state]
+    if time.time() > expire_at:
+        return {"success": True, "data": {"authorized": False, "expired": True}}
+
+    return {"success": True, "data": {"authorized": False}}
 
 
 @router.get("/messages")
@@ -524,10 +664,12 @@ def get_customers(
     current_user: CurrentUser,
     stage: str = "",
     channel: str = "",
+    q: str = "",
+    tag: str = "",
     min_ai_score: float = 0.0,
-    limit: int = 200,
+    limit: int = 500,
 ):
-    """客户列表（复用 pipeline 逻辑，支持筛选）。"""
+    """客户列表（复用 pipeline 逻辑，支持搜索与多维筛选）。"""
     from app.services.pipeline import PIPELINE_STAGES, list_pipeline_client_summaries
 
     clients = list_pipeline_client_summaries()
@@ -540,21 +682,127 @@ def get_customers(
     if channel:
         clients = [c for c in clients if channel in (c.get("channel_sources") or [])]
 
+    # 按标签筛选（手动标签或 AI 标签）
+    if tag:
+        clients = [
+            c for c in clients
+            if tag in (c.get("tags") or []) or tag in (c.get("ai_tags") or [])
+        ]
+
+    # 关键词搜索（姓名/公司/邮箱/电话/登录名）
+    if q.strip():
+        ql = q.strip().lower()
+        search_fields = ("display_name", "name", "company", "email", "phone", "username")
+        clients = [
+            c for c in clients
+            if any(ql in str(c.get(f) or "").lower() for f in search_fields)
+        ]
+
     # 按 AI 评分筛选
     if min_ai_score > 0.0:
         clients = [c for c in clients if float(c.get("ai_score") or 0.0) >= min_ai_score]
 
-    # 限制返回数量
-    clients = clients[:limit]
+    total = len(clients)
+    clients = clients[: max(1, int(limit))]
 
     return {
         "success": True,
         "data": {
             "customers": clients,
-            "total": len(clients),
+            "total": total,
             "stage_definitions": PIPELINE_STAGES,
         },
     }
+
+
+class CustomerProfileBody(BaseModel):
+    """客户资料创建/更新请求体。"""
+    name: str = Field(default="", max_length=128)
+    company: str = Field(default="", max_length=256)
+    email: str = Field(default="", max_length=256)
+    phone: str = Field(default="", max_length=64)
+    note: str = Field(default="", max_length=4000)
+    owner: str = Field(default="", max_length=128)
+    source: str = Field(default="", max_length=64)
+    stage: str = Field(default="", max_length=32)
+    tags: list[str] = Field(default_factory=list, max_length=50)
+    channel_sources: list[str] = Field(default_factory=list, max_length=50)
+
+
+class CustomerBatchBody(BaseModel):
+    """客户批量操作请求体。action: delete | set_stage | add_tag | remove_tag"""
+    customer_ids: list[int] = Field(default_factory=list, max_length=1000)
+    action: str = Field(..., min_length=1, max_length=32)
+    stage: str = Field(default="", max_length=32)
+    tag: str = Field(default="", max_length=64)
+
+
+@router.post("/customers")
+def create_customer_endpoint(body: CustomerProfileBody, current_user: CurrentUser):
+    """新建客户。"""
+    from app.services.pipeline import create_customer
+
+    if not (body.name.strip() or body.company.strip()):
+        raise HTTPException(status_code=400, detail={"message": "请至少填写客户姓名或公司名称"})
+
+    operator = str(current_user.get("display_name") or current_user.get("email") or "")
+    doc = create_customer(body.model_dump(), username=operator)
+    return {"success": True, "data": {"customer_id": doc.get("customer_id"), "pipeline": doc}}
+
+
+@router.post("/customers/batch")
+def batch_customers_endpoint(body: CustomerBatchBody, current_user: CurrentUser):
+    """客户批量操作：删除 / 改阶段 / 增删标签。"""
+    from app.services.pipeline import (
+        add_customer_tag,
+        delete_pipeline,
+        remove_customer_tag,
+        set_pipeline_stage,
+    )
+
+    action = body.action.strip()
+    valid_actions = {"delete", "set_stage", "add_tag", "remove_tag"}
+    if action not in valid_actions:
+        raise HTTPException(status_code=400, detail={"message": f"不支持的操作: {action}"})
+
+    affected = 0
+    for cid in body.customer_ids:
+        try:
+            if action == "delete":
+                if delete_pipeline(int(cid)):
+                    affected += 1
+            elif action == "set_stage" and body.stage:
+                set_pipeline_stage(int(cid), body.stage, source="manual", note="批量改阶段")
+                affected += 1
+            elif action == "add_tag" and body.tag:
+                add_customer_tag(int(cid), body.tag)
+                affected += 1
+            elif action == "remove_tag" and body.tag:
+                remove_customer_tag(int(cid), body.tag)
+                affected += 1
+        except Exception:  # pragma: no cover - 单条失败不影响其他
+            logger.warning("批量客户操作失败: cid=%s action=%s", cid, action, exc_info=True)
+
+    return {"success": True, "data": {"affected": affected, "action": action}}
+
+
+@router.put("/customers/{customer_id}")
+def update_customer_endpoint(customer_id: int, body: CustomerProfileBody, current_user: CurrentUser):
+    """更新客户资料。"""
+    from app.services.pipeline import update_customer_profile
+
+    operator = str(current_user.get("display_name") or current_user.get("email") or "")
+    doc = update_customer_profile(int(customer_id), body.model_dump(), username=operator)
+    return {"success": True, "data": {"customer_id": doc.get("customer_id"), "pipeline": doc}}
+
+
+@router.delete("/customers/{customer_id}")
+def delete_customer_endpoint(customer_id: int, current_user: CurrentUser):
+    """删除客户。"""
+    from app.services.pipeline import delete_pipeline
+
+    deleted = delete_pipeline(int(customer_id))
+    return {"success": bool(deleted), "data": {"customer_id": int(customer_id), "deleted": bool(deleted)}}
 
 
 @router.get("/status")
@@ -1091,7 +1339,7 @@ def auth_register(body: RegisterBody, request: Request):
         email=body.email,
         phone=body.phone,
         password=body.password,
-        display_name=body.display_name,
+        display_name=body.display_name or body.name,
     )
     return result
 
@@ -1168,6 +1416,31 @@ def auth_send_sms(body: LoginBody, request: Request):
     if not code:
         return {"success": False, "error": "验证码发送失败，请检查手机号"}
     return {"success": True, "message": "验证码已发送（开发模式：请查看服务器日志）", "code": code}
+
+
+@router.post("/auth/forgot-password")
+def auth_reset_password(body: ResetPasswordBody, request: Request):
+    """通过手机验证码重置密码。
+
+    前置：客户端需先调用 /auth/sms/send 获取验证码。
+    """
+    from app.services.auth import reset_password_by_phone
+    from app.services.rate_limiter import check_login_rate_limit
+    from app.main import _get_client_ip
+
+    ip_key = f"ip:{_get_client_ip(request)}"
+    allowed, retry_after = check_login_rate_limit(ip_key)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail={"message": "请求过于频繁，请稍后再试", "retry_after": round(retry_after, 1)},
+            headers={"Retry-After": str(int(retry_after) + 1)},
+        )
+
+    result = reset_password_by_phone(body.phone, body.code, body.new_password)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail={"message": result.get("error", "重置失败")})
+    return result
 
 
 @router.get("/auth/me")

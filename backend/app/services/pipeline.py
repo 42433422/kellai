@@ -90,6 +90,16 @@ def _default_pipeline(customer_id: int, username: str = "") -> dict[str, Any]:
         "customer_id": int(customer_id),
         "market_user_id": int(customer_id),
         "username": str(username or "").strip(),
+        # 手动维护的客户资料字段
+        "name": "",
+        "company": "",
+        "email": "",
+        "phone": "",
+        "note": "",
+        "owner": "",
+        "source": "",
+        "tags": [],
+        "created_at": _now_iso(),
         "stage": "idle",
         "channel_sources": [],
         "ai_score": 0.0,
@@ -205,7 +215,18 @@ def set_pipeline_stage(
     return save_pipeline(doc)
 
 
+# 客户可手动维护的资料字段（用于创建/更新时白名单赋值）
+_PROFILE_FIELDS = ("name", "company", "email", "phone", "note", "owner", "source")
+
+
 def _display_name_from_doc(doc: dict[str, Any], username: str = "") -> str:
+    # 手动维护的客户资料优先（公司 > 姓名）
+    top_company = str(doc.get("company") or "").strip()
+    if top_company:
+        return top_company
+    top_name = str(doc.get("name") or "").strip()
+    if top_name:
+        return top_name
     intake = doc.get("intake_form")
     if isinstance(intake, dict):
         company = str(intake.get("company") or "").strip()
@@ -219,6 +240,33 @@ def _display_name_from_doc(doc: dict[str, Any], username: str = "") -> str:
         return erp
     login = str(doc.get("username") or username or "").strip()
     return login
+
+
+def _contact_from_doc(doc: dict[str, Any]) -> dict[str, Any]:
+    """提取客户联系信息：顶层资料优先，其次回退到需求表单。"""
+    intake = doc.get("intake_form") if isinstance(doc.get("intake_form"), dict) else {}
+
+    def pick(*keys: str) -> str:
+        for k in keys:
+            v = str(doc.get(k) or "").strip()
+            if v:
+                return v
+        for k in keys:
+            v = str((intake or {}).get(k) or "").strip()
+            if v:
+                return v
+        return ""
+
+    return {
+        "name": pick("name", "contact_name"),
+        "company": pick("company", "company_name", "erp_customer_name"),
+        "email": pick("email", "contact_email"),
+        "phone": pick("phone", "contact_phone"),
+        "owner": str(doc.get("owner") or "").strip(),
+        "note": str(doc.get("note") or "").strip(),
+        "source": str(doc.get("source") or "").strip(),
+        "tags": list(doc.get("tags") or []),
+    }
 
 
 def _iter_pipeline_docs() -> list[dict[str, Any]]:
@@ -253,6 +301,7 @@ def list_pipeline_client_summaries() -> list[dict[str, Any]]:
         if uid <= 0:
             continue
         stage = str(doc.get("stage") or "idle")
+        contact = _contact_from_doc(doc)
         rows.append(
             {
                 "customer_id": uid,
@@ -267,9 +316,19 @@ def list_pipeline_client_summaries() -> list[dict[str, Any]]:
                 "intake_sent": bool(doc.get("intake_sent")),
                 "last_message_preview": str(doc.get("last_message_preview") or "")[:500],
                 "updated_at": str(doc.get("updated_at") or ""),
+                "created_at": str(doc.get("created_at") or doc.get("updated_at") or ""),
+                # 扩展：手动维护的客户资料
+                "name": contact["name"],
+                "company": contact["company"],
+                "email": contact["email"],
+                "phone": contact["phone"],
+                "owner": contact["owner"],
+                "note": contact["note"],
+                "source": contact["source"],
+                "tags": contact["tags"],
             }
         )
-    rows.sort(key=lambda r: (r.get("username") or "", r["customer_id"]))
+    rows.sort(key=lambda r: (r.get("updated_at") or "", r["customer_id"]), reverse=True)
     return rows
 
 
@@ -381,18 +440,116 @@ def repair_all_pipelines() -> dict[str, Any]:
     return {"repaired": repaired}
 
 
+# ---------------------------------------------------------------------------
+# 客户资料 CRUD（基于 pipeline 档案）
+# ---------------------------------------------------------------------------
+
+# 手动创建客户的 ID 基线，避免与外部系统 ID（如 market_user_id）冲突
+_MANUAL_CUSTOMER_ID_BASE = 90000
+
+
+def next_customer_id() -> int:
+    """为手动创建的客户分配一个新的 customer_id。"""
+    max_id = 0
+    for doc in _iter_pipeline_docs():
+        max_id = max(max_id, _customer_id_from_doc(doc))
+    return max(max_id, _MANUAL_CUSTOMER_ID_BASE) + 1
+
+
+def _apply_profile(doc: dict[str, Any], profile: dict[str, Any]) -> None:
+    """把传入的客户资料字段安全地写入 doc（白名单 + 清洗）。"""
+    for key in _PROFILE_FIELDS:
+        if profile.get(key) is not None:
+            val = profile[key]
+            doc[key] = val.strip() if isinstance(val, str) else val
+    if profile.get("tags") is not None:
+        doc["tags"] = [str(t).strip() for t in (profile.get("tags") or []) if str(t).strip()]
+    if profile.get("channel_sources") is not None:
+        doc["channel_sources"] = [str(c).strip() for c in (profile.get("channel_sources") or []) if str(c).strip()]
+
+
+def create_customer(profile: dict[str, Any], *, username: str = "") -> dict[str, Any]:
+    """新建客户档案，返回保存后的 doc。"""
+    uid = next_customer_id()
+    doc = _default_pipeline(uid, username=username)
+    doc["created_at"] = _now_iso()
+    _apply_profile(doc, profile)
+    stage = str(profile.get("stage") or "").strip()
+    if stage in _STAGE_ORDER:
+        doc["stage"] = stage
+    _append_timeline(doc, doc["stage"], "manual", note="创建客户")
+    return save_pipeline(doc)
+
+
+def update_customer_profile(customer_id: int, profile: dict[str, Any], *, username: str = "") -> dict[str, Any]:
+    """更新客户资料（含可选的阶段变更），返回保存后的 doc。"""
+    doc = load_pipeline(int(customer_id), username=username)
+    _apply_profile(doc, profile)
+    stage = str(profile.get("stage") or "").strip()
+    if stage and stage in _STAGE_ORDER and doc.get("stage") != stage:
+        doc["stage"] = stage
+        _append_timeline(doc, stage, "manual", note="资料更新")
+    return save_pipeline(doc)
+
+
+def add_customer_tag(customer_id: int, tag: str) -> dict[str, Any]:
+    """给客户追加一个标签（去重）。"""
+    doc = load_pipeline(int(customer_id))
+    tags = [str(t) for t in (doc.get("tags") or [])]
+    tag = str(tag).strip()
+    if tag and tag not in tags:
+        tags.append(tag)
+    doc["tags"] = tags
+    return save_pipeline(doc)
+
+
+def remove_customer_tag(customer_id: int, tag: str) -> dict[str, Any]:
+    """移除客户的某个标签。"""
+    doc = load_pipeline(int(customer_id))
+    tag = str(tag).strip()
+    doc["tags"] = [str(t) for t in (doc.get("tags") or []) if str(t) != tag]
+    return save_pipeline(doc)
+
+
+def delete_pipeline(customer_id: int) -> bool:
+    """删除客户档案（JSON 文件 + SQLite 快照）。"""
+    uid = int(customer_id)
+    deleted = False
+    for root in _pipeline_roots():
+        path = root / f"{uid}.json"
+        if path.is_file():
+            try:
+                path.unlink()
+                deleted = True
+            except OSError:
+                logger.warning("删除 pipeline 文件失败: %s", path, exc_info=True)
+    try:
+        from app.services.crm_store import delete_pipeline_from_sqlite
+
+        delete_pipeline_from_sqlite(uid)
+    except Exception:  # pragma: no cover - SQLite 清理失败不阻塞
+        logger.debug("删除 SQLite pipeline 失败: customer_id=%s", uid, exc_info=True)
+    return deleted
+
+
 __all__ = [
     "PIPELINE_STAGES",
     "PipelineCrmGateError",
     "_STAGE_ORDER",
     "_pipeline_roots",
+    "add_customer_tag",
     "analyze_customer_pipeline",
     "auto_advance_pipeline_if_ready",
     "build_pipeline_funnel_summary",
+    "create_customer",
+    "delete_pipeline",
     "list_pipeline_client_summaries",
     "load_pipeline",
+    "next_customer_id",
+    "remove_customer_tag",
     "repair_all_pipelines",
     "repair_pipeline_crm",
     "save_pipeline",
     "set_pipeline_stage",
+    "update_customer_profile",
 ]

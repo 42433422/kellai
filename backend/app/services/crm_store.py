@@ -342,3 +342,14 @@ def get_pipeline_from_sqlite(customer_id: int) -> dict[str, Any] | None:
             (int(customer_id),),
         ).fetchone()
     return _pipeline_row_to_dict(row) if row else None
+
+
+def delete_pipeline_from_sqlite(customer_id: int) -> bool:
+    """从 SQLite 删除单个 pipeline 快照行，返回是否删除成功。"""
+    ensure_crm_schema()
+    with _connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM kellai_pipelines WHERE customer_id = ?",
+            (int(customer_id),),
+        )
+        return cur.rowcount > 0

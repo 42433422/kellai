@@ -1,5 +1,5 @@
 import { useNavigate } from 'react-router-dom';
-import { Clock, MessageCircle, Sparkles, Layers } from 'lucide-react';
+import { Clock, MessageCircle, Sparkles, Layers, Handshake, TrendingUp, Users, Timer } from 'lucide-react';
 import { useApiQuery } from '../hooks/useApiQuery';
 import { getReminders, getRecentMessages, getFunnelSummary } from '../api/dashboard';
 import { unwrapApiResponse } from '../utils/format';
@@ -132,7 +132,7 @@ function KpiTile({
   unit?: string;
   hint?: string;
   to: string;
-  tone?: 'blue' | 'cyan' | 'indigo' | 'amber';
+  tone?: 'blue' | 'cyan' | 'indigo' | 'amber' | 'green' | 'rose' | 'violet' | 'orange';
   /** 透传 data-module-id，新手教程 demoDashboard 靠它定位 */
   moduleId?: string;
   /** 透传 data-tour，旧的教程锚点（如果还有别处用到） */
@@ -145,6 +145,10 @@ function KpiTile({
     cyan:   { bg: 'bg-cyan-50',   icon: 'text-cyan-600',   arrow: 'text-cyan-600' },
     indigo: { bg: 'bg-indigo-50', icon: 'text-indigo-600', arrow: 'text-indigo-600' },
     amber:  { bg: 'bg-amber-50',  icon: 'text-amber-600',  arrow: 'text-amber-600' },
+    green:  { bg: 'bg-green-50',  icon: 'text-green-600',  arrow: 'text-green-600' },
+    rose:   { bg: 'bg-rose-50',   icon: 'text-rose-600',   arrow: 'text-rose-600' },
+    violet: { bg: 'bg-violet-50', icon: 'text-violet-600', arrow: 'text-violet-600' },
+    orange: { bg: 'bg-orange-50', icon: 'text-orange-600', arrow: 'text-orange-600' },
   };
   const t = toneMap[tone] ?? toneMap.blue!;
   return (
@@ -254,9 +258,28 @@ export default function Dashboard() {
   // 漏斗里"累计客户数"——KpiTile 用这个做大数字
   const funnelTotalClients = funnelStages.reduce((sum, s) => sum + (s.count ?? 0), 0);
 
+  // 签约客户数：signed + closed_won + deal 阶段
+  const signedCount = funnelStages
+    .filter((s) => ['signed', 'closed_won', 'deal'].includes(s.id))
+    .reduce((sum, s) => sum + s.count, 0);
+
+  // 成交率：签约 / 总客户
+  const winRate = funnelTotalClients > 0 ? Math.round((signedCount / funnelTotalClients) * 100) : 0;
+
+  // 跟进中：排除未接触和已签约/流失的阶段
+  const inProgressStages = ['connected', 'requirement', 'submitted', 'quoted', 'negotiating', 'pending_sign', 'contacted', 'interested', 'intention', 'proposal', 'negotiation', 'qualified'];
+  const inProgressCount = funnelStages
+    .filter((s) => inProgressStages.includes(s.id))
+    .reduce((sum, s) => sum + s.count, 0);
+
+  // 平均跟进时长：从 reminders 的 hours_since_last_contact 取均值
+  const avgFollowUpHours = reminders.length > 0
+    ? Math.round(reminders.reduce((sum, r) => sum + parseInt(r.lastFollowUpAt) || 0, 0) / reminders.length)
+    : 0;
+
   /* ---- 渲染 ---- */
   return (
-    <div className="space-y-6">
+    <div className="flex flex-1 flex-col gap-6 overflow-auto min-h-0">
       {/* 页面标题 */}
       <div>
         <h1 className="text-2xl font-bold text-gray-900 dark:text-slate-100">工作台</h1>
@@ -269,7 +292,6 @@ export default function Dashboard() {
           - 今日待办 / 线索动态 / 漏斗概览 / AI 建议
           - 都只显示关键数字 + 入口，不在 dashboard 展开
           - 一行 4 个 (lg+)，两行 2 个 (sm)，叠成 1 列 (<sm)
-          - 整页不滚动
           每个 tile 带 data-module-id，给教程 demoDashboard 当锚点 */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <KpiTile
@@ -315,6 +337,50 @@ export default function Dashboard() {
           tone="amber"
           moduleId="dashboard-ai"
           dataTour="dashboard-ai"
+        />
+      </div>
+
+      {/* 第二行 4 个 KpiTile：签约 / 成交率 / 跟进中 / 平均跟进时长 */}
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <KpiTile
+          title="签约客户"
+          icon={Handshake}
+          metric={signedCount}
+          unit="位"
+          hint="已签约成交"
+          to="/funnel"
+          tone="green"
+          moduleId="dashboard-signed"
+        />
+        <KpiTile
+          title="成交率"
+          icon={TrendingUp}
+          metric={winRate}
+          unit="%"
+          hint="签约/总客户"
+          to="/sales/performance"
+          tone="rose"
+          moduleId="dashboard-winrate"
+        />
+        <KpiTile
+          title="跟进中"
+          icon={Users}
+          metric={inProgressCount}
+          unit="位"
+          hint="活跃推进中"
+          to="/customers"
+          tone="violet"
+          moduleId="dashboard-inprogress"
+        />
+        <KpiTile
+          title="平均跟进"
+          icon={Timer}
+          metric={avgFollowUpHours}
+          unit="h"
+          hint="距上次跟进"
+          to="/ai"
+          tone="orange"
+          moduleId="dashboard-avgfollowup"
         />
       </div>
     </div>

@@ -54,6 +54,54 @@ def _write_disk(data: dict[str, Any]) -> None:
         logger.warning("写入渠道配置失败: %s", exc)
 
 
+def _env_prefixes(channel_type: str) -> list[str]:
+    """Return supported KELLAI_* env prefixes for a channel.
+
+    A few public/product names differ from historical env names. Keep both so
+    saved configs and deployments upgraded from older builds continue to work.
+    """
+    primary = channel_type.upper()
+    aliases: dict[str, list[str]] = {
+        "wework": ["WECOM", "WEWORK"],
+        "wecom": ["WECOM", "WEWORK"],
+        "miniprogram": ["MINIAPP", "MINIPROGRAM"],
+        "miniapp": ["MINIAPP", "MINIPROGRAM"],
+    }
+    out = aliases.get(channel_type, [primary])
+    if primary not in out:
+        out.append(primary)
+    return out
+
+
+def _env_suffixes(channel_type: str, key: str) -> list[str]:
+    suffix = key.upper()
+    aliases: dict[tuple[str, str], list[str]] = {
+        ("wework", "corp_id"): ["CORP_ID", "CORPID"],
+        ("wecom", "corp_id"): ["CORP_ID", "CORPID"],
+        ("wework", "secret"): ["SECRET", "CORP_SECRET", "CORPSECRET"],
+        ("wecom", "secret"): ["SECRET", "CORP_SECRET", "CORPSECRET"],
+        ("wework", "corp_secret"): ["CORP_SECRET", "CORPSECRET", "SECRET"],
+        ("wecom", "corp_secret"): ["CORP_SECRET", "CORPSECRET", "SECRET"],
+    }
+    out = aliases.get((channel_type, key), [suffix])
+    if suffix not in out:
+        out.append(suffix)
+    return out
+
+
+def _saved_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Flatten saved channel config while preserving old top-level records."""
+    nested = cfg.get("config")
+    merged: dict[str, Any] = {}
+    if isinstance(nested, dict):
+        merged.update(nested)
+    for key, value in cfg.items():
+        if key in {"config", "name", "enabled", "connected", "createdAt"}:
+            continue
+        merged.setdefault(key, value)
+    return merged
+
+
 def get(channel_type: str) -> dict[str, Any]:
     """获取某渠道的已保存配置（不含 env 兜底）。"""
     with _LOCK:
@@ -64,11 +112,13 @@ def get_field(channel_type: str, key: str, default: str = "") -> str:
     """获取某渠道某字段的配置值（env > JSON > default）。"""
     import os as _os
 
-    env_val = _os.environ.get(f"KELLAI_{channel_type.upper()}_{key.upper()}", "").strip()
-    if env_val:
-        return env_val
+    for prefix in _env_prefixes(channel_type):
+        for suffix in _env_suffixes(channel_type, key):
+            env_val = _os.environ.get(f"KELLAI_{prefix}_{suffix}", "").strip()
+            if env_val:
+                return env_val
     cfg = get(channel_type)
-    val = cfg.get(key)
+    val = _saved_config(cfg).get(key)
     return str(val) if val is not None else default
 
 
@@ -76,13 +126,20 @@ def get_all(channel_type: str) -> dict[str, Any]:
     """获取渠道全量配置（含 env 默认）。"""
     cfg = get(channel_type)
     out = dict(cfg)
+    merged_config = _saved_config(cfg)
     # env 默认值以"未在前端设置过"为判断标准
     for key in _expected_fields(channel_type):
-        if key in out and out[key]:
+        if key in merged_config and merged_config[key]:
             continue
-        env_val = os.environ.get(f"KELLAI_{channel_type.upper()}_{key.upper()}", "").strip()
-        if env_val:
-            out.setdefault(key, env_val)
+        for prefix in _env_prefixes(channel_type):
+            for suffix in _env_suffixes(channel_type, key):
+                env_val = os.environ.get(f"KELLAI_{prefix}_{suffix}", "").strip()
+                if env_val:
+                    merged_config.setdefault(key, env_val)
+                    break
+            if key in merged_config and merged_config[key]:
+                break
+    out["config"] = merged_config
     return out
 
 
@@ -118,7 +175,9 @@ def save(channel_type: str, config: dict[str, Any], *, name: Optional[str] = Non
         cur = dict(all_cfg.get(channel_type) or {})
         # 合并：保留原 name/enabled，只覆盖 config
         new_cfg = dict(cur)
-        new_cfg["config"] = dict(config or {})
+        merged_config = dict(cur.get("config") or {})
+        merged_config.update(dict(config or {}))
+        new_cfg["config"] = merged_config
         if name is not None:
             new_cfg["name"] = str(name)
         if enabled is not None:

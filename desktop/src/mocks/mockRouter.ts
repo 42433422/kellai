@@ -25,6 +25,10 @@ export async function handleExtendedRoutes(
   data: unknown
 ): Promise<AxiosResponse<unknown> | null> {
   // === v3 Sales ===
+  if (url === '/api/kellai/sales/flow' && method === 'get') {
+    const cid = (params as { customer_id?: number })?.customer_id ?? 1001;
+    return ok(config, { success: true, data: salesMock.getOrCreateFlow(Number(cid)) });
+  }
   if (url === '/api/kellai/sales/auto-flow' && method === 'post') {
     const body = data as { customer_id?: number; step?: string };
     const flow = salesMock.startAutoFlow(body.customer_id ?? 1001, body.step as SalesFlowStep | undefined);
@@ -91,8 +95,8 @@ export async function handleExtendedRoutes(
 
   // === v5 Scout ===
   if (url === '/api/kellai/scout/scan' && method === 'post') {
-    const body = data as { keyword?: string };
-    return ok(config, { success: true, data: scoutMock.scanComments(body.keyword) });
+    const body = data as { keyword?: string; platform?: string };
+    return ok(config, { success: true, data: scoutMock.scanComments(body.keyword, body.platform) });
   }
   if (url === '/api/kellai/scout/intent-score' && method === 'post') {
     const body = data as { comment?: string };
@@ -102,8 +106,15 @@ export async function handleExtendedRoutes(
     const body = data as { target_id?: string; message?: string };
     return ok(config, { success: true, data: scoutMock.autoDM(body.target_id ?? '', body.message ?? '') });
   }
+  if (url === '/api/kellai/scout/convert' && method === 'post') {
+    const body = data as { target_id?: string };
+    return ok(config, { success: true, data: scoutMock.convertLead(body.target_id ?? '') });
+  }
   if (url === '/api/kellai/scout/sentiment' && method === 'get') {
     return ok(config, { success: true, data: scoutMock.getSentiment() });
+  }
+  if (url === '/api/kellai/scout/sentiment-overview' && method === 'get') {
+    return ok(config, { success: true, data: scoutMock.getSentimentOverview() });
   }
   if (url === '/api/kellai/scout/trace' && method === 'get') {
     const targetId = (params as { target_id?: string })?.target_id ?? 'st1';
@@ -146,7 +157,8 @@ export async function handleExtendedRoutes(
 
   // === v7 Finance ===
   if (url === '/api/kellai/finance/dashboard' && method === 'get') {
-    return ok(config, { success: true, data: financeMock.getFinanceDashboard() });
+    const period = (params as { period?: string })?.period ?? 'month';
+    return ok(config, { success: true, data: financeMock.getFinanceDashboard(period) });
   }
   if (url === '/api/kellai/finance/ask' && method === 'post') {
     const body = data as { question?: string };
@@ -156,7 +168,8 @@ export async function handleExtendedRoutes(
     return ok(config, { success: true, data: financeMock.getBudgetSuggestion() });
   }
   if (url === '/api/kellai/finance/performance' && method === 'get') {
-    return ok(config, { success: true, data: financeMock.getFinancePerformance() });
+    const period = (params as { period?: string })?.period ?? 'month';
+    return ok(config, { success: true, data: financeMock.getFinancePerformance(period) });
   }
   if (url === '/api/kellai/finance/alerts' && method === 'get') {
     return ok(config, { success: true, data: financeMock.getFinanceAlerts() });
@@ -176,6 +189,16 @@ export async function handleExtendedRoutes(
   if (url === '/api/kellai/open/api-keys' && method === 'post') {
     const body = data as { name?: string; scopes?: string[] };
     return ok(config, { success: true, data: openMock.createAPIKey(body.name ?? '新密钥', body.scopes ?? []) });
+  }
+  if (url === '/api/kellai/open/api-keys/revoke' && method === 'post') {
+    const body = data as { id?: string };
+    return ok(config, { success: true, data: { revoked: openMock.revokeAPIKey(body.id ?? '') } });
+  }
+  if (url === '/api/kellai/open/stats' && method === 'get') {
+    return ok(config, { success: true, data: openMock.getPlatformStats() });
+  }
+  if (url === '/api/kellai/open/webhooks' && method === 'get') {
+    return ok(config, { success: true, data: openMock.getWebhooks() });
   }
   if (url === '/api/kellai/open/plugins' && method === 'get') {
     return ok(config, { success: true, data: openMock.getPlugins() });

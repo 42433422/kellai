@@ -14,6 +14,10 @@ class ChannelRegistry:
     """管理渠道适配器的注册与获取（单例）。"""
 
     _instance: ChannelRegistry | None = None
+    _aliases: dict[str, str] = {
+        "wecom": "wework",
+        "miniapp": "miniprogram",
+    }
 
     def __new__(cls) -> ChannelRegistry:
         if cls._instance is None:
@@ -37,12 +41,13 @@ class ChannelRegistry:
 
     def get(self, channel_type: str) -> ChannelAdapter:
         """获取渠道适配器实例（缓存，只实例化一次）。"""
-        if channel_type not in self._registry:
+        resolved_type = self._aliases.get(channel_type, channel_type)
+        if resolved_type not in self._registry:
             raise KeyError(f"未注册的渠道类型: {channel_type}")
-        if channel_type not in self._instances:
-            adapter_class = self._registry[channel_type]["adapter_class"]
-            self._instances[channel_type] = adapter_class()
-        return self._instances[channel_type]
+        if resolved_type not in self._instances:
+            adapter_class = self._registry[resolved_type]["adapter_class"]
+            self._instances[resolved_type] = adapter_class()
+        return self._instances[resolved_type]
 
     def list_channels(self) -> list[dict[str, Any]]:
         """列出所有已注册渠道信息。"""

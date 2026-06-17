@@ -39,6 +39,21 @@ pytestmark = pytest.mark.asyncio
 
 
 @pytest.fixture()
+def isolated_channel_config(tmp_path, monkeypatch):
+    """避免本机 data/channel_configs.json 影响通道单测。"""
+    monkeypatch.setenv("KELLAI_CHANNEL_CONFIG_PATH", str(tmp_path / "channel_configs.json"))
+    from app.channels import config_store
+
+    importlib.reload(config_store)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_channel_config(isolated_channel_config):
+    yield
+
+
+@pytest.fixture()
 def tmp_db(tmp_path, monkeypatch):
     monkeypatch.setenv("KELLAI_DATA_DIR", str(tmp_path))
 
@@ -152,6 +167,63 @@ class TestWeChatAdapter:
             out = await a.send_message("@chat", "ping")
         assert out["success"] is True
         assert out["message_id"] == "wm-1"
+
+
+# ---------------------------------------------------------------------------
+# 渠道配置与别名
+# ---------------------------------------------------------------------------
+
+
+class TestChannelConfigStore:
+    async def test_saved_config_is_read_and_merged(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KELLAI_CHANNEL_CONFIG_PATH", str(tmp_path / "channels.json"))
+
+        from app.channels import config_store
+
+        importlib.reload(config_store)
+        config_store.save(
+            "wework",
+            {"corp_id": "wxcorp123", "secret": "sec", "agent_id": "1000002"},
+            name="企业微信",
+            enabled=True,
+        )
+        config_store.save("wework", {"oauth_authorized": "true"})
+
+        assert config_store.get_field("wework", "corp_id") == "wxcorp123"
+        assert config_store.get_field("wework", "secret") == "sec"
+        assert config_store.get_field("wework", "oauth_authorized") == "true"
+
+        all_config = config_store.get_all("wework")
+        assert all_config["enabled"] is True
+        assert all_config["config"]["agent_id"] == "1000002"
+        assert all_config["config"]["oauth_authorized"] == "true"
+
+    async def test_wecom_env_alias_and_registry_alias(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KELLAI_CHANNEL_CONFIG_PATH", str(tmp_path / "channels.json"))
+        monkeypatch.setenv("KELLAI_WECOM_CORP_ID", "env-corp")
+
+        from app.channels import ChannelRegistry, config_store
+        from app.channels.wecom import WeComAdapter
+
+        importlib.reload(config_store)
+        assert config_store.get_field("wework", "corp_id") == "env-corp"
+
+        reg = ChannelRegistry()
+        assert isinstance(reg.get("wecom"), WeComAdapter)
+        assert reg.get("wecom") is reg.get("wework")
+
+    async def test_channel_list_does_not_probe_external_connections(self, monkeypatch):
+        from app.api.routes import list_channels
+        from app.channels.wecom import WeComAdapter
+
+        async def fail_if_called(self):
+            raise AssertionError("list_channels must not call external connection tests")
+
+        monkeypatch.setattr(WeComAdapter, "test_connection", fail_if_called)
+
+        result = await list_channels()
+        assert result["success"] is True
+        assert any(ch["type"] == "wework" for ch in result["data"])
 
 
 # ---------------------------------------------------------------------------

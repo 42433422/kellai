@@ -398,7 +398,7 @@ function AIChatPanel({ selectedCustomerId, selectedCustomerName }: { selectedCus
   };
 
   return (
-    <div className="flex flex-1 flex-col border-b border-gray-200">
+    <div className="flex flex-1 flex-col border-b border-gray-200 min-h-0">
       {/* 标题栏 */}
       <div className="flex items-center gap-2 border-b border-gray-100 px-5 py-3.5">
         <Bot className="h-5 w-5 text-blue-500" />
@@ -411,7 +411,7 @@ function AIChatPanel({ selectedCustomerId, selectedCustomerName }: { selectedCus
       </div>
 
       {/* 对话区域 */}
-      <div className="flex-1 overflow-y-auto px-5 py-4">
+      <div className="flex-1 overflow-y-auto px-5 py-4 min-h-0">
         {messages.length === 0 && (
           <div className="flex h-full flex-col items-center justify-center text-center">
             <div className="mb-3 flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-blue-50 to-indigo-100">
@@ -851,7 +851,7 @@ export default function AIAssistant() {
     // -m-6 抵消父布局（Layout.tsx 中 <main> 内的 p-6），
     // 让提醒栏 / 对话区 / 画像栏 贴满整块内容区，无外边距。
     // 如果父布局 padding 变更，这里需同步调整。
-    <div className="flex h-full -m-6">
+    <div className="flex flex-1 min-h-0">
       {/* 左栏：跟进提醒 */}
       <ReminderPanel />
 

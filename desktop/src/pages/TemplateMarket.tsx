@@ -24,7 +24,7 @@ export default function TemplateMarket() {
   );
 
   return (
-    <div className="space-y-6">
+    <div className="flex flex-1 flex-col gap-6 overflow-auto min-h-0">
       <div>
         <h1 className="text-2xl font-bold text-gray-900 dark:text-slate-100">模板市场</h1>
         <p className="mt-1 text-sm text-gray-500 dark:text-slate-400">行业开箱即用流程方案</p>

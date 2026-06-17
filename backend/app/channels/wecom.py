@@ -32,6 +32,11 @@ def _cfg(field: str, default: str = "") -> str:
     return get_field("wework", field, default=default) or read_env(f"KELLAI_WECOM_{field.upper()}", default=default)
 
 
+def _inbox_channel_types() -> list[str]:
+    """企微历史上同时出现过 wework/wecom，收件箱读取要兼容。"""
+    return ["wework", "wecom"]
+
+
 class _WeComClient(BaseChannelClient):
     """企业微信 HTTP 客户端。"""
 
@@ -217,7 +222,11 @@ class WeComAdapter(ChannelAdapter):
         """从收件箱表读取待消费消息（webhook 已写入）。"""
         try:
             from app.services.message_store import list_inbox
-            rows = list_inbox(self.channel_type, limit=int(limit))
+            rows: list[dict[str, Any]] = []
+            for channel_type in _inbox_channel_types():
+                rows.extend(list_inbox(channel_type, limit=max(int(limit), 1)))
+            rows.sort(key=lambda item: str(item.get("received_at", "")), reverse=True)
+            rows = rows[: int(limit)]
         except Exception as exc:
             logger.warning("读取企微收件箱失败: %s", exc)
             return []
@@ -230,7 +239,7 @@ class WeComAdapter(ChannelAdapter):
                 UnifiedMessage(
                     id=str(r["id"]),
                     customer_id=0,
-                    channel_type=self.channel_type,
+                    channel_type=str(r.get("channel_type") or self.channel_type),
                     contact_id=str(r.get("contact_id", "")),
                     contact_name=str(r.get("contact_name", "")),
                     direction=str(r.get("direction", "inbound")),
@@ -252,7 +261,7 @@ class WeComAdapter(ChannelAdapter):
         corp_id = self._corp_id()
         corp_secret = self._corp_secret()
         if not (corp_id and corp_secret):
-            return []
+            return self._contacts_from_inbox(keyword=keyword, limit=limit)
         try:
             client = _WeComClient(corp_id, corp_secret)
             token = await client.fetch_token()
@@ -281,7 +290,36 @@ class WeComAdapter(ChannelAdapter):
             ]
         except Exception as exc:
             logger.warning("企微 get_contacts 异常: %s", exc)
+            return self._contacts_from_inbox(keyword=keyword, limit=limit)
+
+    def _contacts_from_inbox(self, keyword: str = "", limit: int = 80) -> list[dict]:
+        """未配置通讯录权限时，从 webhook/收件箱沉淀的联系人兜底。"""
+        try:
+            from app.services.message_store import list_inbox
+            rows: list[dict[str, Any]] = []
+            for channel_type in _inbox_channel_types():
+                rows.extend(list_inbox(channel_type, limit=500, include_consumed=True))
+            rows.sort(key=lambda item: str(item.get("received_at", "")), reverse=True)
+        except Exception:
             return []
+
+        seen: dict[str, dict] = {}
+        kw = keyword.lower()
+        for row in rows:
+            cid = str(row.get("contact_id", "")).strip()
+            if not cid or cid in seen:
+                continue
+            name = str(row.get("contact_name", "")).strip() or cid
+            if kw and kw not in name.lower() and kw not in cid.lower():
+                continue
+            seen[cid] = {
+                "id": cid,
+                "name": name,
+                "channel": str(row.get("channel_type") or self.channel_type),
+            }
+            if len(seen) >= int(limit):
+                break
+        return list(seen.values())
 
     # ----------------- test_connection -----------------
 

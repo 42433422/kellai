@@ -11,6 +11,9 @@ import type {
   SalesScriptHint,
 } from '../types';
 
+export const getFlow = (customerId: number) =>
+  request<SalesFlow>('get', '/api/kellai/sales/flow', { customer_id: customerId });
+
 export const startAutoFlow = (customerId: number, step?: SalesFlowStep) =>
   request<SalesFlow>('post', '/api/kellai/sales/auto-flow', { customer_id: customerId, step });
 

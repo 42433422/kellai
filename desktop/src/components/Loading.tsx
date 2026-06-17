@@ -183,7 +183,7 @@ export default function Loading({
   return (
     <div
       className={clsx(
-        "flex flex-col items-center justify-center py-8 text-gray-400 dark:text-slate-400",
+        "flex flex-1 flex-col items-center justify-center py-8 text-gray-400 dark:text-slate-400",
         sz.gap,
         sz.text,
         className

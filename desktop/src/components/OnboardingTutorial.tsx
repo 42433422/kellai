@@ -51,20 +51,6 @@ function cursorClick(el: HTMLElement, label?: string, duration = 500 * SPEED) {
   }
 }
 
-/** 安全地触发一个元素的 click（带容错 + 虚拟光标动画） */
-function safeClick(selector: string, label?: string, duration = 500 * SPEED): boolean {
-  const el = document.querySelector(selector) as HTMLElement | null;
-  if (!el) return false;
-  // 把元素滚进可视区，避免被遮罩盖住
-  try {
-    el.scrollIntoView({ behavior: "smooth", block: "center" });
-  } catch {
-    // ignore
-  }
-  cursorClick(el, label, duration);
-  return true;
-}
-
 /** 模拟键盘事件 */
 function fireKey(key: string, code: string, meta = false) {
   const ev = new KeyboardEvent("keydown", {
@@ -376,43 +362,82 @@ function demoFunnelDrag(timers: ReturnType<typeof makeTimerGroup>): DemoResult {
   return { ok: true };
 }
 
-/** Step 3（消息）：自动点第一个联系人 → AI 推荐 → 等 AI 返回 → 填入第一条话术
+/** Step 5（消息中心）：自动点第一个联系人 → AI 推荐 → 等 AI 返回 → 填入第一条话术
  *  用 data-tour / data-contact-id / data-suggestion-fill 锚点
- *  关键：AI 推荐会触发后端请求 + loading，必须等"填入"按钮真的出现再点，
- *  不能写死时序（之前写 2800ms 不够，SPEED=2 时等于 5.6s，但 AI 后端也卡的话仍会失败） */
+ *  关键修复：
+ *  1. cursorClick 的真实 click 在 duration 后才触发，所以"点联系人"后必须等足够久
+ *     再点 AI 推荐按钮（之前 1200*SPEED 不够，联系人选中状态还没更新）
+ *  2. AI 推荐按钮在未选中联系人时 disabled，必须确认联系人已选中
+ *  3. AI 推荐会触发后端请求 + loading，必须等"填入"按钮真的出现再点
+ *  4. 联系人列表是异步加载的，必须轮询等 data-contact-id 出现再操作
+ *     （之前直接 querySelector，如果列表还在 loading 骨架屏阶段就找不到） */
 function demoMessages(timers: ReturnType<typeof makeTimerGroup>): DemoResult {
   const list = document.querySelector<HTMLElement>('[data-tour="messages-contact-list"]');
   if (!list) return { ok: false, fallbackMsg: "消息页面未加载，请刷新" };
 
-  // 抓第一个联系人的真实 id，后面 Step 6 跳详情页要用
-  let firstContactId: string | null = null;
-  const firstContactEl = document.querySelector<HTMLElement>(
-    '[data-tour="messages-contact-list"] [data-contact-id]'
-  );
-  if (firstContactEl) firstContactId = firstContactEl.getAttribute("data-contact-id");
-  // 暴露给外层 runStep 用
-  (window as unknown as { __tutorialFirstContact?: string | null }).__tutorialFirstContact = firstContactId;
-
-  // 1) 点开第一个联系人
-  timers.set(() => {
-    const firstContact = document.querySelector<HTMLElement>(
+  // 0) 轮询等待联系人列表加载完成（骨架屏 → 真实联系人）
+  //    最多等 5*SPEED 秒；找到后设置 __tutorialFirstContact
+  let contactPollElapsed = 0;
+  const contactPollMax = 5000 * SPEED;
+  timers.set(function pollContact() {
+    const firstContactEl = document.querySelector<HTMLElement>(
       '[data-tour="messages-contact-list"] [data-contact-id]'
     );
-    if (firstContact) {
-      firstContact.style.transition = "background .3s";
-      firstContact.style.background = "#dbeafe";
-      cursorClick(firstContact, "💬 选这个客户", 800 * SPEED);
-      setTimeout(() => (firstContact.style.background = ""), 600 * SPEED);
+    if (firstContactEl) {
+      const cid = firstContactEl.getAttribute("data-contact-id");
+      (window as unknown as { __tutorialFirstContact?: string | null }).__tutorialFirstContact = cid;
+      return;
     }
+    contactPollElapsed += 200 * SPEED;
+    if (contactPollElapsed < contactPollMax) {
+      timers.set(pollContact, 200 * SPEED);
+    } else {
+      // 超时：设一个 fallback，让 step 6 至少能导航到 /customers/1001
+      (window as unknown as { __tutorialFirstContact?: string | null }).__tutorialFirstContact = null;
+    }
+  }, 100 * SPEED);
+
+  // 1) 点开第一个联系人（轮询等待联系人出现，而非直接 querySelector）
+  //    联系人列表是异步加载的，SCHEDULE 的 waitFor 已确保 [data-contact-id] 出现，
+  //    但这里加一层保险：如果还没出现就等一下再试
+  timers.set(() => {
+    const tryClickContact = () => {
+      const firstContact = document.querySelector<HTMLElement>(
+        '[data-tour="messages-contact-list"] [data-contact-id]'
+      );
+      if (firstContact) {
+        firstContact.style.transition = "background .3s";
+        firstContact.style.background = "#dbeafe";
+        cursorClick(firstContact, "💬 选这个客户", 800 * SPEED);
+        setTimeout(() => (firstContact.style.background = ""), 600 * SPEED);
+      } else {
+        // 还没加载，100ms 后重试
+        timers.set(tryClickContact, 100 * SPEED);
+      }
+    };
+    tryClickContact();
   }, 200 * SPEED);
 
-  // 2) 点 AI 推荐按钮
-  timers.set(() => safeClick('[data-tour="messages-ai-suggest"]', "✨ AI 推荐", 800 * SPEED), 1200 * SPEED);
+  // 2) 点 AI 推荐按钮 — 必须等联系人选中完成（cursorClick duration=800*SPEED + React 渲染 ~1 帧）
+  //    之前 1200*SPEED 不够，改为 1600*SPEED 确保联系人已选中
+  //    同时用轮询确认按钮不再是 disabled
+  timers.set(() => {
+    const tryClickAiBtn = () => {
+      const btn = document.querySelector<HTMLButtonElement>('[data-tour="messages-ai-suggest"]');
+      if (btn && !btn.disabled) {
+        cursorClick(btn, "✨ AI 推荐", 800 * SPEED);
+      } else {
+        // 按钮还没就绪，100ms 后重试
+        timers.set(tryClickAiBtn, 100 * SPEED);
+      }
+    };
+    tryClickAiBtn();
+  }, 1600 * SPEED);
 
-  // 3) 等 AI 返回（轮询 data-suggestion-fill 锚点出现，最长 4*SPEED 秒）
+  // 3) 等 AI 返回（轮询 data-suggestion-fill 锚点出现，最长 6*SPEED 秒）
   let aiWaited = 0;
-  const aiStart = 2200 * SPEED; // 第 2 步点完后开始等
-  const aiMax = 4000 * SPEED;
+  const aiStart = 2800 * SPEED; // 留足够时间给 AI 推荐请求
+  const aiMax = 6000 * SPEED;
   timers.set(function pollAi() {
     const fillBtn = document.querySelector<HTMLElement>('[data-suggestion-fill="0"]') ||
       document.querySelector<HTMLElement>('[data-tour="messages-suggestion-fill"]');
@@ -440,27 +465,79 @@ function demoMessages(timers: ReturnType<typeof makeTimerGroup>): DemoResult {
   return { ok: true };
 }
 
-/** Step 4（客户详情）：滚动到 AI 画像区域
- *  锚点用 data-tour="customer-ai-profile"，不再走"按 h 文本猜祖先"那种 fragile 逻辑 */
-function demoCustomerDetail(_timers: ReturnType<typeof makeTimerGroup>): DemoResult {
-  const card = document.querySelector<HTMLElement>('[data-tour="customer-ai-profile"]');
-  if (!card) return { ok: false, fallbackMsg: "客户详情页 AI 画像区域未找到" };
-  card.scrollIntoView({ behavior: "smooth", block: "center" });
-  card.style.transition = "outline .3s, outline-offset .3s";
-  card.style.outline = "2px solid #3b82f6";
-  card.style.outlineOffset = "4px";
-  setTimeout(() => {
-    card.style.outline = "";
-    card.style.outlineOffset = "";
-  }, 1500 * SPEED);
+/** Step 6（客户详情）：先展示 AI 画像，再切到销售 Tab 展示 LTV 预测
+ *  修复：之前只滚动高亮 AI 画像，交互太弱。现在增加切换 Tab 和展示销售功能的演示。 */
+function demoCustomerDetail(timers: ReturnType<typeof makeTimerGroup>): DemoResult {
+  const detailRoot = document.querySelector<HTMLElement>('[data-tour="customer-detail"]');
+  if (!detailRoot) return { ok: false, fallbackMsg: "客户详情页未加载" };
+
+  // 1) 高亮 AI 画像区域
+  timers.set(() => {
+    const card = document.querySelector<HTMLElement>('[data-tour="customer-ai-profile"]');
+    if (card) {
+      card.scrollIntoView({ behavior: "smooth", block: "center" });
+      const cursor = (window as unknown as { virtualCursor?: { moveTo: (el: HTMLElement, opts?: { duration?: number; label?: string }) => void } }).virtualCursor;
+      if (cursor) cursor.moveTo(card, { duration: 700 * SPEED, label: "🧠 AI 画像" });
+      card.style.transition = "outline .3s, outline-offset .3s";
+      card.style.outline = "2px solid #3b82f6";
+      card.style.outlineOffset = "4px";
+    }
+  }, 200 * SPEED);
+
+  // 2) 清除 AI 画像高亮
+  timers.set(() => {
+    const card = document.querySelector<HTMLElement>('[data-tour="customer-ai-profile"]');
+    if (card) {
+      card.style.outline = "";
+      card.style.outlineOffset = "";
+    }
+  }, 1400 * SPEED);
+
+  // 3) 点击"销售"Tab（用 aria-label 定位）
+  timers.set(() => {
+    const tabBtns = detailRoot.querySelectorAll<HTMLButtonElement>("button");
+    let salesTab: HTMLButtonElement | null = null;
+    tabBtns.forEach((btn) => {
+      if (btn.textContent?.trim() === "销售") {
+        salesTab = btn;
+      }
+    });
+    if (salesTab) {
+      cursorClick(salesTab, "📊 销售 Tab", 600 * SPEED);
+    }
+  }, 1600 * SPEED);
+
+  // 4) 高亮 LTV 预测区域（等 Tab 切换渲染完成）
+  timers.set(() => {
+    // 销售 Tab 渲染后，找 LTV 预测卡片（包含"预测"或"LTV"文字的区域）
+    const ltvCard = detailRoot.querySelector<HTMLElement>("h3")?.closest<HTMLElement>(".rounded-xl");
+    if (ltvCard) {
+      ltvCard.scrollIntoView({ behavior: "smooth", block: "center" });
+      const cursor = (window as unknown as { virtualCursor?: { moveTo: (el: HTMLElement, opts?: { duration?: number; label?: string }) => void } }).virtualCursor;
+      if (cursor) cursor.moveTo(ltvCard, { duration: 700 * SPEED, label: "💰 LTV 预测" });
+      ltvCard.style.transition = "outline .3s, outline-offset .3s";
+      ltvCard.style.outline = "2px solid #10b981";
+      ltvCard.style.outlineOffset = "4px";
+      setTimeout(() => {
+        ltvCard.style.outline = "";
+        ltvCard.style.outlineOffset = "";
+      }, 1200 * SPEED);
+    }
+  }, 2600 * SPEED);
+
   return { ok: true };
 }
 
-/** Step 5（AI 助手）：选第一个客户 + 输入示例文本 + 点分析意图
+/** Step 7（AI 助手）：选第一个客户 + 输入示例文本 + 点分析意图
+ *  修复：
+ *  1. cursorClick 点击搜索框后，真实 click 在 duration 后触发，下拉可能还没展开
+ *     改为轮询等待 data-customer-option 出现再点击
+ *  2. 模拟打字后需要等打字完成再点分析意图
  *  锚点全用 data-tour / data-customer-option */
 function demoAiAssistant(timers: ReturnType<typeof makeTimerGroup>): DemoResult {
   const analyzeArea = document.querySelector<HTMLElement>('[data-tour="ai-analyze"]');
   if (!analyzeArea) return { ok: false, fallbackMsg: "AI 助手页未加载" };
+
   // 1) 点搜索框展开下拉
   timers.set(() => {
     const searchInput = document.querySelector<HTMLInputElement>(
@@ -471,18 +548,26 @@ function demoAiAssistant(timers: ReturnType<typeof makeTimerGroup>): DemoResult 
     }
   }, 200 * SPEED);
 
-  // 2) 等下拉展开后，点第一个客户
-  timers.set(() => {
+  // 2) 轮询等待下拉展开后，点第一个客户（之前写死 1100*SPEED，下拉可能还没出现）
+  let customerWaited = 0;
+  const customerMaxWait = 3000 * SPEED;
+  timers.set(function pollCustomer() {
     const opt = document.querySelector<HTMLElement>("[data-customer-option]");
     if (opt) {
       opt.style.transition = "background .3s";
       opt.style.background = "#dbeafe";
       cursorClick(opt, "👤 选这个", 700 * SPEED);
       setTimeout(() => (opt.style.background = ""), 600 * SPEED);
+      return;
+    }
+    customerWaited += 150 * SPEED;
+    if (customerWaited < customerMaxWait) {
+      timers.set(pollCustomer, 150 * SPEED);
     }
   }, 1100 * SPEED);
 
   // 3) 在输入框填入示例客户话（用 data-tour="ai-input" 锚点）
+  //    延迟加大，确保客户已选中
   timers.set(() => {
     const textarea =
       document.querySelector<HTMLTextAreaElement>('[data-tour="ai-input"]') ||
@@ -501,9 +586,10 @@ function demoAiAssistant(timers: ReturnType<typeof makeTimerGroup>): DemoResult 
         if (i >= phrase.length) window.clearInterval(typer);
       }, 35 * SPEED);
     }
-  }, 1900 * SPEED);
+  }, 2400 * SPEED);
 
   // 4) 点分析意图（用 data-tour 锚点，不再 selector 二义）
+  //    延迟加大，确保打字完成
   timers.set(() => {
     const btn = document.querySelector<HTMLElement>('[data-tour="ai-analyze"]');
     if (btn) {
@@ -516,7 +602,7 @@ function demoAiAssistant(timers: ReturnType<typeof makeTimerGroup>): DemoResult 
         btn.style.boxShadow = "";
       }, 600 * SPEED);
     }
-  }, 3000 * SPEED);
+  }, 3800 * SPEED);
   return { ok: true };
 }
 
@@ -649,7 +735,7 @@ export default function OnboardingTutorial() {
       popover: {
         title: "客户详情",
         description:
-          "刚才自动滚动至「<b>AI 画像</b>」区域。\n\n该区域聚合客户的需求、预算、决策角色及全部跟进记录。\n\n沟通前可快速了解客户全貌。",
+          "刚才的操作：\n1. 滚动至「<b>AI 画像</b>」区域查看客户全貌\n2. 切换到「<b>销售</b>」Tab 查看 LTV 预测\n\nAI 画像聚合客户的需求、预算、决策角色及全部跟进记录。\n销售 Tab 展示 LTV 预测、智能报价和自动销售流程。\n\n沟通前可快速了解客户全貌。",
         side: "right",
         align: "start",
       },
@@ -714,154 +800,6 @@ export default function OnboardingTutorial() {
     },
   ];
 
-  /** 构造一个新的 driver.js 实例（每次教程启动都重新创建，保证状态干净） */
-  const buildDriver = (): DriverInstance =>
-    driver({
-      animate: true,
-      overlayOpacity: 0.55,
-      stagePadding: 6,
-      stageRadius: 10,
-      allowClose: true,
-      overlayClickBehavior: () => {},
-      showProgress: true,
-      progressText: "第 {{current}} 步 / 共 {{total}} 步",
-      nextBtnText: "下一步 →",
-      prevBtnText: "← 上一步",
-      doneBtnText: "完成",
-      overlayColor: "rgba(15, 23, 42, 0.55)",
-      popoverClass: "kellai-tour-popover",
-      onDestroyed: () => {
-        if (timersRef.current) timersRef.current.clear();
-      },
-      onCloseClick: () => {
-        if (timersRef.current) timersRef.current.clear();
-        try {
-          window.virtualCursor?.hide();
-        } catch {
-          // ignore
-        }
-        try {
-          document.body.classList.remove("tutorial-active");
-        } catch {
-          // ignore
-        }
-        try {
-          driverRef.current?.destroy();
-        } catch {
-          // ignore
-        }
-        markSkipped();
-      },
-      /* 每次 popover 渲染时，注入 ⏸/⏭ 控制按钮 + 收尾 CTA */
-      onPopoverRender: (popover) => {
-        const popoverEl = popover.wrapper as HTMLElement | undefined;
-        if (!popoverEl) return;
-        // 等一帧让 driver.js 完成 popover 插入
-        window.setTimeout(() => {
-          const idx = currentStepRef.current;
-          // 修复：之前写死 idx === 7（只有 8 步时才对），现在 SCHEDULE 长度 10，
-          // 收尾是 idx === SCHEDULE.length - 1。
-          // 构造时把总步数挂到 driver 实例上，保证 onPopoverRender 拿得到。
-          const totalSteps = (driverRef.current as unknown as { __totalSteps?: number } | null)?.__totalSteps ?? 10;
-          const isLast = idx === totalSteps - 1;
-          // 1) 清理旧的（避免重复注入）
-          const old = popoverEl.querySelector(".kellai-tour-ctl");
-          if (old) old.remove();
-          const oldCta = popoverEl.querySelector(".kellai-tour-cta");
-          if (oldCta) oldCta.remove();
-
-          // 2) 注入 ⏸/⏭（每步都有）
-          if (!isLast) {
-            const ctl = document.createElement("div");
-            ctl.className = "kellai-tour-ctl";
-            ctl.style.cssText = `
-              display:flex; justify-content:space-between; align-items:center;
-              margin-top:12px; padding-top:10px; border-top:1px dashed #e2e8f0;
-            `;
-            const pauseBtn = document.createElement("button");
-            pauseBtn.className = "kellai-tour-btn-pause";
-            pauseBtn.type = "button";
-            pauseBtn.setAttribute("aria-label", "暂停 / 继续");
-            const updatePauseUI = () => {
-              const ctrl = (driverRef as unknown as { __controls?: { isPaused: () => boolean; resume: () => void; pause: () => void } }).__controls;
-              if (!ctrl) return;
-              if (ctrl.isPaused()) {
-                pauseBtn.textContent = "继续";
-                pauseBtn.style.color = "#10b981";
-              } else {
-                pauseBtn.textContent = "暂停";
-                pauseBtn.style.color = "#64748b";
-              }
-            };
-            pauseBtn.style.cssText = `
-              background:transparent; border:none; cursor:pointer;
-              font-size:12px; padding:4px 8px; border-radius:4px;
-              transition:background .15s;
-            `;
-            pauseBtn.onmouseover = () => (pauseBtn.style.background = "#f1f5f9");
-            pauseBtn.onmouseout = () => (pauseBtn.style.background = "transparent");
-            pauseBtn.onclick = () => {
-              const ctrl = (driverRef as unknown as { __controls?: { isPaused: () => boolean; resume: () => void; pause: () => void } }).__controls;
-              if (!ctrl) return;
-              if (ctrl.isPaused()) ctrl.resume();
-              else ctrl.pause();
-              updatePauseUI();
-            };
-
-            const skipBtn = document.createElement("button");
-            skipBtn.type = "button";
-            skipBtn.setAttribute("aria-label", "跳过当前步");
-            skipBtn.textContent = "跳过";
-            skipBtn.style.cssText = `
-              background:transparent; border:none; cursor:pointer;
-              font-size:12px; padding:4px 8px; border-radius:4px;
-              color:#64748b; transition:background .15s;
-            `;
-            skipBtn.onmouseover = () => (skipBtn.style.background = "#f1f5f9");
-            skipBtn.onmouseout = () => (skipBtn.style.background = "transparent");
-            skipBtn.onclick = () => {
-              const ctrl = (driverRef as unknown as { __controls?: { skip: () => void } }).__controls;
-              if (ctrl) ctrl.skip();
-            };
-
-            ctl.appendChild(pauseBtn);
-            ctl.appendChild(skipBtn);
-            popoverEl.appendChild(ctl);
-            updatePauseUI();
-          }
-
-          // 3) 收尾步注入 CTA 大按钮
-          if (isLast) {
-            const cta = document.createElement("button");
-            cta.className = "kellai-tour-cta";
-            cta.type = "button";
-            cta.textContent = "开始使用";
-            cta.style.cssText = `
-              display:block; width:100%; margin-top:12px; padding:10px 16px;
-              background:linear-gradient(135deg, #3b82f6 0%, #6366f1 100%);
-              color:white; border:none; border-radius:8px; font-size:14px;
-              font-weight:600; cursor:pointer; box-shadow:0 4px 12px rgba(59,130,246,.35);
-              transition:transform .15s, box-shadow .15s;
-            `;
-            cta.onmouseover = () => {
-              cta.style.transform = "translateY(-1px)";
-              cta.style.boxShadow = "0 6px 18px rgba(59,130,246,.5)";
-            };
-            cta.onmouseout = () => {
-              cta.style.transform = "";
-              cta.style.boxShadow = "0 4px 12px rgba(59,130,246,.35)";
-            };
-            cta.onclick = () => {
-              const ctrl = (driverRef as unknown as { __controls?: { cta: () => void } }).__controls;
-              if (ctrl) ctrl.cta();
-            };
-            popoverEl.appendChild(cta);
-          }
-        }, 30);
-      },
-      steps: TOUR_STEPS,
-    });
-
   /* ---------- 响应 store.active 启动 / 停止 ----------
    * 链式调度：每一步顺序：navigate → poll for element → run demo → drive → 等 duration → 进下一步
    * 完全不依赖 driver.js 的 onNextClick（按钮已隐藏） */
@@ -881,13 +819,7 @@ export default function OnboardingTutorial() {
       // 启动：body 加 tutorial-active class 屏蔽全站指针（仅 popover / overlay 可点）
       try { document.body.classList.add("tutorial-active"); } catch { /* ignore */ }
 
-      // 2) 构造新实例
-      const obj = buildDriver();
-      driverRef.current = obj;
-      // 把总步数挂到 driver 实例上，给 onPopoverRender 用
-      (obj as unknown as { __totalSteps: number }).__totalSteps = 12;
-
-      // 3) 链式调度表（v2 压缩到 ~30 秒，SPEED=2 时约 60 秒）
+      // 2) 链式调度表（v2 压缩到 ~30 秒，SPEED=2 时约 60 秒）
       type StepSchedule = {
         path: string; // 导航目标（先 navigate 再等元素）
         waitFor: string; // 等这个 selector 出现再跑 demo
@@ -927,34 +859,38 @@ export default function OnboardingTutorial() {
           duration: 4500 * SPEED,
         },
         // Step 4: 漏斗（拖卡片改阶段）
+        // 修复：waitFor 改为等客户卡片出现，而非只等看板容器（卡片是异步加载的）
         {
           path: "/funnel",
-          waitFor: '[data-tour="funnel-board"]',
+          waitFor: '[data-customer-id]',
           demo: (t) => demoFunnelDrag(t),
           duration: 3500 * SPEED,
         },
-        // Step 5: 消息（AI 话术）— AI 填入可能耗时较长，给够 7.5s 看完整流程
+        // Step 5: 消息（AI 话术）— AI 填入可能耗时较长，给够 9s 看完整流程
+        // 修复：waitFor 改为等联系人出现，而非只等列表容器（联系人是异步加载的）
         {
           path: "/messages",
-          waitFor: '[data-tour="messages-contact-list"]',
+          waitFor: '[data-tour="messages-contact-list"] [data-contact-id]',
           demo: (t) => demoMessages(t),
-          duration: 7500 * SPEED,
+          duration: 9000 * SPEED,
         },
-        // Step 6: 客户详情（360° 画像）
+        // Step 6: 客户详情（360° 画像 + 销售 Tab + LTV 预测）
         // 路径用 Step 5 抓到的真实 contact id，不写死 1（之前写死 /customers/1
         //  经常撞到不存在的客户，详情页 fallback 走"客户不存在"空态）
+        // 修复：fallback 改为 /customers/1001（mock 数据第一个客户），而非 /customers（无 id 时
+        //  详情页不会渲染 data-tour="customer-detail"，导致 waitFor 超时）
         {
           path: "__USE_FIRST_CONTACT__",
           waitFor: '[data-tour="customer-detail"]',
           demo: (t) => demoCustomerDetail(t),
-          duration: 2500 * SPEED,
+          duration: 4500 * SPEED,
         },
-        // Step 7: AI 助手（分析意图）— 看到分析结果再走
+        // Step 7: AI 助手（分析意图）— 轮询等客户选项 + 打字 + 分析，给够 8s
         {
           path: "/ai",
           waitFor: '[data-tour="ai-analyze"]',
           demo: (t) => demoAiAssistant(t),
-          duration: 6000 * SPEED,
+          duration: 8000 * SPEED,
         },
         // Step 8: 自动销售流程 (v3)
         {
@@ -1011,10 +947,12 @@ export default function OnboardingTutorial() {
         // a) resolve 实际路径
         //    "__USE_FIRST_CONTACT__" 是 Step 6 的占位，会用 Step 5 在 window 上挂的
         //    __tutorialFirstContact 替换成真实客户 id。
+        //    修复：fallback 改为 /customers/1001（mock 数据第一个客户），
+        //    而非 /customers（无 id 时详情页不渲染 data-tour="customer-detail"）
         let realPath = step.path;
         if (step.path === "__USE_FIRST_CONTACT__") {
           const cid = (window as unknown as { __tutorialFirstContact?: string | null }).__tutorialFirstContact;
-          realPath = cid ? `/customers/${cid}` : "/customers";
+          realPath = cid ? `/customers/${cid}` : "/customers/1001";
         }
 
         // b) navigate
@@ -1241,10 +1179,10 @@ export default function OnboardingTutorial() {
           skipRequestedRef.current = true;
         },
         cta: () => {
-          // 收尾 CTA：完成 + 跳漏斗
+          // 收尾 CTA：完成 + 销毁当前 driver + 跳漏斗
           markCompleted();
           try {
-            obj.destroy();
+            driverRef.current?.destroy();
           } catch {
             // ignore
           }

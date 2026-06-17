@@ -22,7 +22,7 @@ const STAGE_ORDER: { id: string; label: string }[] = [
   { id: 'delivered', label: '已交付' },
 ];
 
-interface MockCustomer {
+export interface MockCustomer {
   customer_id: number;
   username: string;
   display_name: string;
@@ -38,6 +38,13 @@ interface MockCustomer {
   email: string;
   company: string;
   phone: string;
+  // 客户管理扩展字段（手动维护）
+  name?: string;
+  owner?: string;
+  note?: string;
+  source?: string;
+  tags?: string[];
+  created_at?: string;
 }
 
 export const MOCK_CUSTOMERS: MockCustomer[] = [
@@ -339,4 +346,110 @@ export function getMockReminders() {
           ? '高意向客户，建议本周内主动联系推进'
           : '保持 3 天一次的节奏，简短问候',
     }));
+}
+
+/* ============================================================
+ *  客户管理：可变存储 + CRUD（让 mock 模式下增删改持久于会话）
+ * ============================================================ */
+
+/** 阶段 ID → 中文标签 */
+export function stageLabelOf(stageId: string): string {
+  return STAGE_ORDER.find((s) => s.id === stageId)?.label ?? stageId;
+}
+
+/** 阶段定义（供客户管理页下拉使用） */
+export function mockStageDefinitions() {
+  return STAGE_ORDER.map((s) => ({ id: s.id, label: s.label }));
+}
+
+/** 下一个可用的客户 ID（手动创建从 90001 起） */
+export function nextMockCustomerId(): number {
+  const max = MOCK_CUSTOMERS.reduce((m, c) => Math.max(m, c.customer_id), 90000);
+  return max + 1;
+}
+
+interface MockProfileInput {
+  name?: string;
+  company?: string;
+  email?: string;
+  phone?: string;
+  note?: string;
+  owner?: string;
+  source?: string;
+  stage?: string;
+  tags?: string[];
+  channel_sources?: string[];
+}
+
+/** 新建 mock 客户，返回新记录 */
+export function addMockCustomer(profile: MockProfileInput): MockCustomer {
+  const id = nextMockCustomerId();
+  const stage = profile.stage || 'no_contact';
+  const now = new Date().toISOString();
+  const record: MockCustomer = {
+    customer_id: id,
+    username: (profile.name || profile.company || `cust_${id}`).trim(),
+    display_name: (profile.company || profile.name || `客户 ${id}`).trim(),
+    stage,
+    stage_label: stageLabelOf(stage),
+    intake_sent: false,
+    last_message_preview: '',
+    channel_sources: profile.channel_sources ?? [],
+    ai_score: 0,
+    ai_tags: [],
+    updated_at: now,
+    contact_id: '',
+    email: profile.email ?? '',
+    company: profile.company ?? '',
+    phone: profile.phone ?? '',
+    name: profile.name ?? '',
+    owner: profile.owner ?? '',
+    note: profile.note ?? '',
+    source: profile.source ?? '',
+    tags: profile.tags ?? [],
+    created_at: now,
+  };
+  MOCK_CUSTOMERS.unshift(record);
+  return record;
+}
+
+/** 更新 mock 客户资料，返回更新后的记录（不存在则返回 null） */
+export function updateMockCustomer(id: number, profile: MockProfileInput): MockCustomer | null {
+  const c = MOCK_CUSTOMERS.find((x) => x.customer_id === id);
+  if (!c) return null;
+  if (profile.name !== undefined) c.name = profile.name;
+  if (profile.company !== undefined) c.company = profile.company;
+  if (profile.email !== undefined) c.email = profile.email;
+  if (profile.phone !== undefined) c.phone = profile.phone;
+  if (profile.note !== undefined) c.note = profile.note;
+  if (profile.owner !== undefined) c.owner = profile.owner;
+  if (profile.source !== undefined) c.source = profile.source;
+  if (profile.tags !== undefined) c.tags = profile.tags;
+  if (profile.channel_sources !== undefined) c.channel_sources = profile.channel_sources;
+  if (profile.stage && profile.stage !== c.stage) {
+    c.stage = profile.stage;
+    c.stage_label = stageLabelOf(profile.stage);
+  }
+  // display_name 跟随资料刷新
+  c.display_name = (c.company || c.name || c.display_name).trim();
+  c.updated_at = new Date().toISOString();
+  return c;
+}
+
+/** 删除 mock 客户，返回是否删除成功 */
+export function deleteMockCustomer(id: number): boolean {
+  const idx = MOCK_CUSTOMERS.findIndex((x) => x.customer_id === id);
+  if (idx === -1) return false;
+  MOCK_CUSTOMERS.splice(idx, 1);
+  return true;
+}
+
+/** 设置 mock 客户阶段（漏斗拖拽与客户管理共用，保持一致） */
+export function setMockCustomerStage(id: number, stage: string): MockCustomer | null {
+  const c = MOCK_CUSTOMERS.find((x) => x.customer_id === id);
+  if (!c) return null;
+  c.stage = stage;
+  c.stage_label = stageLabelOf(stage);
+  c.updated_at = new Date().toISOString();
+  return c;
 }

@@ -59,7 +59,7 @@ export default function ContentStudio() {
   ];
 
   return (
-    <div className="flex h-full flex-col space-y-4">
+    <div className="flex h-full flex-col gap-4 min-h-0">
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold text-gray-900 dark:text-slate-100">内容创作工作台</h1>
@@ -75,7 +75,7 @@ export default function ContentStudio() {
         </button>
       </div>
 
-      <div className="flex flex-1 gap-4 overflow-hidden">
+      <div className="flex flex-1 gap-4 overflow-hidden min-h-0">
         <div className="w-48 shrink-0 space-y-1">
           {tabs.map((t) => (
             <button

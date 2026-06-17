@@ -452,7 +452,7 @@ export default function Funnel() {
       </div>
 
       {/* 看板区域：水平滚动（新手教程锚点） */}
-      <div data-tour="funnel-board" className="flex-1 overflow-x-auto overflow-y-hidden">
+      <div data-tour="funnel-board" className="flex-1 overflow-x-auto overflow-y-hidden min-h-0">
         <div className="flex gap-3 pb-4" style={{ minWidth: STAGE_ORDER.length * 296 }}>
           {loading
             ? STAGE_ORDER.map((s) => <SkeletonColumn key={s.id} />)
@@ -483,7 +483,7 @@ export default function Funnel() {
                     </div>
 
                     {/* 客户卡片列表，可滚动 */}
-                    <div className="max-h-[calc(100vh-220px)] space-y-2 overflow-y-auto pr-1">
+                    <div className="space-y-2 overflow-y-auto pr-1">
                       {clients.map((client) => (
                         <DraggableClientCard key={client.customer_id} client={client} />
                       ))}

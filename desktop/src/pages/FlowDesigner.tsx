@@ -86,7 +86,7 @@ export default function FlowDesigner() {
   }
 
   return (
-    <div className="flex h-full flex-col space-y-4">
+    <div className="flex h-full flex-col gap-4 flex-1 min-h-0">
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold text-gray-900 dark:text-slate-100">流程设计器</h1>
@@ -111,7 +111,7 @@ export default function FlowDesigner() {
           </button>
         </div>
       </div>
-      <div className="flex-1 rounded-xl border border-gray-200 dark:border-slate-700" style={{ minHeight: 400 }}>
+      <div className="flex-1 rounded-xl border border-gray-200 dark:border-slate-700 min-h-0" style={{ minHeight: 400 }}>
         <ReactFlow
           nodes={nodes}
           edges={edges}

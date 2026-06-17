@@ -2,28 +2,6 @@ import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { useEffect, useState, lazy, Suspense } from "react";
 import Layout from "./components/Layout";
 import Login from "./pages/Login";
-import Dashboard from "./pages/Dashboard";
-import Funnel from "./pages/Funnel";
-import Messages from "./pages/Messages";
-import CustomerDetail from "./pages/CustomerDetail";
-import AIAssistant from "./pages/AIAssistant";
-import Settings from "./pages/Settings";
-import SalesFlow from "./pages/SalesFlow";
-import Performance from "./pages/Performance";
-import ContentStudio from "./pages/ContentStudio";
-import ContentAnalytics from "./pages/ContentAnalytics";
-import ScoutHunter from "./pages/ScoutHunter";
-import SentimentMonitor from "./pages/SentimentMonitor";
-import FlowMonitor from "./pages/FlowMonitor";
-import TemplateMarket from "./pages/TemplateMarket";
-import FinanceDashboard from "./pages/FinanceDashboard";
-import FinanceAI from "./pages/FinanceAI";
-import PerformanceBoard from "./pages/PerformanceBoard";
-import OpenPlatform from "./pages/OpenPlatform";
-import PluginMarket from "./pages/PluginMarket";
-import DeveloperPortal from "./pages/DeveloperPortal";
-import AppBuilder from "./pages/AppBuilder";
-import APIDocs from "./pages/APIDocs";
 import ErrorBoundary from "./components/ErrorBoundary";
 import Loading from "./components/Loading";
 import { useAuthStore } from "./stores/auth";
@@ -33,9 +11,34 @@ import { useOnboardingStore } from "./stores/onboarding";
 import { useSalesStore } from "./stores/salesStore";
 import { useFinanceStore } from "./stores/financeStore";
 import { useOpenPlatformStore } from "./stores/openPlatformStore";
-import { Loader2, Users } from "lucide-react";
+import { Loader2 } from "lucide-react";
 
+/* 路由级代码分割：除登录页外的页面按需懒加载，显著减小首屏 bundle。
+   每个 Page 包裹了 Suspense 兜底（见下方 Page 组件）。 */
+const Dashboard = lazy(() => import("./pages/Dashboard"));
+const Funnel = lazy(() => import("./pages/Funnel"));
+const Messages = lazy(() => import("./pages/Messages"));
+const CustomerDetail = lazy(() => import("./pages/CustomerDetail"));
+const Customers = lazy(() => import("./pages/Customers"));
+const AIAssistant = lazy(() => import("./pages/AIAssistant"));
+const Settings = lazy(() => import("./pages/Settings"));
+const SalesFlow = lazy(() => import("./pages/SalesFlow"));
+const Performance = lazy(() => import("./pages/Performance"));
+const ContentStudio = lazy(() => import("./pages/ContentStudio"));
+const ContentAnalytics = lazy(() => import("./pages/ContentAnalytics"));
+const ScoutHunter = lazy(() => import("./pages/ScoutHunter"));
+const SentimentMonitor = lazy(() => import("./pages/SentimentMonitor"));
 const FlowDesigner = lazy(() => import("./pages/FlowDesigner"));
+const FlowMonitor = lazy(() => import("./pages/FlowMonitor"));
+const TemplateMarket = lazy(() => import("./pages/TemplateMarket"));
+const FinanceDashboard = lazy(() => import("./pages/FinanceDashboard"));
+const FinanceAI = lazy(() => import("./pages/FinanceAI"));
+const PerformanceBoard = lazy(() => import("./pages/PerformanceBoard"));
+const OpenPlatform = lazy(() => import("./pages/OpenPlatform"));
+const PluginMarket = lazy(() => import("./pages/PluginMarket"));
+const DeveloperPortal = lazy(() => import("./pages/DeveloperPortal"));
+const AppBuilder = lazy(() => import("./pages/AppBuilder"));
+const APIDocs = lazy(() => import("./pages/APIDocs"));
 
 function AuthGuard({ children }: { children: React.ReactNode }) {
   const { isAuthenticated, loadFromStorage, user } = useAuthStore();
@@ -86,7 +89,7 @@ function AuthBootstrap({ children }: { children: React.ReactNode }) {
     return () => { cancelled = true; };
   }, [loadFromStorage, attemptSilentAutoLogin]);
 
-  if (phase === "trying" && !isAuthenticated) {
+  if (phase !== "done" && !isAuthenticated) {
     return (
       <div className="flex h-screen items-center justify-center bg-gray-50">
         <div className="flex flex-col items-center gap-3 text-gray-500">
@@ -119,28 +122,6 @@ function MessagePollingBridge() {
   return null;
 }
 
-function PlaceholderPage({
-  title,
-  icon: Icon,
-  description,
-}: {
-  title: string;
-  icon: React.ComponentType<{ className?: string }>;
-  description: string;
-}) {
-  return (
-    <div className="flex h-full items-center justify-center">
-      <div className="text-center">
-        <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-gray-100 dark:bg-slate-800">
-          <Icon className="h-8 w-8 text-gray-400 dark:text-slate-500" />
-        </div>
-        <h2 className="text-xl font-semibold text-gray-700 dark:text-slate-200">{title}</h2>
-        <p className="mt-2 text-sm text-gray-400 dark:text-slate-500">{description}</p>
-      </div>
-    </div>
-  );
-}
-
 function ThemeBootstrap({ children }: { children: React.ReactNode }) {
   const loadFromStorage = useThemeStore((s) => s.loadFromStorage);
   const initSystemListener = useThemeStore((s) => s.initSystemListener);
@@ -155,7 +136,13 @@ function ThemeBootstrap({ children }: { children: React.ReactNode }) {
 }
 
 function Page({ children }: { children: React.ReactNode }) {
-  return <ErrorBoundary>{children}</ErrorBoundary>;
+  return (
+    <ErrorBoundary>
+      <Suspense fallback={<Loading className="min-h-[60vh]" text="页面加载中..." />}>
+        {children}
+      </Suspense>
+    </ErrorBoundary>
+  );
 }
 
 export default function App() {
@@ -178,7 +165,7 @@ export default function App() {
               <Route path="funnel" element={<Page><Funnel /></Page>} />
               <Route path="messages" element={<Page><Messages /></Page>} />
               <Route path="customers/:id" element={<Page><CustomerDetail /></Page>} />
-              <Route path="customers" element={<Page><PlaceholderPage title="客户管理" icon={Users} description="客户信息管理、标签分组、跟进记录，功能开发中..." /></Page>} />
+              <Route path="customers" element={<Page><Customers /></Page>} />
               <Route path="ai" element={<Page><AIAssistant /></Page>} />
               <Route path="settings" element={<Page><Settings /></Page>} />
               {/* v3 Sales */}
@@ -191,7 +178,7 @@ export default function App() {
               <Route path="scout/hunter" element={<Page><ScoutHunter /></Page>} />
               <Route path="scout/sentiment" element={<Page><SentimentMonitor /></Page>} />
               {/* v6 Flow */}
-              <Route path="flow/designer" element={<Page><Suspense fallback={<Loading />}><FlowDesigner /></Suspense></Page>} />
+              <Route path="flow/designer" element={<Page><FlowDesigner /></Page>} />
               <Route path="flow/monitor" element={<Page><FlowMonitor /></Page>} />
               <Route path="flow/templates" element={<Page><TemplateMarket /></Page>} />
               {/* v7 Finance */}

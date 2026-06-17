@@ -7,6 +7,7 @@ from app.channels.miniapp import MiniAppAdapter
 from app.channels.phone import PhoneAdapter
 from app.channels.registry import ChannelRegistry
 from app.channels.wecom import WeComAdapter
+from app.channels.wechat import WeChatAdapter
 # 电商平台
 from app.channels.pdd import PddAdapter
 from app.channels.taobao import TaobaoAdapter
@@ -22,6 +23,7 @@ __all__ = [
     "ChannelRegistry",
     "UnifiedMessage",
     "WeComAdapter",
+    "WeChatAdapter",
     "PhoneAdapter",
     "DouyinAdapter",
     "MiniAppAdapter",
@@ -40,6 +42,7 @@ def _auto_register() -> None:
     reg = ChannelRegistry()
     # 即时通讯
     reg.register("wework", WeComAdapter)
+    reg.register("wechat", WeChatAdapter)
     reg.register("phone", PhoneAdapter)
     reg.register("douyin", DouyinAdapter)
     reg.register("miniprogram", MiniAppAdapter)

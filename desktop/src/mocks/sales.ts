@@ -2,10 +2,12 @@ import { MOCK_CUSTOMERS } from './customers';
 import type {
   SalesFlow,
   SalesFlowStep,
+  SalesFlowTimelineEntry,
   Quote,
   Contract,
   LTVForecast,
   SalesPerformance,
+  SalesRep,
   AttributionReport,
   FunnelTrace,
   SalesScriptHint,
@@ -19,6 +21,39 @@ const STEP_LABELS: Record<SalesFlowStep, string> = {
   signing: '签约',
 };
 
+/** 每个阶段的 AI 洞察、赢单概率、下一步行动与待办清单（驱动 SalesFlow 富交互） */
+const STEP_META: Record<
+  SalesFlowStep,
+  { probability: number; ai_insight: string; next_action: string; checklist: string[] }
+> = {
+  requirement: {
+    probability: 25,
+    ai_insight: 'AI 已从历史会话中识别预算区间与决策链，客户处于需求澄清期，核心关注「获客效率」与「实施周期」。',
+    next_action: '与对接人确认预算与决策流程，预约一次需求调研会',
+    checklist: ['确认预算区间', '梳理决策链 / 关键决策人', '明确期望上线时间', '记录 3 个核心痛点'],
+  },
+  proposal: {
+    probability: 52,
+    ai_insight: '基于客户画像，推荐「标准版 + AI 助手」组合，同行业客户平均 6 个月内回本，建议突出 ROI 与标杆案例。',
+    next_action: '发送定制方案与报价，预约方案讲解会并邀请决策人参加',
+    checklist: ['输出定制方案 PPT', '附同行业标杆案例', '生成智能报价', '邀请决策人参会'],
+  },
+  promotion: {
+    probability: 74,
+    ai_insight: '客户已多次查看报价，AI 判断处于决策窗口期，建议用限时优惠 + 名额稀缺制造紧迫感推动签约。',
+    next_action: '推送限时优惠并锁定签约时间，处理最后的价格与条款异议',
+    checklist: ['确认最终折扣审批', '推送限时优惠', '解决付款方式异议', '锁定签约时间窗'],
+  },
+  signing: {
+    probability: 90,
+    ai_insight: '进入签约阶段，合同条款已对齐，建议引导客户走电子签约缩短回款周期，并提前规划交付与培训。',
+    next_action: '生成电子合同并引导线上签署，安排实施交付负责人对接',
+    checklist: ['生成电子合同', '法务条款确认', '客户完成电子签', '排期实施与培训'],
+  },
+};
+
+const OWNERS = ['张敏', '李航', '王磊', '陈悦', '刘洋'];
+
 const flowStateMap = new Map<number, SalesFlow>();
 const quoteStore = new Map<number, Quote>();
 const contractStore = new Map<number, Contract>();
@@ -29,21 +64,58 @@ function industryFactor(company: string): number {
   return 1.0;
 }
 
+/** 依据客户 AI 评分估算商机金额 */
+function dealValueFor(customerId: number): number {
+  const customer = MOCK_CUSTOMERS.find((c) => c.customer_id === customerId);
+  const score = customer?.ai_score ?? 0.5;
+  return Math.round((60000 + score * 240000) / 1000) * 1000;
+}
+
+function probabilityFor(step: SalesFlowStep, status: SalesFlow['status']): number {
+  if (status === 'completed') return 100;
+  if (status === 'failed') return 0;
+  return STEP_META[step].probability;
+}
+
+function nowIso(offsetDays = 0): string {
+  return new Date(Date.now() + offsetDays * 86400000).toISOString();
+}
+
 export function getOrCreateFlow(customerId: number): SalesFlow {
   let flow = flowStateMap.get(customerId);
   if (flow) return flow;
   const customer = MOCK_CUSTOMERS.find((c) => c.customer_id === customerId);
+  const owner = OWNERS[customerId % OWNERS.length];
   flow = {
     id: `flow_${customerId}`,
     customer_id: customerId,
     customer_name: customer?.display_name ?? `客户${customerId}`,
     current_step: 'requirement',
     status: 'idle',
-    started_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
+    started_at: nowIso(-3),
+    updated_at: nowIso(),
     steps_completed: [],
+    deal_value: dealValueFor(customerId),
+    win_probability: STEP_META.requirement.probability,
+    expected_close_date: nowIso(21).slice(0, 10),
+    owner,
+    next_action: STEP_META.requirement.next_action,
+    ai_insight: STEP_META.requirement.ai_insight,
+    checklist: STEP_META.requirement.checklist,
+    timeline: [
+      { step: 'requirement', label: STEP_LABELS.requirement, at: nowIso(-3), note: '流程启动，进入需求确认阶段' },
+    ],
   };
   flowStateMap.set(customerId, flow);
+  return flow;
+}
+
+function syncStepMeta(flow: SalesFlow): SalesFlow {
+  const meta = STEP_META[flow.current_step];
+  flow.win_probability = probabilityFor(flow.current_step, flow.status);
+  flow.next_action = flow.status === 'completed' ? '已签约成交，转入交付与客户成功流程' : meta.next_action;
+  flow.ai_insight = meta.ai_insight;
+  flow.checklist = meta.checklist;
   return flow;
 }
 
@@ -51,23 +123,36 @@ export function startAutoFlow(customerId: number, step?: SalesFlowStep): SalesFl
   const flow = getOrCreateFlow(customerId);
   flow.status = 'running';
   if (step) flow.current_step = step;
-  flow.updated_at = new Date().toISOString();
+  flow.updated_at = nowIso();
+  syncStepMeta(flow);
   flowStateMap.set(customerId, flow);
   return flow;
 }
 
 export function advanceFlow(customerId: number): SalesFlow {
   const flow = getOrCreateFlow(customerId);
+  flow.status = 'running';
   const idx = FLOW_STEPS.indexOf(flow.current_step);
   if (!flow.steps_completed.includes(flow.current_step)) {
     flow.steps_completed.push(flow.current_step);
   }
+  const ts = nowIso();
   if (idx < FLOW_STEPS.length - 1) {
-    flow.current_step = FLOW_STEPS[idx + 1];
+    const next = FLOW_STEPS[idx + 1];
+    flow.current_step = next;
+    flow.timeline = [
+      ...(flow.timeline ?? []),
+      { step: next, label: STEP_LABELS[next], at: ts, note: `AI 推进至「${STEP_LABELS[next]}」阶段` },
+    ];
   } else {
     flow.status = 'completed';
+    flow.timeline = [
+      ...(flow.timeline ?? []),
+      { step: 'signing', label: '已成交', at: ts, note: '客户完成签约，商机赢单' } as SalesFlowTimelineEntry,
+    ];
   }
-  flow.updated_at = new Date().toISOString();
+  flow.updated_at = ts;
+  syncStepMeta(flow);
   flowStateMap.set(customerId, flow);
   return flow;
 }
@@ -104,7 +189,7 @@ export function generateContract(customerId: number, quoteId?: string): Contract
     quote_id: quoteId ?? quote.id,
     status: 'pending_sign',
     title: `客来来 CRM 服务合同 - ${MOCK_CUSTOMERS.find((c) => c.customer_id === customerId)?.company ?? ''}`,
-    content_preview: `本合同金额为 ¥${quote.total.toLocaleString()}，包含 CRM 标准版及 AI 模块，有效期 12 个月。`,
+    content_preview: `本合同金额为 ¥${quote.total.toLocaleString()}，包含 CRM 标准版及 AI 模块，服务有效期 12 个月，含实施与培训，自双方签署之日起生效。`,
     sign_url: `https://sign.kellai.com/mock/${customerId}`,
     created_at: new Date().toISOString(),
   };
@@ -131,20 +216,89 @@ export function getLTVForecast(customerId: number): LTVForecast {
   };
 }
 
+/** 不同周期的业绩系数：周/月/季/年 */
+const PERIOD_PROFILE: Record<string, { target: number; actual: number; deals: number; momentum: number; label: string }> = {
+  week: { target: 125000, actual: 96000, deals: 4, momentum: 8.1, label: '本周' },
+  month: { target: 500000, actual: 342000, deals: 12, momentum: 5.2, label: '本月' },
+  quarter: { target: 1500000, actual: 1124000, deals: 38, momentum: 11.6, label: '本季度' },
+  year: { target: 6000000, actual: 4380000, deals: 152, momentum: 18.4, label: '本年' },
+};
+
+function buildReps(scale: number): SalesRep[] {
+  const raw = [
+    { name: '张敏', revenue: 0.31, deals: 0.28, win_rate: 42 },
+    { name: '李航', revenue: 0.26, deals: 0.24, win_rate: 38 },
+    { name: '王磊', revenue: 0.2, deals: 0.22, win_rate: 35 },
+    { name: '陈悦', revenue: 0.14, deals: 0.16, win_rate: 31 },
+    { name: '刘洋', revenue: 0.09, deals: 0.1, win_rate: 27 },
+  ];
+  return raw
+    .map((r, i) => ({
+      id: i + 1,
+      name: r.name,
+      revenue: Math.round((scale * r.revenue) / 1000) * 1000,
+      target: Math.round((scale * 0.24) / 1000) * 1000,
+      deals: Math.max(1, Math.round((PERIOD_PROFILE.month.deals * 3) * r.deals)),
+      win_rate: r.win_rate,
+      rank: i + 1,
+    }))
+    .sort((a, b) => b.revenue - a.revenue)
+    .map((r, i) => ({ ...r, rank: i + 1 }));
+}
+
+function buildTrend(period: string, target: number, actual: number) {
+  if (period === 'year') {
+    return ['Q1', 'Q2', 'Q3', 'Q4'].map((p, i) => ({
+      period: p,
+      target: Math.round(target / 4),
+      actual: i < 2 ? Math.round((actual / 1.6) * (i === 0 ? 0.7 : 0.9)) : 0,
+    }));
+  }
+  if (period === 'quarter') {
+    return ['第1月', '第2月', '第3月'].map((p, i) => ({
+      period: p,
+      target: Math.round(target / 3),
+      actual: i < 2 ? Math.round((actual / 1.8) * (i === 0 ? 0.85 : 1.05)) : 0,
+    }));
+  }
+  if (period === 'week') {
+    return ['周一', '周二', '周三', '周四', '周五'].map((p, i) => ({
+      period: p,
+      target: Math.round(target / 5),
+      actual: i < 4 ? Math.round((actual / 3.4) * [0.9, 1.1, 0.8, 1.0][i]) : 0,
+    }));
+  }
+  return ['第1周', '第2周', '第3周', '第4周'].map((p, i) => ({
+    period: p,
+    target: Math.round(target / 4),
+    actual: i < 3 ? Math.round((actual / 2.6) * [0.85, 1.05, 0.95][i]) : 0,
+  }));
+}
+
 export function getSalesPerformance(period = 'month'): SalesPerformance {
+  const prof = PERIOD_PROFILE[period] ?? PERIOD_PROFILE.month;
+  const completion = Math.round((prof.actual / prof.target) * 1000) / 10;
+  const avg = Math.round(prof.actual / prof.deals);
+  const weeklyTarget = period === 'month' ? 30 : period === 'quarter' ? 90 : period === 'year' ? 360 : 8;
   return {
     period,
-    revenue_target: 500000,
-    revenue_actual: 342000,
-    completion_rate: 68.4,
-    deals_closed: 12,
-    avg_deal_size: 28500,
+    revenue_target: prof.target,
+    revenue_actual: prof.actual,
+    completion_rate: completion,
+    deals_closed: prof.deals,
+    avg_deal_size: avg,
+    momentum_pct: prof.momentum,
+    win_rate: 38,
+    pipeline_value: Math.round(prof.target * 1.8),
+    forecast: Math.round(prof.actual * 1.32),
+    reps: buildReps(prof.actual),
+    revenue_trend: buildTrend(period, prof.target, prof.actual),
     goals: [
       {
         id: 'g1',
-        title: 'Q2 签约目标',
-        target: 30,
-        actual: 12,
+        title: `${prof.label}签约目标`,
+        target: weeklyTarget,
+        actual: prof.deals,
         unit: '单',
         breakdown: [
           { period: '第1周', target: 8, actual: 3, progress: 37.5 },

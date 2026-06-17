@@ -46,3 +46,11 @@ export const getUserInfo = () =>
 /** 更新当前用户信息 */
 export const updateUserInfo = (data: { display_name?: string; avatar_url?: string }) =>
   api.put('/api/kellai/auth/me', data);
+
+/** 发起企微 OAuth 授权（获取扫码 URL） */
+export const initiateWeworkOAuth = () =>
+  api.post('/api/kellai/channels/wework/oauth/initiate');
+
+/** 查询企微 OAuth 授权状态 */
+export const checkWeworkOAuthStatus = (state: string) =>
+  api.get('/api/kellai/channels/wework/oauth/status', { params: { state } });

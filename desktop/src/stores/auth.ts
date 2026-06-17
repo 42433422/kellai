@@ -318,7 +318,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     localStorage.setItem("auth_user", JSON.stringify(result.user));
     rememberEmail(
       result.user?.email || data.email,
-      result.user?.display_name || result.user?.name || data.name
+      result.user?.display_name || result.user?.name || data.display_name
     );
     set({
       token: result.access_token,

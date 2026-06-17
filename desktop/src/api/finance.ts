@@ -8,8 +8,8 @@ import type {
   DecisionAdvice,
 } from '../types';
 
-export const getFinanceDashboard = () =>
-  request<FinanceDashboardData>('get', '/api/kellai/finance/dashboard');
+export const getFinanceDashboard = (period = 'month') =>
+  request<FinanceDashboardData>('get', '/api/kellai/finance/dashboard', { period });
 
 export const askFinance = (question: string) =>
   request<{ answer: string }>('post', '/api/kellai/finance/ask', { question });
@@ -17,8 +17,8 @@ export const askFinance = (question: string) =>
 export const getBudgetSuggestion = () =>
   request<BudgetSuggestion>('get', '/api/kellai/finance/budget-suggest');
 
-export const getFinancePerformance = () =>
-  request<FinancePerformanceMember[]>('get', '/api/kellai/finance/performance');
+export const getFinancePerformance = (period = 'month') =>
+  request<FinancePerformanceMember[]>('get', '/api/kellai/finance/performance', { period });
 
 export const getFinanceAlerts = () =>
   request<FinanceAlert[]>('get', '/api/kellai/finance/alerts');

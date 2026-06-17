@@ -16,15 +16,21 @@ import {
   RefreshCw,
   Loader2,
   AlertCircle,
+  CalendarClock,
+  SlidersHorizontal,
+  CheckCircle2,
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import ChannelLogo from '../components/ChannelLogo';
+import FollowUpModal from '../components/customers/FollowUpModal';
+import { useCrmEnhanceStore, followUpUrgency } from '../stores/crmEnhance';
 import type {
   CustomerPipeline,
   CustomerMessage,
   CustomerAiProfile,
   IntakeForm,
   CrmBundle,
+  CustomerRecord,
 } from '../types';
 import {
   getCustomerPipeline,
@@ -183,6 +189,13 @@ export default function CustomerDetail() {
 
   // Toast
   const [toast, setToast] = useState({ message: '', visible: false });
+
+  // CRM 增强：自定义字段 + 跟进
+  const customFields = useCrmEnhanceStore((s) => s.customFields);
+  const customValues = useCrmEnhanceStore((s) => s.customValues[customerId]);
+  const followUp = useCrmEnhanceStore((s) => s.followUps[customerId]);
+  const toggleFollowUpDone = useCrmEnhanceStore((s) => s.toggleFollowUpDone);
+  const [followUpOpen, setFollowUpOpen] = useState(false);
 
   /** 显示 Toast */
   const showToast = useCallback((message: string) => {
@@ -445,9 +458,9 @@ export default function CustomerDetail() {
       </div>
 
       {/* 内容区域 */}
-      <div className="flex flex-1 gap-6 overflow-hidden p-6">
+      <div className="flex flex-1 gap-6 overflow-hidden min-h-0">
         {/* 左侧主内容 */}
-        <div className="flex flex-1 flex-col gap-4 overflow-y-auto">
+        <div className="flex flex-1 flex-col gap-4 overflow-y-auto min-h-0">
           {activeTab === 'overview' && (
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
               {/* AI 画像 */}
@@ -522,6 +535,72 @@ export default function CustomerDetail() {
                   </div>
                 ) : (
                   <p className="text-sm text-gray-400">暂无消息记录</p>
+                )}
+              </div>
+
+              {/* 自定义字段 */}
+              <div className="rounded-xl border border-gray-100 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+                <div className="mb-3 flex items-center gap-2">
+                  <SlidersHorizontal className="h-4 w-4 text-blue-500" />
+                  <h3 className="text-sm font-semibold text-gray-700 dark:text-slate-200">自定义字段</h3>
+                </div>
+                {customFields.length === 0 ? (
+                  <p className="text-sm text-gray-400">未配置自定义字段，可在客户列表页「字段」中添加</p>
+                ) : (
+                  <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm">
+                    {customFields.map((f) => (
+                      <div key={f.key}>
+                        <dt className="text-xs text-gray-400">{f.label}</dt>
+                        <dd className="text-gray-700 dark:text-slate-200">{customValues?.[f.key] || '—'}</dd>
+                      </div>
+                    ))}
+                  </dl>
+                )}
+              </div>
+
+              {/* 跟进计划 */}
+              <div className="rounded-xl border border-gray-100 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+                <div className="mb-3 flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <CalendarClock className="h-4 w-4 text-blue-500" />
+                    <h3 className="text-sm font-semibold text-gray-700 dark:text-slate-200">跟进计划</h3>
+                  </div>
+                  <button
+                    onClick={() => setFollowUpOpen(true)}
+                    className="rounded-lg border border-gray-200 px-2.5 py-1 text-xs text-gray-600 hover:bg-gray-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+                  >
+                    {followUp ? '修改' : '设置跟进'}
+                  </button>
+                </div>
+                {followUp ? (
+                  <div className="space-y-2 text-sm">
+                    <div className="flex items-center gap-2">
+                      <span
+                        className={clsx(
+                          'rounded-full px-2 py-0.5 text-xs font-medium',
+                          followUp.done
+                            ? 'bg-green-50 text-green-600 dark:bg-green-500/10 dark:text-green-400'
+                            : followUpUrgency(followUp) === 'overdue'
+                              ? 'bg-red-50 text-red-600 dark:bg-red-500/10 dark:text-red-400'
+                              : followUpUrgency(followUp) === 'today'
+                                ? 'bg-amber-50 text-amber-600 dark:bg-amber-500/10 dark:text-amber-400'
+                                : 'bg-blue-50 text-blue-600 dark:bg-blue-500/10 dark:text-blue-400',
+                        )}
+                      >
+                        {followUp.done ? '已完成' : '待跟进'} · {followUp.due_date}
+                      </span>
+                      <button
+                        onClick={() => toggleFollowUpDone(customerId)}
+                        className="ml-auto inline-flex items-center gap-1 text-xs text-gray-500 hover:text-green-600 dark:text-slate-400"
+                      >
+                        <CheckCircle2 className="h-3.5 w-3.5" />
+                        {followUp.done ? '重新激活' : '标记完成'}
+                      </button>
+                    </div>
+                    {followUp.note && <p className="text-gray-600 dark:text-slate-400">{followUp.note}</p>}
+                  </div>
+                ) : (
+                  <p className="text-sm text-gray-400">暂无跟进计划，点击右上角设置下次跟进时间</p>
                 )}
               </div>
             </div>
@@ -682,7 +761,67 @@ export default function CustomerDetail() {
           {activeTab === 'logs' && (
             <div className="rounded-xl border border-gray-100 bg-white p-6 dark:border-slate-800 dark:bg-slate-900">
               <h3 className="mb-4 text-sm font-semibold text-gray-700 dark:text-slate-200">操作日志</h3>
-              <p className="text-sm text-gray-400">操作日志功能开发中...</p>
+              {(() => {
+                type LogType = 'stage' | 'inbound' | 'outbound' | 'system';
+                const logs: { id: string; type: LogType; title: string; desc?: string; time: string }[] = [];
+                (pipeline.timeline || []).forEach((e, i) => {
+                  const t = e.timestamp || (e as unknown as { at?: string }).at || '';
+                  logs.push({
+                    id: `tl-${i}`,
+                    type: 'stage',
+                    title: `阶段推进至「${e.stage_label || e.stage}」`,
+                    desc: e.note,
+                    time: t,
+                  });
+                });
+                messages.forEach((mm) => {
+                  logs.push({
+                    id: `msg-${mm.id}`,
+                    type: mm.direction === 'inbound' ? 'inbound' : 'outbound',
+                    title: mm.direction === 'inbound' ? '收到客户消息' : '发出消息',
+                    desc: mm.content,
+                    time: mm.created_at,
+                  });
+                });
+                if (pipeline.created_at) {
+                  logs.push({ id: 'created', type: 'system', title: '创建客户档案', time: pipeline.created_at });
+                }
+                logs.sort((a, b) => new Date(b.time).getTime() - new Date(a.time).getTime());
+                if (!logs.length) return <p className="text-sm text-gray-400">暂无操作日志</p>;
+                const ICONS: Record<LogType, typeof RefreshCw> = {
+                  stage: RefreshCw,
+                  inbound: MessageSquare,
+                  outbound: Send,
+                  system: User,
+                };
+                const TONES: Record<LogType, string> = {
+                  stage: 'bg-blue-50 text-blue-500 dark:bg-blue-500/10',
+                  inbound: 'bg-green-50 text-green-500 dark:bg-green-500/10',
+                  outbound: 'bg-indigo-50 text-indigo-500 dark:bg-indigo-500/10',
+                  system: 'bg-gray-100 text-gray-400 dark:bg-slate-700',
+                };
+                return (
+                  <div className="space-y-1">
+                    {logs.map((log) => {
+                      const Icon = ICONS[log.type];
+                      return (
+                        <div key={log.id} className="flex gap-3">
+                          <div className={clsx('mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full', TONES[log.type])}>
+                            <Icon className="h-3.5 w-3.5" />
+                          </div>
+                          <div className="flex-1 border-b border-gray-50 pb-3 dark:border-slate-800/60">
+                            <div className="flex items-center justify-between gap-2">
+                              <p className="text-sm font-medium text-gray-700 dark:text-slate-200">{log.title}</p>
+                              <span className="shrink-0 text-xs text-gray-400">{formatTimeAgo(log.time)}</span>
+                            </div>
+                            {log.desc && <p className="mt-0.5 truncate text-xs text-gray-500 dark:text-slate-400">{log.desc}</p>}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
             </div>
           )}
         </div>
@@ -823,6 +962,14 @@ export default function CustomerDetail() {
 
       {/* Toast */}
       <Toast message={toast.message} visible={toast.visible} />
+
+      {/* 跟进设置 */}
+      {followUpOpen && (
+        <FollowUpModal
+          customer={{ customer_id: customerId, display_name: pipeline.display_name } as CustomerRecord}
+          onClose={() => setFollowUpOpen(false)}
+        />
+      )}
     </div>
   );
 }
