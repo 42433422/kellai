@@ -19,6 +19,9 @@ import {
   Wand2,
   Lightbulb,
   CheckCircle2,
+  BookOpen,
+  Volume2,
+  Square,
 } from 'lucide-react';
 import {
   analyzeIntent,
@@ -26,9 +29,16 @@ import {
   generateAutoReply,
   getCustomerProfile,
   getReminders,
+  listKnowledgeArticles,
+  saveKnowledgeArticle,
+  suggestKnowledgeAnswer,
   updateAiScore,
+  type KnowledgeArticle,
+  type KnowledgeSuggestion,
 } from '../api/ai';
 import { queryPipelines } from '../api/funnel';
+import { useTextToSpeech } from '../hooks/useTextToSpeech';
+import { toastStore } from '../stores/toast';
 import type { CustomerProfile, Reminder, ChatMessage, ClientSummary } from '../types';
 import { formatTimeAgo, formatStage } from '../utils/format';
 
@@ -266,7 +276,23 @@ function AIChatPanel({ selectedCustomerId, selectedCustomerName }: { selectedCus
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
+  const [speechNotice, setSpeechNotice] = useState('');
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const speech = useTextToSpeech();
+  const handleSpeakText = useCallback(
+    (text: string) => {
+      if (!speech.supported) {
+        setSpeechNotice(speech.lastError || 'MiMo TTS 未配置，请先设置 MIMO_API_KEY');
+        window.setTimeout(() => setSpeechNotice(''), 3500);
+        toastStore.error(speech.lastError || 'MiMo TTS 未配置，请先设置 MIMO_API_KEY');
+        return;
+      }
+      setSpeechNotice(speech.isSpeaking(text) ? '已停止朗读' : '正在朗读...');
+      window.setTimeout(() => setSpeechNotice(''), 1800);
+      speech.speak(text);
+    },
+    [speech]
+  );
 
   /** 自动滚动到底部 */
   useEffect(() => {
@@ -451,6 +477,22 @@ function AIChatPanel({ selectedCustomerId, selectedCustomerName }: { selectedCus
                   <p className="mt-1 text-[10px] text-gray-400">
                     {new Date(msg.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
                   </p>
+                  {!isUser && (
+                    <button
+                      type="button"
+                      onClick={() => handleSpeakText(msg.content)}
+                      aria-label={`${speech.isSpeaking(msg.content) ? '停止朗读' : '朗读 AI 回复'}：${msg.content.slice(0, 20)}`}
+                      data-tour="ai-tts"
+                      className={`mt-1 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium transition-colors ${
+                        speech.isSpeaking(msg.content)
+                          ? 'bg-blue-50 text-blue-600'
+                          : 'text-gray-400 hover:bg-gray-100 hover:text-gray-600'
+                      }`}
+                    >
+                      {speech.isSpeaking(msg.content) ? <Square className="h-2.5 w-2.5" /> : <Volume2 className="h-2.5 w-2.5" />}
+                      {speech.isSpeaking(msg.content) ? '停止' : '朗读'}
+                    </button>
+                  )}
                 </div>
               </div>
             );
@@ -472,6 +514,11 @@ function AIChatPanel({ selectedCustomerId, selectedCustomerName }: { selectedCus
 
       {/* 快捷操作 + 输入框 */}
       <div className="border-t border-gray-100 px-5 py-3">
+        {speechNotice && (
+          <div className="mb-2 rounded-md border border-blue-100 bg-blue-50 px-3 py-2 text-xs text-blue-700">
+            {speechNotice}
+          </div>
+        )}
         {/* 快捷按钮（新手教程锚点：分析意图） */}
         <div className="mb-2.5 flex gap-2">
           <button
@@ -629,7 +676,7 @@ function CustomerProfilePanel({
   }
 
   return (
-    <div className="flex h-[320px] shrink-0 flex-col bg-white dark:bg-slate-800">
+    <div className="flex h-[320px] w-[420px] shrink-0 flex-col bg-white dark:bg-slate-800">
       {/* 标题栏 */}
       <div className="flex items-center justify-between border-b border-gray-100 px-5 py-3.5">
         <div className="flex items-center gap-2">
@@ -835,6 +882,124 @@ function CustomerProfilePanel({
   );
 }
 
+/* ========== 右栏下半部分：知识库 ========== */
+
+function KnowledgeBasePanel({ selectedCustomerId }: { selectedCustomerId: number | null }) {
+  const [articles, setArticles] = useState<KnowledgeArticle[]>([]);
+  const [title, setTitle] = useState('企微接入与首月优惠');
+  const [content, setContent] = useState('企业微信接入需要客服链接或 open_kfid。首月优惠需在客户确认合同后申请，付款后安排交付清单、渠道配置和团队培训。');
+  const [query, setQuery] = useState('客户问企微怎么接入、首月能不能优惠，怎么回复？');
+  const [suggestion, setSuggestion] = useState<KnowledgeSuggestion | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const loadArticles = useCallback(() => {
+    listKnowledgeArticles().then(setArticles).catch(() => setArticles([]));
+  }, []);
+
+  useEffect(() => {
+    loadArticles();
+  }, [loadArticles]);
+
+  const handleSave = async () => {
+    if (!title.trim() || !content.trim() || loading) return;
+    setLoading(true);
+    setError('');
+    try {
+      await saveKnowledgeArticle({
+        title: title.trim(),
+        content: content.trim(),
+        tags: ['企业微信', '优惠', '交付'],
+        source: 'ai-assistant',
+      });
+      loadArticles();
+    } catch {
+      setError('知识沉淀失败');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSuggest = async () => {
+    if (!query.trim() || loading) return;
+    setLoading(true);
+    setError('');
+    try {
+      setSuggestion(await suggestKnowledgeAnswer(query.trim(), selectedCustomerId, 3));
+    } catch {
+      setError('生成知识库答案失败');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="flex h-[320px] min-w-0 flex-1 flex-col border-l border-gray-100 bg-white dark:border-slate-700 dark:bg-slate-800">
+      <div className="flex items-center justify-between border-b border-gray-100 px-5 py-3.5 dark:border-slate-700">
+        <div className="flex items-center gap-2">
+          <BookOpen className="h-5 w-5 text-emerald-500" />
+          <h2 className="text-base font-semibold text-gray-900 dark:text-slate-100">知识库</h2>
+          <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300">
+            {articles.length}
+          </span>
+        </div>
+        <button
+          onClick={handleSuggest}
+          disabled={loading || !query.trim()}
+          className="rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-emerald-700 disabled:opacity-50"
+        >
+          生成答案
+        </button>
+      </div>
+
+      <div className="flex-1 space-y-3 overflow-y-auto px-5 py-4">
+        <div className="grid grid-cols-2 gap-2">
+          <input
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            placeholder="知识标题"
+            className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm outline-none focus:border-emerald-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+          />
+          <button
+            onClick={handleSave}
+            disabled={loading || !title.trim() || !content.trim()}
+            className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm font-medium text-emerald-700 transition hover:bg-emerald-100 disabled:opacity-50 dark:border-emerald-900/50 dark:bg-emerald-500/10 dark:text-emerald-300"
+          >
+            沉淀知识
+          </button>
+        </div>
+        <textarea
+          value={content}
+          onChange={(e) => setContent(e.target.value)}
+          rows={2}
+          placeholder="输入标准回复、产品政策、交付经验..."
+          className="w-full resize-none rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm outline-none focus:border-emerald-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+        />
+        <textarea
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          rows={2}
+          placeholder="输入客户问题，基于知识库生成答案..."
+          className="w-full resize-none rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm outline-none focus:border-emerald-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+        />
+        {error && <p className="text-xs text-red-500">{error}</p>}
+        {suggestion && (
+          <div className="rounded-lg border border-emerald-100 bg-emerald-50/70 p-3 text-sm dark:border-emerald-900/50 dark:bg-emerald-500/10">
+            <p className="whitespace-pre-wrap text-gray-700 dark:text-slate-200">{suggestion.answer}</p>
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {suggestion.sources.map((source) => (
+                <span key={source.id} className="rounded-full bg-white px-2 py-0.5 text-xs text-emerald-700 ring-1 ring-emerald-100 dark:bg-slate-900 dark:text-emerald-300 dark:ring-emerald-900/70">
+                  {source.title}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /* ========== 主组件 ========== */
 
 export default function AIAssistant() {
@@ -861,10 +1026,13 @@ export default function AIAssistant() {
           selectedCustomerId={selectedCustomerId}
           selectedCustomerName={selectedCustomerName}
         />
-        <CustomerProfilePanel
-          selectedCustomerId={selectedCustomerId}
-          onSelectCustomer={handleSelectCustomer}
-        />
+        <div className="flex h-[320px] shrink-0">
+          <CustomerProfilePanel
+            selectedCustomerId={selectedCustomerId}
+            onSelectCustomer={handleSelectCustomer}
+          />
+          <KnowledgeBasePanel selectedCustomerId={selectedCustomerId} />
+        </div>
       </div>
     </div>
   );

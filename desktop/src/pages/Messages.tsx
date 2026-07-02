@@ -8,15 +8,20 @@ import {
   X,
   Loader2,
   ChevronRight,
+  Volume2,
+  Square,
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import ChannelLogo, { CHANNEL_BRAND_COLOR } from '../components/ChannelLogo';
 import { getMessages, sendMessage, suggestReply, getChannels } from '../api/messages';
+import { updatePipelineStage } from '../api/funnel';
 import { getScriptHint } from '../api/sales';
 import { useApiQuery, useApiMutation, useQueryClient } from '../hooks/useApiQuery';
 import { useMessageStore } from '../stores/message';
 import { useSalesStore } from '../stores/salesStore';
+import { toastStore } from '../stores/toast';
 import ScriptHintToast from '../components/ScriptHintToast';
+import { useTextToSpeech } from '../hooks/useTextToSpeech';
 import { unwrapApiResponse } from '../utils/format';
 import type { SalesScriptHint } from '../types';
 
@@ -30,6 +35,11 @@ interface MessageItem {
   direction: 'inbound' | 'outbound';
   content: string;
   ai_intent?: string;
+  stage?: string;
+  stage_label?: string;
+  ai_score?: number;
+  pending_follow_up?: boolean;
+  next_action?: string;
   read: boolean;
   created_at: string;
 }
@@ -45,6 +55,11 @@ interface ContactGroup {
   lastMessageDirection: 'inbound' | 'outbound';
   /** 最后一条消息所属渠道（用于列表角标） */
   lastMessageChannel: string;
+  stage: string;
+  stageLabel: string;
+  aiScore: number;
+  pendingFollowUp: boolean;
+  nextAction: string;
   unreadCount: number;
   messages: MessageItem[];
 }
@@ -70,12 +85,16 @@ const STAGE_COLORS: Record<string, string> = {
   closed_lost: 'bg-red-50 text-red-600 dark:bg-red-500/20 dark:text-red-300',
   deal: 'bg-green-50 text-green-600 dark:bg-green-500/20 dark:text-green-300',
   no_contact: 'bg-gray-100 text-gray-600 dark:bg-slate-700 dark:text-slate-300',
+  idle: 'bg-gray-100 text-gray-600 dark:bg-slate-700 dark:text-slate-300',
   connected: 'bg-cyan-50 text-cyan-600 dark:bg-cyan-500/20 dark:text-cyan-300',
   requirement: 'bg-indigo-50 text-indigo-600 dark:bg-indigo-500/20 dark:text-indigo-300',
+  intake: 'bg-indigo-50 text-indigo-600 dark:bg-indigo-500/20 dark:text-indigo-300',
   submitted: 'bg-purple-50 text-purple-600 dark:bg-purple-500/20 dark:text-purple-300',
+  intake_done: 'bg-purple-50 text-purple-600 dark:bg-purple-500/20 dark:text-purple-300',
   quoted: 'bg-amber-50 text-amber-600 dark:bg-amber-500/20 dark:text-amber-300',
   negotiating: 'bg-rose-50 text-rose-600 dark:bg-rose-500/20 dark:text-rose-300',
   pending_sign: 'bg-pink-50 text-pink-600 dark:bg-pink-500/20 dark:text-pink-300',
+  contract_pending: 'bg-pink-50 text-pink-600 dark:bg-pink-500/20 dark:text-pink-300',
   signed: 'bg-green-50 text-green-600 dark:bg-green-500/20 dark:text-green-300',
   delivering: 'bg-blue-50 text-blue-600 dark:bg-blue-500/20 dark:text-blue-300',
   delivered: 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300',
@@ -84,15 +103,32 @@ const STAGE_COLORS: Record<string, string> = {
 /** 阶段 ID 转中文标签 */
 const STAGE_LABELS: Record<string, string> = {
   lead: '线索', new: '新线索', qualified: '合格线索', contacted: '已联系',
+  idle: '未接触',
   connected: '已建联', interested: '有意向', intention: '意向客户',
-  requirement: '需求采集', submitted: '已提交', quoted: '已报价',
+  requirement: '需求采集', intake: '需求采集', submitted: '已提交', intake_done: '已提交', quoted: '已报价',
   negotiation: '商务谈判', negotiating: '议价', closed_won: '成交',
-  closed_lost: '流失', deal: '成交', pending_sign: '待签', signed: '已签',
+  closed_lost: '流失', deal: '成交', pending_sign: '待签', contract_pending: '待签', signed: '已签',
   delivering: '交付中', delivered: '已交付',
 };
 
+const PIPELINE_STAGE_ORDER = ['idle', 'connected', 'intake', 'intake_done', 'quoted', 'negotiating', 'contract_pending', 'signed', 'delivering', 'delivered'];
+
 function getStageLabel(stage: string): string {
   return STAGE_LABELS[stage] ?? stage;
+}
+
+function getNextPipelineStage(stage: string): string | null {
+  const normalized: Record<string, string> = {
+    no_contact: 'idle',
+    requirement: 'intake',
+    submitted: 'intake_done',
+    pending_sign: 'contract_pending',
+    negotiation: 'negotiating',
+  };
+  const current = normalized[stage] ?? stage;
+  const index = PIPELINE_STAGE_ORDER.indexOf(current);
+  if (index < 0 || index >= PIPELINE_STAGE_ORDER.length - 1) return null;
+  return PIPELINE_STAGE_ORDER[index + 1];
 }
 
 /** AI 意图标签颜色 */
@@ -207,6 +243,11 @@ function groupMessagesByCustomer(messages: MessageItem[]): ContactGroup[] {
         existing.lastTime = msg.created_at;
         existing.lastMessageDirection = msg.direction;
         existing.lastMessageChannel = msg.channel_type;
+        existing.stage = msg.stage || existing.stage;
+        existing.stageLabel = msg.stage_label || getStageLabel(existing.stage);
+        existing.aiScore = msg.ai_score ?? existing.aiScore;
+        existing.pendingFollowUp = Boolean(msg.pending_follow_up);
+        existing.nextAction = msg.next_action || existing.nextAction;
       }
       if (!msg.read && msg.direction === 'inbound') {
         existing.unreadCount += 1;
@@ -220,6 +261,11 @@ function groupMessagesByCustomer(messages: MessageItem[]): ContactGroup[] {
         lastTime: msg.created_at,
         lastMessageDirection: msg.direction,
         lastMessageChannel: msg.channel_type,
+        stage: msg.stage || 'idle',
+        stageLabel: msg.stage_label || getStageLabel(msg.stage || 'idle'),
+        aiScore: msg.ai_score ?? 0,
+        pendingFollowUp: Boolean(msg.pending_follow_up),
+        nextAction: msg.next_action || '',
         unreadCount: !msg.read && msg.direction === 'inbound' ? 1 : 0,
         messages: [msg],
       });
@@ -256,12 +302,28 @@ export default function Messages() {
   // 推荐话术浮层
   const [showQuickReplies, setShowQuickReplies] = useState(false);
   const [scriptHint, setScriptHint] = useState<SalesScriptHint | null>(null);
+  const [speechNotice, setSpeechNotice] = useState('');
   const scriptHintsEnabled = useSalesStore((s) => s.scriptHintsEnabled);
 
   const SALES_STAGES = ['quoted', 'negotiating', 'pending_sign', 'proposal'];
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const speech = useTextToSpeech();
+  const handleSpeakText = useCallback(
+    (text: string) => {
+      if (!speech.supported) {
+        setSpeechNotice(speech.lastError || 'MiMo TTS 未配置，请先设置 MIMO_API_KEY');
+        window.setTimeout(() => setSpeechNotice(''), 3500);
+        toastStore.error(speech.lastError || 'MiMo TTS 未配置，请先设置 MIMO_API_KEY');
+        return;
+      }
+      setSpeechNotice(speech.isSpeaking(text) ? '已停止朗读' : '正在朗读...');
+      window.setTimeout(() => setSpeechNotice(''), 1800);
+      speech.speak(text);
+    },
+    [speech]
+  );
 
   // 进入消息中心即标记全部已读；同时主动同步一次未读汇总（不等下一轮 poll）
   const markAllRead = useMessageStore((s) => s.markAllRead);
@@ -329,9 +391,28 @@ export default function Messages() {
         setShowQuickReplies(false);
         // 立即拉取最新消息
         queryClient.invalidateQueries({ queryKey: ['messages', 'list'] });
+        queryClient.invalidateQueries({ queryKey: ['funnel', 'data'] });
+        queryClient.invalidateQueries({ queryKey: ['dashboard'] });
+        void fetchUnread();
       },
       onError: () => {
         // 错误 toast 由 axios 拦截器自动处理
+      },
+    }
+  );
+
+  const advanceStageMutation = useApiMutation<unknown, { customerId: number; stage: string }>(
+    ({ customerId, stage }) => updatePipelineStage(customerId, stage, '消息中心推进'),
+    {
+      onSuccess: (_data, vars) => {
+        toastStore.success(`已推进到「${getStageLabel(vars.stage)}」`);
+        queryClient.invalidateQueries({ queryKey: ['messages', 'list'] });
+        queryClient.invalidateQueries({ queryKey: ['funnel', 'data'] });
+        queryClient.invalidateQueries({ queryKey: ['customers'] });
+        queryClient.invalidateQueries({ queryKey: ['dashboard'] });
+      },
+      onError: () => {
+        toastStore.error('推进失败，请重试');
       },
     }
   );
@@ -451,6 +532,8 @@ export default function Messages() {
 
   const sending = sendMutation.isPending;
   const aiLoading = suggestMutation.isPending;
+  const nextStage = selectedContact ? getNextPipelineStage(selectedContact.stage) : null;
+  const advancingStage = advanceStageMutation.isPending;
 
   return (
     <div className="flex h-full overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm dark:border-slate-700 dark:bg-slate-800">
@@ -597,9 +680,14 @@ export default function Messages() {
                       {selectedContact.customerName}
                     </span>
                     {/* 阶段标签 */}
-                    <span className={clsx('rounded px-1.5 py-0.5 text-[10px] font-medium', STAGE_COLORS.connected)}>
-                      {getStageLabel('connected')}
+                    <span className={clsx('rounded px-1.5 py-0.5 text-[10px] font-medium', STAGE_COLORS[selectedContact.stage] ?? STAGE_COLORS.idle)}>
+                      {selectedContact.stageLabel || getStageLabel(selectedContact.stage)}
                     </span>
+                    {selectedContact.pendingFollowUp && (
+                      <span className="rounded bg-red-50 px-1.5 py-0.5 text-[10px] font-medium text-red-600 dark:bg-red-500/20 dark:text-red-300">
+                        待跟进
+                      </span>
+                    )}
                   </div>
                   <div className="mt-0.5 flex items-center gap-1.5">
                     {selectedContact.channelTypes.map((ch) => {
@@ -689,6 +777,21 @@ export default function Messages() {
                             <span className="text-[10px] text-gray-400 dark:text-slate-500">
                               {formatTime(msg.created_at)}
                             </span>
+                            <button
+                              type="button"
+                              onClick={() => handleSpeakText(msg.content)}
+                              aria-label={`${speech.isSpeaking(msg.content) ? '停止朗读' : '朗读消息'}：${msg.content.slice(0, 20)}`}
+                              data-tour="messages-tts"
+                              className={clsx(
+                                'inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium transition-colors',
+                                speech.isSpeaking(msg.content)
+                                  ? 'bg-blue-50 text-blue-600 dark:bg-blue-500/20 dark:text-blue-300'
+                                  : 'text-gray-400 hover:bg-gray-100 hover:text-gray-600 dark:text-slate-500 dark:hover:bg-slate-700 dark:hover:text-slate-300'
+                              )}
+                            >
+                              {speech.isSpeaking(msg.content) ? <Square className="h-2.5 w-2.5" /> : <Volume2 className="h-2.5 w-2.5" />}
+                              {speech.isSpeaking(msg.content) ? '停止' : '朗读'}
+                            </button>
                           </div>
                         </div>
 
@@ -723,16 +826,39 @@ export default function Messages() {
                     </button>
                   </div>
                   <div className="space-y-1.5">
-                    {aiSuggestions.map((s, i) => (
-                      <button
-                        key={i}
-                        onClick={() => handleFillSuggestion(s)}
-                        className="block w-full rounded-md bg-white px-3 py-2 text-left text-xs text-gray-700 shadow-sm transition-colors hover:bg-blue-50 hover:text-blue-700 dark:bg-slate-700 dark:text-slate-200 dark:shadow-none dark:hover:bg-blue-500/20 dark:hover:text-blue-300"
-                      >
-                        {s}
-                      </button>
-                    ))}
+                    {aiSuggestions.map((s, i) => {
+                      const isSpeaking = speech.isSpeaking(s);
+                      return (
+                        <div key={i} className="flex items-stretch gap-1.5">
+                          <button
+                            onClick={() => handleFillSuggestion(s)}
+                            className="block min-w-0 flex-1 rounded-md bg-white px-3 py-2 text-left text-xs text-gray-700 shadow-sm transition-colors hover:bg-blue-50 hover:text-blue-700 dark:bg-slate-700 dark:text-slate-200 dark:shadow-none dark:hover:bg-blue-500/20 dark:hover:text-blue-300"
+                          >
+                            {s}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleSpeakText(s)}
+                            aria-label={`${isSpeaking ? '停止朗读' : '朗读推荐话术'}：${s.slice(0, 20)}`}
+                            className={clsx(
+                              'flex w-9 shrink-0 items-center justify-center rounded-md border text-xs transition-colors',
+                              isSpeaking
+                                ? 'border-blue-200 bg-blue-50 text-blue-600 dark:border-blue-500/40 dark:bg-blue-500/20 dark:text-blue-300'
+                                : 'border-blue-100 bg-white text-blue-500 hover:bg-blue-50 dark:border-blue-500/30 dark:bg-slate-700 dark:text-blue-300 dark:hover:bg-blue-500/20'
+                            )}
+                          >
+                            {isSpeaking ? <Square className="h-3 w-3" /> : <Volume2 className="h-3.5 w-3.5" />}
+                          </button>
+                        </div>
+                      );
+                    })}
                   </div>
+                </div>
+              )}
+
+              {speechNotice && (
+                <div className="mb-2 rounded-md border border-blue-100 bg-blue-50 px-3 py-2 text-xs text-blue-700 dark:border-blue-500/30 dark:bg-blue-500/10 dark:text-blue-300">
+                  {speechNotice}
                 </div>
               )}
 
@@ -881,6 +1007,46 @@ export default function Messages() {
               </div>
             </div>
 
+            <div className="rounded-lg bg-white p-3 shadow-sm dark:bg-slate-800 dark:shadow-none">
+              <div className="mb-2 flex items-center justify-between">
+                <h4 className="text-xs font-semibold text-gray-500 dark:text-slate-400">成交闭环</h4>
+                <span className={clsx('rounded px-1.5 py-0.5 text-[10px] font-medium', STAGE_COLORS[selectedContact.stage] ?? STAGE_COLORS.idle)}>
+                  {selectedContact.stageLabel || getStageLabel(selectedContact.stage)}
+                </span>
+              </div>
+              <div className="space-y-2">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-gray-500 dark:text-slate-400">AI 意向分</span>
+                  <span className="font-semibold text-gray-900 dark:text-slate-100">
+                    {Math.round((selectedContact.aiScore || 0) * 100)}
+                  </span>
+                </div>
+                <p className="rounded-md bg-gray-50 px-3 py-2 text-xs leading-relaxed text-gray-600 dark:bg-slate-700/60 dark:text-slate-300">
+                  {selectedContact.nextAction || '补齐客户需求并安排下一次跟进'}
+                </p>
+                {nextStage ? (
+                  <button
+                    type="button"
+                    onClick={() => advanceStageMutation.mutate({ customerId: selectedContact.customerId, stage: nextStage })}
+                    disabled={advancingStage}
+                    className={clsx(
+                      'flex w-full items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium transition-colors',
+                      advancingStage
+                        ? 'cursor-wait bg-gray-100 text-gray-400 dark:bg-slate-700 dark:text-slate-500'
+                        : 'bg-green-600 text-white hover:bg-green-700'
+                    )}
+                  >
+                    {advancingStage ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ChevronRight className="h-3.5 w-3.5" />}
+                    推进到「{getStageLabel(nextStage)}」
+                  </button>
+                ) : (
+                  <div className="rounded-lg bg-emerald-50 px-3 py-2 text-center text-xs font-medium text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300">
+                    已到最终阶段
+                  </div>
+                )}
+              </div>
+            </div>
+
             {/* 推荐话术卡片 */}
             <div className="rounded-lg bg-white p-3 shadow-sm dark:bg-slate-800 dark:shadow-none">
               <div className="mb-2 flex items-center justify-between">
@@ -897,19 +1063,36 @@ export default function Messages() {
               </div>
               {aiSuggestions.length > 0 ? (
                 <div className="space-y-2">
-                  {aiSuggestions.map((s, i) => (
-                    <button
-                      key={i}
-                      onClick={() => handleFillSuggestion(s)}
-                      aria-label={`使用推荐话术：${s.slice(0, 10)}`}
-                      data-suggestion-fill={i}
-                      data-tour="messages-suggestion-fill"
-                      className="block w-full rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-left text-xs text-blue-700 transition-colors hover:bg-blue-100 dark:border-blue-500/40 dark:bg-blue-500/10 dark:text-blue-300 dark:hover:bg-blue-500/20"
-                    >
-                      <span className="mr-1 font-medium text-blue-500 dark:text-blue-400">#{i + 1}</span>
-                      {s}
-                    </button>
-                  ))}
+                  {aiSuggestions.map((s, i) => {
+                    const isSpeaking = speech.isSpeaking(s);
+                    return (
+                      <div key={i} className="flex items-stretch gap-1.5">
+                        <button
+                          onClick={() => handleFillSuggestion(s)}
+                          aria-label={`使用推荐话术：${s.slice(0, 10)}`}
+                          data-suggestion-fill={i}
+                          data-tour="messages-suggestion-fill"
+                          className="block min-w-0 flex-1 rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-left text-xs text-blue-700 transition-colors hover:bg-blue-100 dark:border-blue-500/40 dark:bg-blue-500/10 dark:text-blue-300 dark:hover:bg-blue-500/20"
+                        >
+                          <span className="mr-1 font-medium text-blue-500 dark:text-blue-400">#{i + 1}</span>
+                          {s}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleSpeakText(s)}
+                          aria-label={`${isSpeaking ? '停止朗读' : '朗读推荐话术'}：${s.slice(0, 20)}`}
+                          className={clsx(
+                            'flex w-9 shrink-0 items-center justify-center rounded-md border text-xs transition-colors',
+                            isSpeaking
+                              ? 'border-blue-200 bg-blue-50 text-blue-600 dark:border-blue-500/40 dark:bg-blue-500/20 dark:text-blue-300'
+                              : 'border-blue-200 bg-white text-blue-500 hover:bg-blue-50 dark:border-blue-500/40 dark:bg-slate-800 dark:text-blue-300 dark:hover:bg-blue-500/20'
+                          )}
+                        >
+                          {isSpeaking ? <Square className="h-3 w-3" /> : <Volume2 className="h-3.5 w-3.5" />}
+                        </button>
+                      </div>
+                    );
+                  })}
                 </div>
               ) : (
                 <div className="py-4 text-center text-xs text-gray-400 dark:text-slate-500">

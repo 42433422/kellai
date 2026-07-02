@@ -170,15 +170,13 @@ client.interceptors.response.use(
         return client.request(originalConfig);
       }
 
-      // refresh 失败：仅当本地 token 确实不存在时才跳转
-      // 避免单个请求 401 导致全局登出风暴
-      const stillHasToken = localStorage.getItem(TOKEN_KEY);
-      if (!stillHasToken) {
-        if (!originalConfig.skipErrorToast) {
-          toastStore.error("登录已过期，请重新登录");
-        }
-        redirectToLogin();
+      localStorage.removeItem(TOKEN_KEY);
+      localStorage.removeItem(REFRESH_TOKEN_KEY);
+      localStorage.removeItem(USER_KEY);
+      if (!originalConfig.skipErrorToast) {
+        toastStore.error("登录已过期，请重新登录");
       }
+      redirectToLogin();
       return Promise.reject(error);
     }
 

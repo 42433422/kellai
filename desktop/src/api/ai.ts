@@ -16,6 +16,37 @@ export const generateAutoReply = (customerId: number, message: string, intent = 
 export const getCustomerProfile = (customerId: number) =>
   api.get(`/api/kellai/ai/profile/${customerId}`);
 
+export interface KnowledgeArticle {
+  id: string;
+  title: string;
+  content: string;
+  tags?: string[];
+  source?: string;
+  updated_at?: string;
+}
+
+export interface KnowledgeSuggestion {
+  answer: string;
+  matched: boolean;
+  sources: Array<{ id: string; title: string; score: number }>;
+  confidence: number;
+}
+
+export const listKnowledgeArticles = async (): Promise<KnowledgeArticle[]> => {
+  const body = await request<{ articles: KnowledgeArticle[] }>('get', '/api/kellai/ai/knowledge-base');
+  return Array.isArray(body?.articles) ? body.articles : [];
+};
+
+export const saveKnowledgeArticle = (article: Partial<KnowledgeArticle> & { title: string; content: string }) =>
+  request<KnowledgeArticle>('post', '/api/kellai/ai/knowledge-base', article);
+
+export const suggestKnowledgeAnswer = (query: string, customerId?: number | null, limit = 3) =>
+  request<KnowledgeSuggestion>('post', '/api/kellai/ai/knowledge-base/suggest', {
+    query,
+    customer_id: customerId || undefined,
+    limit,
+  });
+
 /** 跟进提醒单条结构（与后端 get_follow_up_reminders 对齐） */
 export interface FollowUpReminder {
   customer_id: number;

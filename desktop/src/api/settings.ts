@@ -19,9 +19,33 @@ export const saveChannelConfig = (
 export const deleteChannel = (channelType: string) =>
   api.delete(`/api/kellai/channels/${channelType}`);
 
+/** 同步指定渠道收件箱 */
+export const syncChannelInbox = (channelType: string, limit = 20) =>
+  api.post('/api/kellai/channels/sync-inbox', { channel_type: channelType, limit });
+
 /** 获取 LLM 状态 */
 export const getLlmStatus = () =>
   api.get('/api/kellai/ai/llm-status');
+
+/** 保存真实 LLM 配置 */
+export const saveLlmConfig = (payload: {
+  provider: string;
+  model?: string;
+  base_url?: string;
+  api_key?: string;
+  auto_reply_enabled?: boolean;
+  auto_reply_stages?: string[];
+  confirm_scenarios?: string[];
+}) =>
+  api.put('/api/kellai/ai/llm-config', payload);
+
+/** 手动测试真实 LLM 连通性 */
+export const probeLlmConfig = () =>
+  api.post('/api/kellai/ai/llm-probe');
+
+/** 获取脱敏 LLM 配置诊断 */
+export const getLlmDiagnostics = () =>
+  api.get('/api/kellai/ai/llm-diagnostics');
 
 /** 获取团队信息 */
 export const getTeamInfo = () =>

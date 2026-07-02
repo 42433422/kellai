@@ -1,0 +1,13 @@
+2026-07-01 15:33:17,566 [WARNING] app.services.auth: 使用开发模式随机 JWT_SECRET（每次启动不同，仅限 development 环境）
+2026-07-01 15:33:17,566 [WARNING] app.services.auth: 使用开发模式固定 PASSWORD_SALT（仅限 development 环境）
+2026-07-01 15:33:17,567 [INFO] app.services.auth: bcrypt 库可用: version=5.0.0
+2026-07-01 15:33:17,575 [WARNING] kellai: ⚠️  当前处于软认证模式，未携带 token 的请求也会被放行（仅开发环境）
+2026-07-01 15:33:17,582 [INFO] app.services.auth: 密码 hash 迁移完成: scanned=35, upgraded=0, errors=0
+2026-07-01 15:33:17,582 [INFO] kellai: auth 启动完成: {'scanned': 35, 'upgraded': 0, 'errors': 0}
+INFO:     Started server process [13413]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8793 (Press CTRL+C to quit)
+2026-07-01 15:33:18,920 [WARNING] kellai: soft-auth: 未带 token 访问受保护接口 path=/api/kellai/ai/llm-status（演示模式放行）
+2026-07-01 15:33:18,997 [INFO] kellai: request GET /api/kellai/ai/llm-status status=200 duration=76.98ms user_id=-
+INFO:     127.0.0.1:65388 - "GET /api/kellai/ai/llm-status HTTP/1.1" 200 OK

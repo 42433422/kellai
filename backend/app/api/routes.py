@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Annotated, Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from app.api.auth_middleware import CurrentUser
@@ -153,6 +153,116 @@ class MarkReadBody(BaseModel):
     all: bool = False
 
 
+class ChannelSyncInboxBody(BaseModel):
+    """同步渠道收件箱到客户消息与漏斗闭环。"""
+    channel_type: str = Field(default="", max_length=32)
+    limit: int = Field(default=50, ge=1, le=200)
+
+
+class SimulateCustomerBehaviorBody(BaseModel):
+    """演示用：模拟真实客户进线行为。"""
+    count: int = Field(default=5, ge=1, le=20)
+    scenario_set: str = Field(default="realistic", max_length=32)
+
+
+class TtsSpeakBody(BaseModel):
+    """云端语音播报（优先 MiMo TTS）。"""
+    text: str = Field(..., min_length=1, max_length=1200)
+    voice: str = Field(default="", max_length=80)
+    rate: int = Field(default=185, ge=120, le=260)
+
+
+class LLMFullFlowTestBody(BaseModel):
+    """LLM/脚本驱动：多轮客户行为 + 销售回复 + 漏斗断言。"""
+    turns: int = Field(default=5, ge=1, le=8)
+    target_stage: str = Field(default="signed", max_length=32)
+    channel_type: str = Field(default="douyin", max_length=32)
+    scenario: str = Field(default="", max_length=64)
+    use_llm: bool = True
+    auto_reply: bool = True
+    require_llm: bool = True
+
+
+class ClosedLoopAuditBody(BaseModel):
+    """产品闭环验收：核心链路 + 可选真实 LLM 强校验。"""
+    require_llm: bool = True
+    target_stage: str = Field(default="signed", max_length=32)
+
+
+class LLMConfigBody(BaseModel):
+    """设置页保存的真实 LLM 配置。api_key 为空时保留原 Key。"""
+    provider: str = Field(default="deepseek", max_length=32)
+    model: str = Field(default="", max_length=128)
+    base_url: str = Field(default="", max_length=512)
+    api_key: str = Field(default="", max_length=4096)
+    auto_reply_enabled: bool = False
+    auto_reply_stages: list[str] = Field(default_factory=list, max_length=20)
+    confirm_scenarios: list[str] = Field(default_factory=list, max_length=20)
+
+
+class KnowledgeArticleBody(BaseModel):
+    id: str = Field(default="", max_length=80)
+    title: str = Field(..., min_length=1, max_length=160)
+    content: str = Field(..., min_length=1, max_length=12000)
+    tags: list[str] = Field(default_factory=list, max_length=20)
+    source: str = Field(default="manual", max_length=80)
+
+
+class KnowledgeQueryBody(BaseModel):
+    query: str = Field(..., min_length=1, max_length=2000)
+    customer_id: Optional[int] = Field(default=None, gt=0)
+    limit: int = Field(default=5, ge=1, le=20)
+
+
+class ServiceTicketCreateBody(BaseModel):
+    customer_id: int = Field(..., gt=0)
+    title: str = Field(default="高风险会话转人工", max_length=160)
+    reason: str = Field(default="", max_length=1000)
+    assignee: str = Field(default="", max_length=80)
+    priority: str = Field(default="high", max_length=32)
+    source: str = Field(default="manual", max_length=80)
+    sla_minutes: int = Field(default=30, ge=5, le=1440)
+    from_quality: bool = True
+
+
+class ServiceTicketAssignBody(BaseModel):
+    assignee: str = Field(..., min_length=1, max_length=80)
+    actor: str = Field(default="system", max_length=80)
+
+
+class ServiceTicketResolveBody(BaseModel):
+    resolution: str = Field(..., min_length=1, max_length=1000)
+    actor: str = Field(default="system", max_length=80)
+    rehost_to_ai: bool = True
+
+
+class ServiceLearningBody(BaseModel):
+    persist: bool = True
+
+
+class OutboundCallPlanBody(BaseModel):
+    customer_id: int = Field(..., gt=0)
+    purpose: str = Field(default="follow_up", max_length=64)
+    assignee: str = Field(default="AI外呼助手", max_length=80)
+
+
+class OutboundCallExecuteBody(BaseModel):
+    outcome: str = Field(default="demo_booked", max_length=64)
+    note: str = Field(default="", max_length=500)
+    actor: str = Field(default="desktop", max_length=80)
+
+
+class SelfServiceResolutionBody(BaseModel):
+    query: str = Field(default="", max_length=2000)
+    channel_type: str = Field(default="", max_length=32)
+    fallback_to_ticket: bool = True
+
+
+class AgentAssistBody(BaseModel):
+    persist: bool = True
+    actor: str = Field(default="desktop", max_length=80)
+
+
 # ---------------------------------------------------------------------------
 # 认证与团队 Body 模型
 # ---------------------------------------------------------------------------
@@ -235,6 +345,195 @@ class ScoreBody(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+CHANNEL_ONBOARDING_GUIDES: dict[str, dict[str, Any]] = {
+    "wework": {
+        "recommended_mode": "scan",
+        "auth_modes": ["scan", "form"],
+        "required_fields": ["corp_id", "secret", "agent_id"],
+        "optional_fields": ["bot_webhook", "kf_url", "open_kfid"],
+        "materials": ["企业微信管理员权限", "自建应用的 Corp ID / Agent ID / Secret", "企业微信客服链接或 open_kfid"],
+        "external_steps": ["在企业微信后台创建或选择自建应用", "配置可信域名和回调地址", "把 Corp ID、Agent ID、Secret 回填到客来来", "扫码授权并测试连接"],
+        "success_criteria": ["测试连接通过", "能同步一条企微客户消息", "客户自动进入漏斗并生成下一步动作"],
+    },
+    "douyin": {
+        "recommended_mode": "scan",
+        "auth_modes": ["scan", "form"],
+        "required_fields": ["app_id", "app_secret"],
+        "optional_fields": ["client_key", "client_secret"],
+        "materials": ["抖音开放平台应用", "App ID / App Secret", "商家账号或客服权限"],
+        "external_steps": ["在抖音开放平台创建应用", "开通客服消息或私信相关权限", "把应用凭据回填到客来来", "测试连接后同步收件箱"],
+        "success_criteria": ["测试连接通过", "抖音进线能入库", "客户阶段随消息自动推进"],
+    },
+    "miniprogram": {
+        "recommended_mode": "scan",
+        "auth_modes": ["scan", "form"],
+        "required_fields": ["app_id", "app_secret"],
+        "optional_fields": ["template_id"],
+        "materials": ["公众号或小程序管理员权限", "App ID / App Secret", "模板消息 ID（可选）"],
+        "external_steps": ["在微信公众平台确认开发者配置", "配置服务器域名和消息回调", "把 App ID / Secret 回填到客来来", "测试连接并同步留资消息"],
+        "success_criteria": ["测试连接通过", "小程序留资能入库", "消息能关联到客户档案"],
+    },
+    "pdd": {
+        "recommended_mode": "scan",
+        "auth_modes": ["scan", "form"],
+        "required_fields": ["client_id", "client_secret"],
+        "optional_fields": [],
+        "materials": ["拼多多开放平台应用", "Client ID / Client Secret", "商家工作台授权账号"],
+        "external_steps": ["创建或选择拼多多开放平台应用", "申请客服/订单相关接口权限", "回填 Client ID / Secret", "测试连接并同步消息"],
+        "success_criteria": ["测试连接通过", "店铺客户消息能进入消息中心"],
+    },
+    "taobao": {
+        "recommended_mode": "scan",
+        "auth_modes": ["scan", "form"],
+        "required_fields": ["app_key", "app_secret"],
+        "optional_fields": [],
+        "materials": ["淘宝开放平台应用", "App Key / App Secret", "千牛商家账号"],
+        "external_steps": ["在淘宝开放平台创建应用", "申请客服消息权限", "回填 App Key / Secret", "测试连接并同步消息"],
+        "success_criteria": ["测试连接通过", "千牛消息能进入统一收件箱"],
+    },
+    "jd": {
+        "recommended_mode": "scan",
+        "auth_modes": ["scan", "form"],
+        "required_fields": ["app_key", "app_secret"],
+        "optional_fields": [],
+        "materials": ["京东宙斯/开放平台应用", "App Key / App Secret", "京麦商家账号"],
+        "external_steps": ["创建京东开放平台应用", "申请客服或订单相关权限", "回填 App Key / Secret", "测试连接并同步消息"],
+        "success_criteria": ["测试连接通过", "京东客户消息能进入统一收件箱"],
+    },
+    "alibaba": {
+        "recommended_mode": "scan",
+        "auth_modes": ["scan", "form"],
+        "required_fields": ["app_key", "app_secret"],
+        "optional_fields": [],
+        "materials": ["1688/阿里开放平台应用", "App Key / App Secret", "商家账号授权"],
+        "external_steps": ["创建阿里开放平台应用", "申请买家咨询相关权限", "回填 App Key / Secret", "测试连接并同步消息"],
+        "success_criteria": ["测试连接通过", "1688 客户咨询能入库"],
+    },
+    "whatsapp": {
+        "recommended_mode": "form",
+        "auth_modes": ["form"],
+        "required_fields": ["phone_number_id", "access_token"],
+        "optional_fields": ["business_id"],
+        "materials": ["WhatsApp Business 账号", "Phone Number ID", "长期 Access Token"],
+        "external_steps": ["在 Meta Business 后台准备号码和 Token", "配置 Webhook 回调", "回填 Phone Number ID / Token", "测试连接"],
+        "success_criteria": ["测试连接通过", "WhatsApp 消息能同步到客来来"],
+    },
+    "telegram": {
+        "recommended_mode": "form",
+        "auth_modes": ["form"],
+        "required_fields": ["bot_token"],
+        "optional_fields": [],
+        "materials": ["Telegram Bot", "Bot Token"],
+        "external_steps": ["通过 BotFather 创建 Bot", "复制 Bot Token", "回填并测试连接"],
+        "success_criteria": ["测试连接通过", "Bot 消息能同步到客来来"],
+    },
+    "line": {
+        "recommended_mode": "form",
+        "auth_modes": ["form"],
+        "required_fields": ["channel_access_token"],
+        "optional_fields": ["channel_secret"],
+        "materials": ["LINE Official Account", "Channel Access Token", "Channel Secret（可选）"],
+        "external_steps": ["在 LINE Developers 建立 Messaging API Channel", "启用 Webhook", "回填 Token / Secret", "测试连接"],
+        "success_criteria": ["测试连接通过", "LINE 消息能进入统一收件箱"],
+    },
+    "phone": {
+        "recommended_mode": "select",
+        "auth_modes": ["select"],
+        "required_fields": ["line"],
+        "optional_fields": [],
+        "materials": ["可用外呼线路"],
+        "external_steps": ["选择外呼线路", "保存后测试外呼线路", "后续由 AI 外呼任务调用"],
+        "success_criteria": ["测试连接通过", "外呼记录能回写客户时间线"],
+    },
+    "email": {
+        "recommended_mode": "none",
+        "auth_modes": ["none"],
+        "required_fields": [],
+        "optional_fields": [],
+        "materials": [],
+        "external_steps": ["当前版本无需额外配置，可直接作为客户来源"],
+        "success_criteria": ["渠道展示为可用"],
+    },
+    "sms": {
+        "recommended_mode": "none",
+        "auth_modes": ["none"],
+        "required_fields": [],
+        "optional_fields": [],
+        "materials": ["短信服务商账号（后续生产接入时配置）"],
+        "external_steps": ["当前版本先保留入口，生产接入时再配置服务商 Key"],
+        "success_criteria": ["渠道入口可见"],
+    },
+    "web": {
+        "recommended_mode": "none",
+        "auth_modes": ["none"],
+        "required_fields": [],
+        "optional_fields": [],
+        "materials": ["网站表单或落地页入口"],
+        "external_steps": ["当前版本用于承接网页线索来源，无需额外配置"],
+        "success_criteria": ["网页线索能进入客户列表"],
+    },
+}
+
+
+def _channel_onboarding_profile(
+    channel_type: str,
+    config: dict[str, Any],
+    *,
+    connected: bool,
+    enabled: bool,
+) -> dict[str, Any]:
+    guide = CHANNEL_ONBOARDING_GUIDES.get(channel_type, {})
+    required_fields = [str(x) for x in guide.get("required_fields", [])]
+    optional_fields = [str(x) for x in guide.get("optional_fields", [])]
+    missing_required = [key for key in required_fields if not str(config.get(key) or "").strip()]
+    saved_fields = [key for key, value in config.items() if str(value or "").strip()]
+    required_complete = not missing_required
+    if connected:
+        status = "connected"
+        next_action = "同步收件箱，确认客户消息能进入漏斗。"
+    elif saved_fields:
+        status = "saved"
+        next_action = "补齐必填字段并保存后，再测试连接。" if missing_required else "点击测试连接，确认平台凭据可用。"
+    elif guide.get("recommended_mode") == "none":
+        status = "ready"
+        next_action = "无需配置，可在客户来源中直接使用。"
+    else:
+        status = "not_started"
+        next_action = "先准备平台材料，然后按向导授权或回填字段。"
+
+    stages = [
+        {"key": "prepare", "label": "准备材料", "status": "done" if saved_fields or connected or not required_fields else "current"},
+        {
+            "key": "configure",
+            "label": "授权/配置",
+            "status": (
+                "done"
+                if connected or (saved_fields and required_complete)
+                else ("current" if saved_fields and missing_required else ("skipped" if not required_fields else "pending"))
+            ),
+        },
+        {"key": "test", "label": "测试连接", "status": "done" if connected else ("current" if saved_fields and required_complete else "pending")},
+        {"key": "sync", "label": "同步收件箱", "status": "current" if connected else "pending"},
+    ]
+    return {
+        "status": status,
+        "recommended_mode": str(guide.get("recommended_mode") or "form"),
+        "auth_modes": list(guide.get("auth_modes") or ["form"]),
+        "required_fields": required_fields,
+        "optional_fields": optional_fields,
+        "missing_required_fields": missing_required,
+        "saved_fields": saved_fields,
+        "materials": list(guide.get("materials") or []),
+        "external_steps": list(guide.get("external_steps") or []),
+        "success_criteria": list(guide.get("success_criteria") or []),
+        "stages": stages,
+        "next_action": next_action,
+        "can_scan": "scan" in (guide.get("auth_modes") or []),
+        "can_manual": bool(required_fields or optional_fields),
+        "enabled": enabled,
+    }
+
+
 @router.get("/channels")
 async def list_channels():
     """列出所有已注册渠道及状态（含已保存的配置）。"""
@@ -249,7 +548,7 @@ async def list_channels():
         merged_config = dict(cfg.get("config") or {})
         has_config = any(str(v).strip() for v in merged_config.values())
         enabled = bool(cfg.get("enabled", has_config))
-        connected = enabled and has_config
+        connected = enabled and bool(cfg.get("connected"))
         result.append({
             "id": f"ch_{ch['channel_type']}",
             "name": cfg.get("name") or ch["channel_type"],
@@ -257,9 +556,15 @@ async def list_channels():
             "adapter_class": ch["adapter_class"],
             "enabled": enabled,
             "connected": connected,
-            "message": "已保存配置，点击测试连接验证" if connected else "未配置",
+            "message": "已连接" if connected else ("已保存配置，点击测试连接验证" if has_config else "未配置"),
             "config": merged_config,
             "config_schema": ch.get("config_schema") or {},
+            "onboarding": _channel_onboarding_profile(
+                ch["channel_type"],
+                merged_config,
+                connected=connected,
+                enabled=enabled,
+            ),
             "createdAt": cfg.get("createdAt") or "",
         })
     return {"success": True, "data": result}
@@ -269,6 +574,8 @@ async def list_channels():
 async def test_channel(channel_type: str):
     """测试指定渠道连接。"""
     from app.channels import ChannelRegistry
+    from app.channels.config_store import get as get_config
+    from app.channels.config_store import save as save_config
 
     reg = ChannelRegistry()
     try:
@@ -279,8 +586,17 @@ async def test_channel(channel_type: str):
         result = await adapter.test_connection()
     except Exception as exc:
         return {"success": False, "error": f"测试失败: {exc}"}
+    connected = bool(result.get("connected"))
+    try:
+        existing = get_config(channel_type)
+        if connected:
+            save_config(channel_type, {}, enabled=True, connected=True)
+        elif existing:
+            save_config(channel_type, {}, connected=False)
+    except Exception as exc:
+        logger.warning("保存渠道连接测试状态失败: %s", exc)
     return {
-        "success": bool(result.get("connected")),
+        "success": connected,
         "data": result,
         "message": result.get("message", ""),
     }
@@ -310,6 +626,7 @@ async def update_channel_config(channel_type: str, body: ChannelConfigUpdate):
         body.config,
         name=body.name,
         enabled=body.enabled,
+        connected=False,
     )
     logger.info("渠道配置已保存: %s (enabled=%s)", channel_type, saved.get("enabled"))
     return {
@@ -319,7 +636,14 @@ async def update_channel_config(channel_type: str, body: ChannelConfigUpdate):
             "name": saved.get("name", channel_type),
             "type": channel_type,
             "enabled": bool(saved.get("enabled")),
+            "connected": bool(saved.get("connected")),
             "config": saved.get("config", {}),
+            "onboarding": _channel_onboarding_profile(
+                channel_type,
+                dict(saved.get("config") or {}),
+                connected=bool(saved.get("enabled")) and bool(saved.get("connected")),
+                enabled=bool(saved.get("enabled")),
+            ),
         },
     }
 
@@ -338,6 +662,55 @@ async def delete_channel(channel_type: str):
 
     deleted = delete_config(channel_type)
     return {"success": True, "data": {"type": channel_type, "deleted": deleted}}
+
+
+@router.post("/channels/sync-inbox")
+async def sync_channel_inbox(body: ChannelSyncInboxBody):
+    """消费渠道收件箱，落库为客户消息，并驱动客户/漏斗/待办闭环。"""
+    from app.channels import ChannelRegistry
+    from app.services.message_store import mark_inbox_consumed, save_message
+
+    reg = ChannelRegistry()
+    if body.channel_type.strip():
+        channel_types = [body.channel_type.strip()]
+    else:
+        channel_types = [c["channel_type"] for c in reg.list_channels()]
+
+    saved_messages: list[dict[str, Any]] = []
+    consumed_ids: list[str] = []
+    seen_ids: set[str] = set()
+    errors: list[dict[str, str]] = []
+
+    for channel_type in channel_types:
+        try:
+            adapter = reg.get(channel_type)
+        except KeyError as exc:
+            errors.append({"channel_type": channel_type, "error": str(exc)})
+            continue
+        try:
+            messages = await adapter.receive_messages(limit=body.limit)
+        except Exception as exc:
+            logger.warning("同步渠道收件箱失败: channel=%s", channel_type, exc_info=True)
+            errors.append({"channel_type": channel_type, "error": str(exc)})
+            continue
+        for msg in messages:
+            if msg.id in seen_ids:
+                continue
+            seen_ids.add(msg.id)
+            saved = save_message(msg)
+            consumed_ids.append(msg.id)
+            saved_messages.append(saved.model_dump())
+
+    consumed = mark_inbox_consumed(consumed_ids)
+    return {
+        "success": True,
+        "data": {
+            "synced": len(saved_messages),
+            "consumed": consumed,
+            "messages": saved_messages,
+            "errors": errors,
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -491,7 +864,7 @@ def get_messages(
     
     当 customer_id 缺省时，按团队所有客户的消息返回。
     """
-    from app.services.message_store import get_messages as _get_messages
+    from app.services.message_store import get_messages_with_state as _get_messages
     from app.services.pipeline import list_pipeline_client_summaries
 
     if customer_id:
@@ -514,12 +887,12 @@ def get_messages(
             messages.extend(msgs)
 
         # 按时间倒序并截断
-        messages.sort(key=lambda m: m.created_at, reverse=True)
+        messages.sort(key=lambda m: str(m.get("created_at") or ""), reverse=True)
         messages = messages[:limit]
 
     return {
         "success": True,
-        "data": [msg.model_dump() for msg in messages],
+        "data": messages,
         "total": len(messages),
     }
 
@@ -540,6 +913,13 @@ async def send_message(body: ChannelSendMessageBody):
     except KeyError:
         return {"success": False, "error": f"未注册的渠道类型: {body.channel_type}"}
     result = await adapter.send_message(body.contact_id, body.content)
+    if not result.get("success", False):
+        return {
+            "success": False,
+            "error": result.get("error") or result.get("message") or "渠道发送失败",
+            "data": {"message_id": "", "channel_result": result},
+        }
+
     now = datetime.now(timezone.utc).isoformat()
     msg = UnifiedMessage(
         id=str(uuid.uuid4()),
@@ -553,8 +933,23 @@ async def send_message(body: ChannelSendMessageBody):
         metadata=result,
         created_at=now,
     )
-    save_message(msg)
-    return {"success": result.get("success", False), "data": {"message_id": msg.id, "channel_result": result}}
+    try:
+        save_message(msg)
+        persisted = True
+        persist_error = ""
+    except Exception as exc:
+        logger.warning("发送成功但消息落库失败: %s", exc)
+        persisted = False
+        persist_error = str(exc)
+    return {
+        "success": True,
+        "data": {
+            "message_id": msg.id if persisted else "",
+            "channel_result": result,
+            "persisted": persisted,
+            "persist_error": persist_error,
+        },
+    }
 
 
 @router.get("/messages/unread-count")
@@ -815,6 +1210,254 @@ def status():
             "independent": True,
         },
     }
+
+
+@router.get("/tts/status")
+def tts_status():
+    """查询云端语音能力。"""
+    from app.services.tts_runtime import speech_status
+
+    return speech_status()
+
+
+@router.post("/tts/audio")
+def tts_audio(body: TtsSpeakBody):
+    """通过 MiMo/Azure 云端 TTS 生成音频，由前端播放。"""
+    from urllib.parse import quote
+
+    from app.services.tts_runtime import synthesize_tts_audio
+
+    try:
+        result = synthesize_tts_audio(body.text, voice=body.voice, rate=body.rate)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return Response(
+        content=result.audio,
+        media_type="audio/wav",
+        headers={
+            "X-Kellai-TTS-Provider": result.provider,
+            "X-Kellai-TTS-Voice": quote(result.voice, safe=""),
+            "X-Kellai-TTS-Model": result.model,
+            "X-Kellai-TTS-Cache": "HIT" if result.cached else "MISS",
+            "X-Kellai-TTS-Cache-Key": result.cache_key,
+        },
+    )
+
+
+@router.post("/tts/speak")
+def tts_speak(body: TtsSpeakBody):
+    """兼容接口：仅验证云端 TTS 可合成。"""
+    from app.services.tts_runtime import speak_text
+
+    result = speak_text(body.text, voice=body.voice, rate=body.rate)
+    if not result.get("success"):
+        raise HTTPException(status_code=503, detail=result.get("message", "云端语音不可用"))
+    return result
+
+
+@router.post("/tts/stop")
+def tts_stop():
+    """兼容接口：后端不再拥有播放进程。"""
+    from app.services.tts_runtime import stop_speech
+
+    return stop_speech()
+
+
+@router.post("/demo/simulate-customer-behavior")
+async def simulate_customer_behavior(body: SimulateCustomerBehaviorBody):
+    """生成一批贴近中小商家场景的模拟客户进线，并跑完整闭环。"""
+    import time
+
+    from app.services.message_store import push_inbox
+    from app.services.growth_loop import customer_message_context
+    from app.services.pipeline import _stage_rank, normalize_stage_id
+
+    scenarios = [
+        {
+            "key": "late_price_inquiry",
+            "label": "夜间价格咨询",
+            "channel_type": "douyin",
+            "contact_name": "抖音-夜间咨询",
+            "content": "你们这个多少钱？我晚上刷到的，想看一下套餐和案例。我们有 3 个门店，每天大概 80 条消息。",
+            "expected_stage": "intake_done",
+        },
+        {
+            "key": "repeat_customer_discount",
+            "label": "老客户复购优惠",
+            "channel_type": "wechat",
+            "contact_name": "微信-私域复购",
+            "content": "之前买过一次，老客户还有优惠吗？合适的话这周再订",
+            "expected_stage": "intake",
+        },
+        {
+            "key": "form_submitted",
+            "label": "需求表已提交",
+            "channel_type": "miniprogram",
+            "contact_name": "小程序-留资客户",
+            "content": "我已经提交需求表了，麻烦尽快给我一个方案",
+            "expected_stage": "intake_done",
+        },
+        {
+            "key": "price_sensitive_compare",
+            "label": "比价异议",
+            "channel_type": "pdd",
+            "contact_name": "拼多多-售前比价",
+            "content": "别家便宜一点，你们能不能优惠？有现货吗",
+            "expected_stage": "intake",
+        },
+        {
+            "key": "contract_urgent",
+            "label": "签约交付追问",
+            "channel_type": "wework",
+            "contact_name": "企微-签约推进",
+            "content": "合同怎么签？如果今天付款多久能开始交付",
+            "expected_stage": "contract_pending",
+        },
+        {
+            "key": "social_link_request",
+            "label": "社媒求链接",
+            "channel_type": "xiaohongshu",
+            "contact_name": "小红书-求链接",
+            "content": "怎么买呀？求链接，可以加微信详细说吗",
+            "expected_stage": "intake",
+        },
+        {
+            "key": "paid_delivery",
+            "label": "付款后交付",
+            "channel_type": "wework",
+            "contact_name": "企微-付款客户",
+            "content": "合同确认了，已经付款了，发我交付清单吧",
+            "expected_stage": "signed",
+        },
+        {
+            "key": "low_intent_noise",
+            "label": "低意向闲聊",
+            "channel_type": "douyin",
+            "contact_name": "抖音-围观用户",
+            "content": "先收藏了，回头看看，你们页面做得还不错",
+            "expected_stage": "connected",
+        },
+    ]
+
+    selected = scenarios[: body.count]
+    created_ids: list[str] = []
+    scenario_refs: list[dict[str, Any]] = []
+    now_ms = int(time.time() * 1000)
+    for idx, scenario in enumerate(selected):
+        channel_type = scenario["channel_type"]
+        # 当前注册表没有 xiaohongshu 独立渠道，先按 douyin 类新媒体私信统一进入。
+        stored_channel = "douyin" if channel_type == "xiaohongshu" else channel_type
+        contact_id = f"sim_{channel_type}_{now_ms}_{idx}"
+        mid = push_inbox(
+            stored_channel,
+            contact_id=contact_id,
+            contact_name=scenario["contact_name"],
+            direction="inbound",
+            content=scenario["content"],
+            metadata={
+                "scenario": channel_type,
+                "scenario_key": scenario["key"],
+                "expected_stage": scenario["expected_stage"],
+                "simulated": True,
+            },
+        )
+        created_ids.append(mid)
+        scenario_refs.append({**scenario, "stored_channel": stored_channel, "contact_id": contact_id, "message_id": mid})
+
+    synced = await sync_channel_inbox(ChannelSyncInboxBody(limit=max(body.count, 20)))
+    saved_messages = synced.get("data", {}).get("messages", []) if isinstance(synced.get("data"), dict) else []
+    by_scenario: dict[str, dict[str, Any]] = {}
+    for msg in saved_messages:
+        meta = msg.get("metadata") if isinstance(msg.get("metadata"), dict) else {}
+        key = str(meta.get("scenario_key") or "")
+        if key:
+            by_scenario[key] = msg
+
+    results: list[dict[str, Any]] = []
+    for scenario in scenario_refs:
+        expected_stage = normalize_stage_id(str(scenario.get("expected_stage") or "connected"))
+        msg = by_scenario.get(str(scenario["key"])) or {}
+        customer_id = int(msg.get("customer_id") or 0)
+        ctx = customer_message_context(customer_id) if customer_id > 0 else {}
+        final_stage = normalize_stage_id(str(ctx.get("stage") or "idle"))
+        passed = (
+            customer_id > 0
+            and _stage_rank(final_stage) >= _stage_rank(expected_stage)
+            and float(ctx.get("ai_score") or 0.0) > 0
+            and bool(str(ctx.get("next_action") or "").strip())
+        )
+        results.append(
+            {
+                "key": scenario["key"],
+                "label": scenario["label"],
+                "channel_type": scenario["channel_type"],
+                "stored_channel": scenario["stored_channel"],
+                "contact_id": scenario["contact_id"],
+                "customer_id": customer_id,
+                "expected_stage": expected_stage,
+                "final_stage": final_stage,
+                "stage_label": ctx.get("stage_label") or "",
+                "ai_score": ctx.get("ai_score") or 0.0,
+                "next_action": ctx.get("next_action") or "",
+                "passed": passed,
+            }
+        )
+
+    passed_count = sum(1 for item in results if item["passed"])
+    return {
+        "success": True,
+        "data": {
+            "created": len(created_ids),
+            "scenario_set": body.scenario_set,
+            "inbox_message_ids": created_ids,
+            "sync": synced.get("data", {}),
+            "summary": {
+                "total": len(results),
+                "passed": passed_count,
+                "failed": len(results) - passed_count,
+                "synced": synced.get("data", {}).get("synced", 0) if isinstance(synced.get("data"), dict) else 0,
+            },
+            "scenario_results": results,
+            "passed": bool(results) and passed_count == len(results),
+        },
+    }
+
+
+@router.post("/demo/llm-full-flow-test")
+async def llm_full_flow_test(body: LLMFullFlowTestBody):
+    """用 LLM 扮演客户，跑多轮消息、销售回复、漏斗推进与断言报告。"""
+    from app.services.llm_customer_simulator import run_llm_full_flow_simulation
+
+    result = await run_llm_full_flow_simulation(
+        turns=body.turns,
+        target_stage=body.target_stage,
+        channel_type=body.channel_type,
+        scenario=body.scenario,
+        use_llm=body.use_llm,
+        auto_reply=body.auto_reply,
+        require_llm=body.require_llm,
+    )
+    return {"success": True, "data": result}
+
+
+@router.post("/demo/closed-loop-audit")
+async def closed_loop_audit(body: ClosedLoopAuditBody):
+    """跑产品级闭环验收报告：客户、消息、AI、漏斗、LLM 成交链路。"""
+    from app.services.closed_loop_audit import run_closed_loop_audit
+
+    result = await run_closed_loop_audit(
+        require_llm=body.require_llm,
+        target_stage=body.target_stage,
+    )
+    return {"success": True, "data": result}
+
+
+@router.get("/demo/closed-loop-audit/latest")
+async def latest_closed_loop_audit():
+    """读取最近一次产品级闭环验收报告，用于交付复核和页面刷新后回看。"""
+    from app.services.closed_loop_audit import latest_closed_loop_audit_report
+
+    return {"success": True, "data": latest_closed_loop_audit_report()}
 
 
 @router.get("/clients")
@@ -1129,6 +1772,36 @@ def ai_llm_status():
     return {"success": True, "data": probe_passive_llm_ready()}
 
 
+@router.put("/ai/llm-config")
+def ai_save_llm_config(body: LLMConfigBody):
+    """保存真实 LLM 配置，并立即做一次真实连通探测。"""
+    from app.services.llm_config import probe_llm_connection, public_config, save_config
+
+    save_config(body.model_dump())
+    probe_llm_connection(update_disk=True)
+    data = public_config()
+    return {"success": True, "data": data}
+
+
+@router.post("/ai/llm-probe")
+def ai_probe_llm_connection():
+    """手动触发真实 LLM 连通测试，返回脱敏结果。"""
+    from app.services.llm_config import probe_llm_connection, public_config
+
+    probe = probe_llm_connection(update_disk=True)
+    data = public_config()
+    data["probe"] = probe
+    return {"success": bool(probe.get("success")), "data": data}
+
+
+@router.get("/ai/llm-diagnostics")
+def ai_llm_diagnostics():
+    """返回脱敏 LLM 配置诊断，帮助确认 Key 是否被当前后端读取。"""
+    from app.services.llm_config import diagnostics
+
+    return {"success": True, "data": diagnostics()}
+
+
 @router.post("/wechat/passive-poll")
 async def passive_poll(body: PassivePollBody):
     from app.services.passive_monitor import passive_poll_once
@@ -1279,11 +1952,269 @@ async def ai_customer_profile(
     return {"success": True, "data": profile}
 
 
+@router.get("/ai/operating-insight/{customer_id}")
+async def ai_customer_operating_insight(
+    customer_id: int,
+):
+    """获取客户跨渠道记忆、风险、主动任务和管理洞察。"""
+    from app.services.growth_loop import customer_agent_operating_insight
+
+    insight = customer_agent_operating_insight(int(customer_id))
+    return {"success": True, "data": insight}
+
+
+@router.get("/ai/quality-inspection/{customer_id}")
+async def ai_customer_quality_inspection(
+    customer_id: int,
+):
+    """获取客户客服质检、合规风险和主管复盘建议。"""
+    from app.services.quality_inspection import inspect_customer_conversation
+
+    report = inspect_customer_conversation(int(customer_id))
+    return {"success": True, "data": report}
+
+
+@router.get("/ai/service-tickets/{customer_id}")
+async def ai_customer_service_tickets(
+    customer_id: int,
+):
+    """获取客户转人工/主管工单汇总。"""
+    from app.services.service_tickets import service_ticket_summary
+
+    return {"success": True, "data": service_ticket_summary(int(customer_id))}
+
+
+@router.post("/ai/service-tickets")
+async def ai_create_service_ticket(
+    body: ServiceTicketCreateBody,
+):
+    """创建转人工/主管工单，可从质检报告自动生成。"""
+    from app.services.service_tickets import create_service_ticket, create_ticket_from_quality
+
+    if body.from_quality:
+        ticket = create_ticket_from_quality(
+            int(body.customer_id),
+            assignee=body.assignee,
+            sla_minutes=body.sla_minutes,
+        )
+    else:
+        ticket = create_service_ticket(body.model_dump())
+    return {"success": True, "data": ticket}
+
+
+@router.post("/ai/service-tickets/{ticket_id}/assign")
+async def ai_assign_service_ticket(
+    ticket_id: str,
+    body: ServiceTicketAssignBody,
+):
+    """指派工单给主管/人工客服。"""
+    from app.services.service_tickets import assign_service_ticket
+
+    return {"success": True, "data": assign_service_ticket(ticket_id, body.assignee, actor=body.actor)}
+
+
+@router.post("/ai/service-tickets/{ticket_id}/resolve")
+async def ai_resolve_service_ticket(
+    ticket_id: str,
+    body: ServiceTicketResolveBody,
+):
+    """解决工单，并可将会话回托给 AI 继续跟进。"""
+    from app.services.service_tickets import resolve_service_ticket
+
+    return {
+        "success": True,
+        "data": resolve_service_ticket(
+            ticket_id,
+            body.resolution,
+            actor=body.actor,
+            rehost_to_ai=body.rehost_to_ai,
+        ),
+    }
+
+
+@router.get("/ai/service-learning/{customer_id}")
+async def ai_customer_service_learning(
+    customer_id: int,
+):
+    """读取客户服务自学习指标与已沉淀知识，不产生写入。"""
+    from app.services.service_learning import run_service_learning
+
+    return {"success": True, "data": run_service_learning(int(customer_id), persist=False)}
+
+
+@router.post("/ai/service-learning/{customer_id}")
+async def ai_run_customer_service_learning(
+    customer_id: int,
+    body: ServiceLearningBody | None = None,
+):
+    """将质检/工单处理结果沉淀为可检索知识和服务优化指标。"""
+    from app.services.service_learning import run_service_learning
+
+    persist = True if body is None else body.persist
+    return {"success": True, "data": run_service_learning(int(customer_id), persist=persist)}
+
+
+@router.get("/ai/outbound-calls/{customer_id}")
+async def ai_customer_outbound_calls(
+    customer_id: int,
+):
+    """读取客户 AI 外呼任务、通话纪要与电话消息数量。"""
+    from app.services.outbound_call import outbound_call_summary
+
+    return {"success": True, "data": outbound_call_summary(int(customer_id))}
+
+
+@router.post("/ai/outbound-calls")
+async def ai_plan_outbound_call(
+    body: OutboundCallPlanBody,
+):
+    """生成 AI 外呼任务和电话话术。"""
+    from app.services.outbound_call import plan_outbound_call
+
+    return {
+        "success": True,
+        "data": plan_outbound_call(
+            int(body.customer_id),
+            purpose=body.purpose,
+            assignee=body.assignee,
+            actor="desktop",
+        ),
+    }
+
+
+@router.post("/ai/outbound-calls/{call_id}/execute")
+async def ai_execute_outbound_call(
+    call_id: str,
+    body: OutboundCallExecuteBody,
+):
+    """执行本地模拟 AI 外呼，写入电话消息并推进客户漏斗。"""
+    from app.services.outbound_call import execute_outbound_call
+
+    return {
+        "success": True,
+        "data": execute_outbound_call(
+            call_id,
+            outcome=body.outcome,
+            note=body.note,
+            actor=body.actor,
+        ),
+    }
+
+
+@router.get("/ai/self-service/{customer_id}")
+async def ai_customer_self_service(
+    customer_id: int,
+):
+    """读取客户 AI 自助解决记录与转人工指标。"""
+    from app.services.self_service_resolution import self_service_summary
+
+    return {"success": True, "data": self_service_summary(int(customer_id))}
+
+
+@router.post("/ai/self-service/{customer_id}")
+async def ai_run_customer_self_service(
+    customer_id: int,
+    body: SelfServiceResolutionBody | None = None,
+):
+    """执行 AI 自助解决：知识库命中则自动回复，未命中则转人工工单。"""
+    from app.services.self_service_resolution import run_self_service_resolution
+
+    payload = body or SelfServiceResolutionBody()
+    return {
+        "success": True,
+        "data": run_self_service_resolution(
+            int(customer_id),
+            query=payload.query,
+            channel_type=payload.channel_type,
+            fallback_to_ticket=payload.fallback_to_ticket,
+            actor="desktop",
+            persist=True,
+        ),
+    }
+
+
+@router.get("/ai/agent-assist/{customer_id}")
+async def ai_customer_agent_assist(customer_id: int):
+    """读取坐席助手建议：自动填单草稿、知识推荐和风险提醒。"""
+    from app.services.agent_assist import agent_assist_summary
+
+    return {"success": True, "data": agent_assist_summary(int(customer_id))}
+
+
+@router.post("/ai/agent-assist/{customer_id}")
+async def ai_run_customer_agent_assist(
+    customer_id: int,
+    body: AgentAssistBody | None = None,
+):
+    """执行坐席助手闭环：生成并可应用自动填单结果。"""
+    from app.services.agent_assist import build_agent_assist
+
+    payload = body or AgentAssistBody()
+    return {
+        "success": True,
+        "data": build_agent_assist(
+            int(customer_id),
+            persist=payload.persist,
+            actor=payload.actor,
+        ),
+    }
+
+
+@router.get("/ai/knowledge-base")
+async def ai_knowledge_base_list():
+    """获取客服知识库文章列表。"""
+    from app.services.knowledge_base import list_articles
+
+    return {"success": True, "data": {"articles": list_articles()}}
+
+
+@router.post("/ai/knowledge-base")
+async def ai_knowledge_base_upsert(
+    body: KnowledgeArticleBody,
+):
+    """新增或更新客服知识库文章。"""
+    from app.services.knowledge_base import upsert_article
+
+    article = upsert_article(body.model_dump())
+    return {"success": True, "data": article}
+
+
+@router.delete("/ai/knowledge-base/{article_id}")
+async def ai_knowledge_base_delete(
+    article_id: str,
+):
+    """删除客服知识库文章。"""
+    from app.services.knowledge_base import delete_article
+
+    return {"success": True, "data": {"deleted": delete_article(article_id)}}
+
+
+@router.post("/ai/knowledge-base/search")
+async def ai_knowledge_base_search(
+    body: KnowledgeQueryBody,
+):
+    """检索客服知识库。"""
+    from app.services.knowledge_base import search_articles
+
+    return {"success": True, "data": {"items": search_articles(body.query, limit=body.limit)}}
+
+
+@router.post("/ai/knowledge-base/suggest")
+async def ai_knowledge_base_suggest(
+    body: KnowledgeQueryBody,
+):
+    """基于知识库生成可追溯客服回复建议。"""
+    from app.services.growth_loop import customer_message_context
+    from app.services.knowledge_base import suggest_answer
+
+    context = customer_message_context(int(body.customer_id)) if body.customer_id else {}
+    return {"success": True, "data": suggest_answer(body.query, customer_context=context, limit=body.limit)}
+
+
 @router.get("/ai/reminders")
 async def ai_reminders(
     hours: int = 48,
     limit: int = 20,
-    _rl: None = Depends(enforce_llm_rate_limit),
 ):
     """获取跟进提醒列表"""
     from app.services.ai_copilot import get_follow_up_reminders
@@ -1295,8 +2226,6 @@ async def ai_reminders(
 @router.post("/ai/score/{customer_id}")
 async def ai_update_score(
     customer_id: int,
-    request: Request,
-    _rl: None = Depends(enforce_llm_rate_limit),
 ):
     """更新客户 AI 评分"""
     from app.services.ai_copilot import calculate_ai_score

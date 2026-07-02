@@ -31,6 +31,18 @@ PIPELINE_STAGES: list[dict[str, str]] = [
 
 _STAGE_ORDER = [s["id"] for s in PIPELINE_STAGES]
 _STAGE_LABELS = {s["id"]: s["label"] for s in PIPELINE_STAGES}
+_STAGE_ALIASES: dict[str, str] = {
+    "no_contact": "idle",
+    "requirement": "intake",
+    "submitted": "intake_done",
+    "pending_sign": "contract_pending",
+    "negotiation": "negotiating",
+}
+
+
+def normalize_stage_id(stage: str | None) -> str:
+    st = str(stage or "idle").strip()
+    return _STAGE_ALIASES.get(st, st)
 
 
 def _now_iso() -> str:
@@ -38,7 +50,7 @@ def _now_iso() -> str:
 
 
 def _stage_rank(stage: str | None) -> int:
-    st = str(stage or "idle")
+    st = normalize_stage_id(stage)
     try:
         return _STAGE_ORDER.index(st)
     except ValueError:
@@ -164,7 +176,7 @@ def load_pipeline(customer_id: int, username: str = "") -> dict[str, Any]:
     doc.setdefault("market_user_id", uid)
     if username and not doc.get("username"):
         doc["username"] = str(username).strip()
-    doc.setdefault("stage", "idle")
+    doc["stage"] = normalize_stage_id(str(doc.get("stage") or "idle"))
     doc.setdefault("channel_sources", [])
     doc.setdefault("ai_score", 0.0)
     doc.setdefault("ai_tags", [])
@@ -205,7 +217,7 @@ def set_pipeline_stage(
     source: str = "manual",
     note: str = "",
 ) -> dict[str, Any]:
-    st = str(stage or "").strip()
+    st = normalize_stage_id(stage)
     if st not in _STAGE_ORDER:
         raise ValueError(f"未知阶段: {st}")
     doc = load_pipeline(customer_id, username=username)
@@ -300,7 +312,7 @@ def list_pipeline_client_summaries() -> list[dict[str, Any]]:
         uid = _customer_id_from_doc(doc)
         if uid <= 0:
             continue
-        stage = str(doc.get("stage") or "idle")
+        stage = normalize_stage_id(str(doc.get("stage") or "idle"))
         contact = _contact_from_doc(doc)
         rows.append(
             {
@@ -336,7 +348,7 @@ def build_pipeline_funnel_summary(*, max_clients_per_stage: int = 8) -> dict[str
     counts = {s["id"]: 0 for s in PIPELINE_STAGES}
     clients_by_stage: dict[str, list[dict[str, Any]]] = {s["id"]: [] for s in PIPELINE_STAGES}
     for row in list_pipeline_client_summaries():
-        st = str(row.get("stage") or "idle")
+        st = normalize_stage_id(str(row.get("stage") or "idle"))
         if st not in counts:
             st = "idle"
         counts[st] += 1
@@ -474,7 +486,7 @@ def create_customer(profile: dict[str, Any], *, username: str = "") -> dict[str,
     doc = _default_pipeline(uid, username=username)
     doc["created_at"] = _now_iso()
     _apply_profile(doc, profile)
-    stage = str(profile.get("stage") or "").strip()
+    stage = normalize_stage_id(profile.get("stage"))
     if stage in _STAGE_ORDER:
         doc["stage"] = stage
     _append_timeline(doc, doc["stage"], "manual", note="创建客户")
@@ -485,7 +497,7 @@ def update_customer_profile(customer_id: int, profile: dict[str, Any], *, userna
     """更新客户资料（含可选的阶段变更），返回保存后的 doc。"""
     doc = load_pipeline(int(customer_id), username=username)
     _apply_profile(doc, profile)
-    stage = str(profile.get("stage") or "").strip()
+    stage = normalize_stage_id(profile.get("stage"))
     if stage and stage in _STAGE_ORDER and doc.get("stage") != stage:
         doc["stage"] = stage
         _append_timeline(doc, stage, "manual", note="资料更新")
@@ -546,6 +558,7 @@ __all__ = [
     "list_pipeline_client_summaries",
     "load_pipeline",
     "next_customer_id",
+    "normalize_stage_id",
     "remove_customer_tag",
     "repair_all_pipelines",
     "repair_pipeline_crm",

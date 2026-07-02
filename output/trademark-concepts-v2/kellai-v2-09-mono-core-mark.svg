@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 640" role="img" aria-label="客来来商标 v2 09 单色核心">
+  <rect width="640" height="640" fill="#ffffff"/>
+  <rect x="96" y="96" width="448" height="448" rx="108" fill="#0f172a"/>
+  <path d="M196 398V232c0-58 38-96 94-96h88c56 0 94 38 94 96v166h-68V236c0-22-12-36-32-36h-76c-20 0-32 14-32 36v162z" fill="#ffffff"/>
+  <path d="M230 460c58 34 122 48 190 34" fill="none" stroke="#ffffff" stroke-width="34" stroke-linecap="round"/>
+  <path d="M330 288h100c30 0 54 24 54 54s-24 54-54 54h-28l-48 42v-42h-24c-30 0-54-24-54-54s24-54 54-54z" fill="#0f172a" stroke="#ffffff" stroke-width="26"/>
+  <circle cx="360" cy="342" r="10" fill="#ffffff"/>
+  <circle cx="398" cy="342" r="10" fill="#ffffff"/>
+  <circle cx="436" cy="342" r="10" fill="#ffffff"/>
+</svg>

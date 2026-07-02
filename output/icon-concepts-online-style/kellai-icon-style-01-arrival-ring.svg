@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="客来来图标 01 来客环">
+  <rect width="512" height="512" fill="#ffffff"/>
+  <defs>
+    <linearGradient id="bgArrival" x1="86" y1="72" x2="426" y2="444" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2868f0"/>
+      <stop offset="0.52" stop-color="#10b6d3"/>
+      <stop offset="1" stop-color="#12b981"/>
+    </linearGradient>
+  </defs>
+  <rect x="64" y="64" width="384" height="384" rx="96" fill="url(#bgArrival)"/>
+  <circle cx="256" cy="256" r="132" fill="#ffffff" opacity="0.92"/>
+  <path d="M162 266c54-86 124-128 210-124" fill="none" stroke="#0ea5e9" stroke-width="34" stroke-linecap="round"/>
+  <path d="M160 312c78 54 164 62 258 24" fill="none" stroke="#ffb020" stroke-width="30" stroke-linecap="round"/>
+  <path d="M250 138v166c0 22 16 38 38 38h88" fill="none" stroke="#102a56" stroke-width="34" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="376" cy="144" r="20" fill="#12b981"/>
+</svg>

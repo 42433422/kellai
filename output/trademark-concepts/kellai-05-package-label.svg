@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 840 520" role="img" aria-label="客来来商标候选 05">
+  <defs>
+    <linearGradient id="labelBg" x1="72" y1="72" x2="768" y2="448" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#eff6ff"/>
+      <stop offset="1" stop-color="#ecfdf5"/>
+    </linearGradient>
+  </defs>
+  <rect x="48" y="56" width="744" height="408" rx="64" fill="url(#labelBg)" stroke="#0f766e" stroke-width="12"/>
+  <rect x="82" y="90" width="676" height="340" rx="42" fill="#ffffff" stroke="#bae6fd" stroke-width="4"/>
+  <path d="M148 286c58-86 122-126 214-130" fill="none" stroke="#2563eb" stroke-width="22" stroke-linecap="round"/>
+  <path d="M334 126h76c30 0 55 25 55 55v18c0 30-25 55-55 55h-26l-58 42v-44c-24-9-41-32-41-59v-12c0-30 25-55 55-55z" fill="#0f766e"/>
+  <circle cx="352" cy="190" r="9" fill="#ffffff"/>
+  <circle cx="382" cy="190" r="9" fill="#ffffff"/>
+  <circle cx="412" cy="190" r="9" fill="#ffffff"/>
+  <text x="508" y="247" fill="#0f172a" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, Heiti SC, Arial Unicode MS, sans-serif" font-size="92" font-weight="900">客来来</text>
+  <text x="512" y="302" fill="#0f766e" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, Heiti SC, Arial Unicode MS, sans-serif" font-size="28" font-weight="700" letter-spacing="3">把每个来客变成成交机会</text>
+  <rect x="158" y="312" width="26" height="64" rx="10" fill="#f59e0b"/>
+  <rect x="202" y="278" width="26" height="98" rx="10" fill="#fbbf24"/>
+  <rect x="246" y="236" width="26" height="140" rx="10" fill="#10b981"/>
+</svg>

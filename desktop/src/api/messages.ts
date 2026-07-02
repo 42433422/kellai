@@ -8,8 +8,14 @@ export interface UnreadSummary {
 }
 
 /** 获取消息列表 */
-export const getMessages = (params: { customer_id?: number; channel_type?: string; limit?: number; since?: string }) =>
-  api.get('/api/kellai/messages', { params });
+export const getMessages = async (params: { customer_id?: number; channel_type?: string; limit?: number; since?: string }) => {
+  await syncInboxMessages(params.channel_type).catch(() => undefined);
+  return api.get('/api/kellai/messages', { params });
+};
+
+/** 同步渠道收件箱到消息/客户/漏斗闭环 */
+export const syncInboxMessages = (channelType = '', limit = 50) =>
+  api.post('/api/kellai/channels/sync-inbox', { channel_type: channelType, limit }, { skipErrorToast: true });
 
 /** 发送消息 */
 export const sendMessage = (customerId: number, channelType: string, contactId: string, content: string) =>

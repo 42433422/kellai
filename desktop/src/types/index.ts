@@ -237,7 +237,33 @@ export interface Channel {
   config: Record<string, unknown>;
   enabled: boolean;
   connected: boolean;
+  message?: string;
+  onboarding?: ChannelOnboardingProfile;
   createdAt: string;
+}
+
+export interface ChannelOnboardingStep {
+  key: string;
+  label: string;
+  status: "done" | "current" | "pending" | "skipped";
+}
+
+export interface ChannelOnboardingProfile {
+  status: "not_started" | "saved" | "connected" | "ready";
+  recommended_mode: "scan" | "form" | "select" | "none";
+  auth_modes: string[];
+  required_fields: string[];
+  optional_fields: string[];
+  missing_required_fields: string[];
+  saved_fields: string[];
+  materials: string[];
+  external_steps: string[];
+  success_criteria: string[];
+  stages: ChannelOnboardingStep[];
+  next_action: string;
+  can_scan: boolean;
+  can_manual: boolean;
+  enabled: boolean;
 }
 
 /** 渠道配置项 */
@@ -252,6 +278,10 @@ export interface ChannelConfigField {
 /** LLM 配置 */
 export interface LLMConfig {
   model: string;
+  llmModel?: string;
+  baseUrl?: string;
+  keyPrefix?: string;
+  message?: string;
   apiKey: string;
   connected: boolean;
   autoReplyEnabled: boolean;

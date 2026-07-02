@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="客来来商标候选 02">
+  <defs>
+    <linearGradient id="doorBg" x1="84" y1="52" x2="420" y2="456" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1d4ed8"/>
+      <stop offset="0.55" stop-color="#06b6d4"/>
+      <stop offset="1" stop-color="#22c55e"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="116" fill="url(#doorBg)"/>
+  <path d="M154 354V168c0-30 24-54 54-54h96c30 0 54 24 54 54v186" fill="none" stroke="#ffffff" stroke-width="36" stroke-linecap="round"/>
+  <path d="M198 354V192c0-16 13-29 29-29h58c16 0 29 13 29 29v162" fill="rgba(255,255,255,0.16)" stroke="#ffffff" stroke-width="18"/>
+  <path d="M314 142h42c25 0 45 20 45 45v14c0 25-20 45-45 45h-14l-44 34v-38c-17-7-29-24-29-43v-12c0-25 20-45 45-45z" fill="#ffffff"/>
+  <circle cx="323" cy="194" r="8" fill="#0891b2"/>
+  <circle cx="350" cy="194" r="8" fill="#0891b2"/>
+  <circle cx="377" cy="194" r="8" fill="#0891b2"/>
+  <path d="M136 382c57 34 184 34 240 0" fill="none" stroke="#fbbf24" stroke-width="24" stroke-linecap="round"/>
+  <text x="256" y="324" text-anchor="middle" fill="#ffffff" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, Heiti SC, Arial Unicode MS, sans-serif" font-size="98" font-weight="850">来</text>
+</svg>

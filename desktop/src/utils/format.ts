@@ -26,6 +26,16 @@ export function formatTimeAgo(dateStr: string | number | null | undefined): stri
 /** 阶段 ID 转中文标签 */
 const stageMap: Record<string, string> = {
   lead: '线索',
+  idle: '未接触',
+  connected: '已建联',
+  intake: '需求采集',
+  intake_done: '已提交',
+  quoted: '已报价',
+  negotiating: '议价',
+  contract_pending: '待签',
+  signed: '已签',
+  delivering: '交付中',
+  delivered: '已交付',
   qualified: '合格线索',
   proposal: '方案沟通',
   negotiation: '商务谈判',

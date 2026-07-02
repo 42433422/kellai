@@ -135,12 +135,28 @@ def _get_llm_client() -> tuple[str, Any]:
     """获取 LLM 客户端配置，返回 (provider_name, config_dict)。
 
     支持 deepseek, openai, dashscope, moonshot, siliconflow。
-    优先使用环境变量配置的 provider。
+    优先使用环境变量，其次使用设置页保存的本地配置。
     """
+    try:
+        from app.services.llm_config import effective_config
+
+        cfg = effective_config()
+        if cfg.get("api_key"):
+            return str(cfg.get("provider") or ""), {
+                "api_key": str(cfg["api_key"]),
+                "base_url": str(cfg.get("base_url") or ""),
+                "model": str(cfg.get("model") or ""),
+            }
+    except Exception:
+        logger.debug("读取本地 LLM 配置失败，回退到环境变量", exc_info=True)
+
+    # 兜底兼容旧部署：直接扫描历史环境变量。
     for prov in _LLM_PROVIDERS:
         api_key = (os.environ.get(prov["key_env"]) or "").strip()
         if api_key:
             provider_name = prov["key_env"].replace("_API_KEY", "").lower()
+            if provider_name == "dashscope":
+                provider_name = "qwen"
             return provider_name, {
                 "api_key": api_key,
                 "base_url": prov["base_url"],
@@ -166,6 +182,13 @@ def _call_llm(prompt: str, system_prompt: str = "", max_tokens: int = 1024) -> s
         "max_tokens": max_tokens,
         "temperature": 0.3,
     }
+    try:
+        from app.services.llm_config import needs_mimo_thinking_disabled
+
+        if needs_mimo_thinking_disabled(provider_name, str(config.get("base_url") or "")):
+            payload["thinking"] = {"type": "disabled"}
+    except Exception:
+        logger.debug("检查 MiMo thinking 兼容参数失败", exc_info=True)
 
     headers = {
         "Content-Type": "application/json",
@@ -175,11 +198,14 @@ def _call_llm(prompt: str, system_prompt: str = "", max_tokens: int = 1024) -> s
     url = f"{config['base_url']}/chat/completions"
 
     try:
-        with httpx.Client(timeout=15.0) as client:
+        from app.services.llm_config import trust_env_proxy
+
+        with httpx.Client(timeout=15.0, trust_env=trust_env_proxy()) as client:
             resp = client.post(url, json=payload, headers=headers)
             resp.raise_for_status()
             data = resp.json()
-            content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+            message = (data.get("choices") or [{}])[0].get("message", {})
+            content = message.get("content") or message.get("reasoning_content") or ""
             return content.strip()
     except httpx.TimeoutException:
         logger.warning("LLM 调用超时 (provider=%s)", provider_name)
@@ -641,14 +667,15 @@ def get_follow_up_reminders(
                 except (ValueError, TypeError):
                     pass
 
-        if hours_since < hours_threshold:
+        pending_follow_up = bool(doc.get("pending_follow_up"))
+        if hours_since < hours_threshold and not pending_follow_up:
             continue
 
         stage = str(doc.get("stage") or "idle")
         display_name = _display_name_from_doc(doc)
 
         # 根据阶段生成建议动作
-        suggested_action = _suggest_action_by_stage(stage, hours_since)
+        suggested_action = str(doc.get("next_action") or "").strip() or _suggest_action_by_stage(stage, hours_since)
 
         results.append({
             "customer_id": uid,
@@ -656,10 +683,12 @@ def get_follow_up_reminders(
             "stage": stage,
             "hours_since_last_contact": round(hours_since, 1),
             "suggested_action": suggested_action,
+            "pending_follow_up": pending_follow_up,
+            "reason": str(doc.get("follow_up_reason") or ""),
         })
 
-    # 按紧急度排序：时间越久越靠前
-    results.sort(key=lambda r: r["hours_since_last_contact"], reverse=True)
+    # 先排新消息待处理，再按失联时长排序
+    results.sort(key=lambda r: (not bool(r.get("pending_follow_up")), -float(r["hours_since_last_contact"])))
     return results
 
 
@@ -741,7 +770,10 @@ def calculate_ai_score(customer_id: int, *, messages: list[dict] | None = None) 
         freq_score = 1.0
 
     # ── 2. 高意向消息占比得分 (30%) ──
-    inbound_messages = [m for m in messages if str(m.get("direction") or "") == "in"]
+    inbound_messages = [
+        m for m in messages
+        if str(m.get("direction") or "").lower() in {"in", "inbound", "incoming", "customer"}
+    ]
     high_intent_count = 0
     for m in inbound_messages:
         content = str(m.get("content") or "")

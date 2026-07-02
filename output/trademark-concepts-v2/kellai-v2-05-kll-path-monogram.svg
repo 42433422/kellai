@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 640" role="img" aria-label="客来来商标 v2 05 KLL 路径">
+  <rect width="640" height="640" fill="#ffffff"/>
+  <rect x="94" y="94" width="452" height="452" rx="96" fill="#f8fafc" stroke="#dbe4ef" stroke-width="10"/>
+  <path d="M190 456V184" fill="none" stroke="#0f172a" stroke-width="62" stroke-linecap="round"/>
+  <path d="M210 326l216-142" fill="none" stroke="#2563eb" stroke-width="62" stroke-linecap="round"/>
+  <path d="M220 326l224 140" fill="none" stroke="#10b981" stroke-width="62" stroke-linecap="round"/>
+  <path d="M374 324h82c54 0 96 42 96 96s-42 96-96 96H342" fill="none" stroke="#f59e0b" stroke-width="42" stroke-linecap="round"/>
+  <circle cx="424" cy="421" r="13" fill="#0f172a"/>
+  <circle cx="472" cy="421" r="13" fill="#0f172a"/>
+</svg>

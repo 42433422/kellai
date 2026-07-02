@@ -21,12 +21,26 @@ import { useNavigate } from "react-router-dom";
 import { driver, type DriveStep } from "driver.js";
 import "driver.js/dist/driver.css";
 import { useOnboardingStore } from "../stores/onboarding";
+import { useAdvancedPanelStore } from "../stores/advancedPanel";
 import client from "../api/client";
+import { toastStore } from "../stores/toast";
+import { useTextToSpeech } from "../hooks/useTextToSpeech";
+import { ONBOARDING_WELCOME_CACHE_KEY, ONBOARDING_WELCOME_DESCRIPTION, ONBOARDING_WELCOME_TITLE } from "../constants/onboardingTour";
+import { buildOnboardingSpeechText, estimateSpeechHoldMs } from "../utils/onboardingSpeech";
 
 type DriverInstance = ReturnType<typeof driver>;
 
+type OnboardingSpeechWindow = Window & {
+  __kellaiOnboardingWelcomePreplayedUntil?: number;
+};
+
 /** 教程动画速度倍率：>1 变慢，<1 变快。2.0 = 比默认慢一倍 */
 const SPEED = 2.0;
+
+function buildTourSpeechText(step?: DriveStep) {
+  const popover = (step as { popover?: { title?: unknown; description?: unknown } } | undefined)?.popover;
+  return buildOnboardingSpeechText(popover?.title, popover?.description);
+}
 
 /* ====================================================================
  * 演示工具
@@ -86,7 +100,144 @@ function makeTimerGroup() {
  *       demo 应在 ~2.5s 内完成全部动作。
  * ==================================================================== */
 
-type DemoResult = { ok: boolean; fallbackMsg?: string };
+type DemoResult = { ok: boolean; fallbackMsg?: string; stop?: boolean; redirectPath?: string };
+
+const TUTORIAL_CONTACT_STORAGE_KEY = "kellai:tutorial:first-contact";
+
+function extractResponseData(payload: unknown): any {
+  const response = payload as { data?: unknown } | undefined;
+  const body = response?.data ?? payload;
+  if (body && typeof body === "object" && "data" in body) {
+    return (body as { data?: unknown }).data;
+  }
+  return body;
+}
+
+function setRememberedTutorialCustomer(customerId: unknown) {
+  const id = Number(customerId);
+  if (!Number.isFinite(id) || id <= 0) return "";
+  const customerIdText = String(id);
+  (window as unknown as { __tutorialFirstContact?: string }).__tutorialFirstContact = customerIdText;
+  try {
+    sessionStorage.setItem(TUTORIAL_CONTACT_STORAGE_KEY, customerIdText);
+  } catch {
+    // ignore
+  }
+  return customerIdText;
+}
+
+function readRememberedTutorialCustomer() {
+  const fromWindow = (window as unknown as { __tutorialFirstContact?: string | null }).__tutorialFirstContact;
+  if (fromWindow) return fromWindow;
+  try {
+    return sessionStorage.getItem(TUTORIAL_CONTACT_STORAGE_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+function readVisibleTutorialContact() {
+  const fromMessages = document
+    .querySelector<HTMLElement>('[data-tour="messages-contact-list"] [data-contact-id]')
+    ?.getAttribute("data-contact-id");
+  if (fromMessages) return setRememberedTutorialCustomer(fromMessages);
+  const fromFunnel = document.querySelector<HTMLElement>("[data-customer-id]")?.getAttribute("data-customer-id");
+  if (fromFunnel) return setRememberedTutorialCustomer(fromFunnel);
+  return "";
+}
+
+function rememberTutorialCustomer(customerId: unknown, result?: unknown) {
+  const customerIdText = setRememberedTutorialCustomer(customerId);
+  if (!customerIdText) return false;
+  if (result !== undefined) {
+    (window as unknown as { __tutorialFullFlow?: unknown }).__tutorialFullFlow = result;
+  }
+  window.dispatchEvent(new CustomEvent("kellai:onboarding:full-flow-ready", { detail: result }));
+  return true;
+}
+
+async function seedTutorialCustomerFromScriptedSimulation() {
+  const res = await client.post(
+    "/api/kellai/demo/simulate-customer-behavior",
+    { count: 8, scenario_set: "tutorial" },
+    { skipErrorToast: true, skipLoading: true, timeout: 60000 }
+  );
+  const result = extractResponseData(res);
+  const scenarios = Array.isArray(result?.scenario_results) ? result.scenario_results : [];
+  const signedScenario =
+    scenarios.find((item: any) => item?.passed && item?.final_stage === "signed" && Number(item?.customer_id) > 0) ||
+    scenarios.find((item: any) => item?.passed && Number(item?.customer_id) > 0) ||
+    scenarios.find((item: any) => Number(item?.customer_id) > 0);
+  if (!signedScenario || !rememberTutorialCustomer(signedScenario.customer_id, result)) {
+    return null;
+  }
+  return { result, scenario: signedScenario };
+}
+
+async function demoTutorialCustomerFullFlow(timers: ReturnType<typeof makeTimerGroup>): Promise<DemoResult> {
+  const btn = document.querySelector<HTMLElement>('[data-tour="dashboard-simulate-customer"]');
+  const anchor = btn || document.querySelector<HTMLElement>('[data-tour="dashboard-customer-workbench"]');
+
+  if (anchor) {
+    anchor.scrollIntoView({ behavior: "smooth", block: "center" });
+    timers.set(() => {
+      const cursor = (window as unknown as { virtualCursor?: { moveTo: (el: HTMLElement, opts?: { duration?: number; label?: string }) => void } }).virtualCursor;
+      if (cursor) cursor.moveTo(anchor, { duration: 700 * SPEED, label: "创建教程客户" });
+      anchor.style.transition = "outline .3s, outline-offset .3s, box-shadow .3s";
+      anchor.style.outline = "2px solid #10b981";
+      anchor.style.outlineOffset = "4px";
+      anchor.style.boxShadow = "0 0 0 6px rgba(16,185,129,.15)";
+    }, 100 * SPEED);
+  }
+
+  try {
+    const scriptedSeed = await seedTutorialCustomerFromScriptedSimulation();
+    if (scriptedSeed) {
+      timers.set(() => {
+        if (!anchor) return;
+        anchor.style.outline = "2px solid #059669";
+        anchor.style.boxShadow = "0 0 0 6px rgba(5,150,105,.18)";
+      }, 900 * SPEED);
+      timers.set(() => {
+        if (!anchor) return;
+        anchor.style.outline = "";
+        anchor.style.outlineOffset = "";
+        anchor.style.boxShadow = "";
+      }, 2600 * SPEED);
+      toastStore.show(`教学模式已创建 ${scriptedSeed.result?.summary?.total || 8} 个模拟客户场景`);
+      return {
+        ok: true,
+        fallbackMsg:
+          `教学模式已自动创建 <b>${scriptedSeed.result?.summary?.total || 8}</b> 个模拟客户场景，并选择客户 <b>#${scriptedSeed.scenario.customer_id}</b> 继续演示。<br/>` +
+          `后续步骤会直接使用这批入库客户验证消息、漏斗、客户详情和 AI 助手。` +
+          (!btn ? `<br/>提示：本次通过教程接口创建客户，不依赖进阶功能按钮。` : ""),
+      };
+    }
+    if (anchor) {
+      anchor.style.outline = "";
+      anchor.style.outlineOffset = "";
+      anchor.style.boxShadow = "";
+    }
+    return {
+      ok: false,
+      stop: true,
+      redirectPath: "/",
+      fallbackMsg: "无法创建教程客户。请确认后端服务已启动，再重新开始教学模式。",
+    };
+  } catch {
+    if (anchor) {
+      anchor.style.outline = "";
+      anchor.style.outlineOffset = "";
+      anchor.style.boxShadow = "";
+    }
+    return {
+      ok: false,
+      stop: true,
+      redirectPath: "/",
+      fallbackMsg: "无法连接客户行为模拟接口。请确认后端服务已启动。",
+    };
+  }
+}
 
 /** Step 1（设置·渠道管理）：演示「扫码授权」真实工作流
  *  真实链路：找到「企业微信」卡片 → 点「扫码授权」→ 弹窗出现 QR
@@ -118,11 +269,18 @@ function demoChannelBind(timers: ReturnType<typeof makeTimerGroup>): DemoResult 
     firstCard.style.outline = "2px solid #3b82f6";
     firstCard.style.outlineOffset = "4px";
   }, 1100 * SPEED);
-  // 3) 光标飞到"扫码授权"按钮并真实点击（视觉 + 真实 el.click）
-  timers.set(() => cursorClick(firstConfigBtn, "📱 扫码授权", 700 * SPEED), 1800 * SPEED);
-  // 4) 高亮弹出的 QR 码
-  // 时序：真实点击发生在 1800+700=2500*SPEED 时刻，React 渲染 modal 大约 1 帧，
-  // QR 码 3.5s 后自动跳到「已扫描」。我们在 3200*SPEED 高亮一下 QR 码，给用户聚焦。
+  // 3) 光标飞到"接入向导"按钮并真实点击（视觉 + 真实 el.click）
+  timers.set(() => cursorClick(firstConfigBtn, "📱 接入向导", 700 * SPEED), 1800 * SPEED);
+  // 4) 新主流程会先打开接入向导，再点一次「扫码授权」进入 QR。
+  timers.set(() => {
+    const scanBtn = document.querySelector<HTMLButtonElement>('[data-tour="channel-onboarding-scan"]');
+    if (scanBtn) {
+      cursorClick(scanBtn, "📱 扫码授权", 600 * SPEED);
+    }
+  }, 3200 * SPEED);
+  // 5) 高亮弹出的 QR 码
+  // 时序：真实点击发生在 1800+700=2500*SPEED 时刻，向导渲染后再点扫码，
+  // 因此在 4300*SPEED 高亮 QR 码，兼容旧的直接扫码弹窗和新的接入向导。
   timers.set(() => {
     const qr = document.querySelector<HTMLElement>('[data-tour="channel-qrcode"]');
     if (qr) {
@@ -132,8 +290,8 @@ function demoChannelBind(timers: ReturnType<typeof makeTimerGroup>): DemoResult 
     } else {
       console.warn("[onboarding] step1: QR 码未出现，跳过高亮");
     }
-  }, 3200 * SPEED);
-  // 5) 演示"等待扫码 → 已扫"的过渡：什么都不做，弹窗自带状态机会跑
+  }, 4300 * SPEED);
+  // 6) 演示"等待扫码 → 已扫"的过渡：什么都不做，弹窗自带状态机会跑
   //    教程在 7000*SPEED 左右关掉高亮，让用户知道流程已结束
   timers.set(() => {
     const qr = document.querySelector<HTMLElement>('[data-tour="channel-qrcode"]');
@@ -286,6 +444,7 @@ function demoFunnelDrag(timers: ReturnType<typeof makeTimerGroup>): DemoResult {
   }
   const customerId = card.getAttribute("data-customer-id");
   if (!customerId) return { ok: false, fallbackMsg: "客户卡片缺少 ID 数据" };
+  setRememberedTutorialCustomer(customerId);
 
   // 找到下一阶段列：找所有 stage 列，取 current+1
   const cols = document.querySelectorAll<HTMLElement>("[data-stage-id]");
@@ -374,26 +533,28 @@ function demoFunnelDrag(timers: ReturnType<typeof makeTimerGroup>): DemoResult {
 function demoMessages(timers: ReturnType<typeof makeTimerGroup>): DemoResult {
   const list = document.querySelector<HTMLElement>('[data-tour="messages-contact-list"]');
   if (!list) return { ok: false, fallbackMsg: "消息页面未加载，请刷新" };
+  const preferredContactId = readRememberedTutorialCustomer();
+  const contactSelector = preferredContactId
+    ? `[data-tour="messages-contact-list"] [data-contact-id="${preferredContactId}"]`
+    : '[data-tour="messages-contact-list"] [data-contact-id]';
 
   // 0) 轮询等待联系人列表加载完成（骨架屏 → 真实联系人）
   //    最多等 5*SPEED 秒；找到后设置 __tutorialFirstContact
   let contactPollElapsed = 0;
   const contactPollMax = 5000 * SPEED;
   timers.set(function pollContact() {
-    const firstContactEl = document.querySelector<HTMLElement>(
-      '[data-tour="messages-contact-list"] [data-contact-id]'
-    );
+    const firstContactEl = document.querySelector<HTMLElement>(contactSelector) ||
+      document.querySelector<HTMLElement>('[data-tour="messages-contact-list"] [data-contact-id]');
     if (firstContactEl) {
       const cid = firstContactEl.getAttribute("data-contact-id");
-      (window as unknown as { __tutorialFirstContact?: string | null }).__tutorialFirstContact = cid;
+      setRememberedTutorialCustomer(cid);
       return;
     }
     contactPollElapsed += 200 * SPEED;
     if (contactPollElapsed < contactPollMax) {
       timers.set(pollContact, 200 * SPEED);
     } else {
-      // 超时：设一个 fallback，让 step 6 至少能导航到 /customers/1001
-      (window as unknown as { __tutorialFirstContact?: string | null }).__tutorialFirstContact = null;
+      // 超时：保留前面步骤记住的客户；没有则详情页走 fallback。
     }
   }, 100 * SPEED);
 
@@ -402,9 +563,8 @@ function demoMessages(timers: ReturnType<typeof makeTimerGroup>): DemoResult {
   //    但这里加一层保险：如果还没出现就等一下再试
   timers.set(() => {
     const tryClickContact = () => {
-      const firstContact = document.querySelector<HTMLElement>(
-        '[data-tour="messages-contact-list"] [data-contact-id]'
-      );
+      const firstContact = document.querySelector<HTMLElement>(contactSelector) ||
+        document.querySelector<HTMLElement>('[data-tour="messages-contact-list"] [data-contact-id]');
       if (firstContact) {
         firstContact.style.transition = "background .3s";
         firstContact.style.background = "#dbeafe";
@@ -647,29 +807,46 @@ export default function OnboardingTutorial() {
   const pausedRef = useRef(false);
   const skipRequestedRef = useRef(false);
   const currentStepRef = useRef(0);
+  const speechHoldUntilRef = useRef(0);
   const active = useOnboardingStore((s) => s.active);
+  const setActive = useOnboardingStore((s) => s.setActive);
   const markCompleted = useOnboardingStore((s) => s.markCompleted);
   const markSkipped = useOnboardingStore((s) => s.markSkipped);
+  const setAdvancedPanelOpen = useAdvancedPanelStore((s) => s.setOpen);
   const navigate = useNavigate();
   // 关键修复：useNavigate() 在 Declarative 模式下每次渲染返回新引用，
   // 放进 useEffect 依赖会触发 effect 反复 cleanup / 重跑，把 runStep 链斩断。
   // 用 ref 持有最新值，effect 只依赖真正"会变化"的项。
   const navigateRef = useRef(navigate);
   navigateRef.current = navigate;
+  const speech = useTextToSpeech();
+  const speechRef = useRef(speech);
+  speechRef.current = speech;
 
   /** 教程步骤定义（独立于 driver 实例，避免从 driver 内部读取 steps） */
   const TOUR_STEPS: DriveStep[] = [
     /* ===== Step 0 - 欢迎 ===== */
     {
       popover: {
-        title: "欢迎使用客来来",
-        description:
-          "接下来 <b>90 秒</b>，按实际使用顺序演示核心功能：\n\n<b>1.</b> 接入渠道 → 配置 AI\n<b>2.</b> 工作台、漏斗、消息\n<b>3.</b> 自动销售流程 (v3)\n<b>4.</b> 开放平台生态 (v8)\n<b>5.</b> ⌘K 搜索\n\n按顺序走完即可上手。",
+        title: ONBOARDING_WELCOME_TITLE,
+        description: ONBOARDING_WELCOME_DESCRIPTION,
         align: "center",
       },
     },
 
-    /* ===== Step 1 - 设置·渠道管理 ===== */
+    /* ===== Step 1 - 模拟客户全流程闭环 ===== */
+    {
+      element: '[data-tour="dashboard-customer-workbench"]',
+      popover: {
+        title: "模拟客户全流程闭环",
+        description:
+          "我会自动创建夜间咨询、复购、比价、签约、付款后交付等客户行为，并把消息、客户档案和漏斗阶段全部写入系统。\n\n通过后，后面的消息中心和客户详情会继续使用这些测试客户。",
+        side: "bottom",
+        align: "end",
+      },
+    },
+
+    /* ===== Step 2 - 设置·渠道管理 ===== */
     {
       element: '[data-tour="settings-channels"]',
       popover: {
@@ -681,7 +858,7 @@ export default function OnboardingTutorial() {
       },
     },
 
-    /* ===== Step 2 - 设置·AI 助手 ===== */
+    /* ===== Step 3 - 设置·AI 助手 ===== */
     {
       element: '[data-tour="settings-channels"]',
       popover: {
@@ -693,7 +870,7 @@ export default function OnboardingTutorial() {
       },
     },
 
-    /* ===== Step 3 - 工作台 ===== */
+    /* ===== Step 4 - 工作台 ===== */
     {
       element: '[data-tour="dashboard-todo"]',
       popover: {
@@ -705,7 +882,7 @@ export default function OnboardingTutorial() {
       },
     },
 
-    /* ===== Step 4 - 漏斗 ===== */
+    /* ===== Step 5 - 漏斗 ===== */
     {
       element: '[data-tour="funnel-board"]',
       popover: {
@@ -717,7 +894,7 @@ export default function OnboardingTutorial() {
       },
     },
 
-    /* ===== Step 5 - 消息中心 ===== */
+    /* ===== Step 6 - 消息中心 ===== */
     {
       element: '[data-tour="messages-contact-list"]',
       popover: {
@@ -729,7 +906,7 @@ export default function OnboardingTutorial() {
       },
     },
 
-    /* ===== Step 6 - 客户详情 ===== */
+    /* ===== Step 7 - 客户详情 ===== */
     {
       element: '[data-tour="customer-detail"]',
       popover: {
@@ -741,7 +918,7 @@ export default function OnboardingTutorial() {
       },
     },
 
-    /* ===== Step 7 - AI 助手 ===== */
+    /* ===== Step 8 - AI 助手 ===== */
     {
       element: '[data-tour="ai-analyze"]',
       popover: {
@@ -753,7 +930,7 @@ export default function OnboardingTutorial() {
       },
     },
 
-    /* ===== Step 8 - 自动销售流程 (v3) ===== */
+    /* ===== Step 9 - 自动销售流程 (v3) ===== */
     {
       element: '[data-tour="sales-flow-wizard"]',
       popover: {
@@ -765,7 +942,7 @@ export default function OnboardingTutorial() {
       },
     },
 
-    /* ===== Step 9 - 开放平台 (v8) ===== */
+    /* ===== Step 10 - 开放平台 (v8) ===== */
     {
       element: '[data-tour="open-platform-home"]',
       popover: {
@@ -777,7 +954,7 @@ export default function OnboardingTutorial() {
       },
     },
 
-    /* ===== Step 10 - 全局搜索 ===== */
+    /* ===== Step 11 - 全局搜索 ===== */
     {
       element: '[data-tour="topbar-search"]',
       popover: {
@@ -789,7 +966,7 @@ export default function OnboardingTutorial() {
       },
     },
 
-    /* ===== Step 11 - 收尾 ===== */
+    /* ===== Step 12 - 收尾 ===== */
     {
       popover: {
         title: "引导完成",
@@ -805,6 +982,7 @@ export default function OnboardingTutorial() {
    * 完全不依赖 driver.js 的 onNextClick（按钮已隐藏） */
   useEffect(() => {
     if (active) {
+      setAdvancedPanelOpen(true);
       // 1) 清理旧实例（如有）
       if (driverRef.current) {
         try {
@@ -823,18 +1001,26 @@ export default function OnboardingTutorial() {
       type StepSchedule = {
         path: string; // 导航目标（先 navigate 再等元素）
         waitFor: string; // 等这个 selector 出现再跑 demo
-        demo: (timers: ReturnType<typeof makeTimerGroup>) => { ok: boolean; fallbackMsg?: string };
+        waitTimeout?: number; // 个别真实页面接口多，需要更长等待
+        demo: (timers: ReturnType<typeof makeTimerGroup>) => DemoResult | Promise<DemoResult>;
         duration: number; // 演示完后等多久进下一步
       };
       const SCHEDULE: StepSchedule[] = [
         // Step 0: 欢迎 — 给足时间读（之前 1500ms 太短）
         {
           path: "/",
-          waitFor: '[data-tour="dashboard-todo"]',
+          waitFor: "body",
           demo: () => ({ ok: true }),
           duration: 4500 * SPEED,
         },
-        // Step 1: 设置 → 渠道管理（必须先配，漏斗/消息才有数据来源）
+        // Step 1: 模拟客户行为闭环（先生成真实入库数据，保证教程不被 LLM Key 阻塞）
+        {
+          path: "/",
+          waitFor: '[data-tour="dashboard-customer-workbench"]',
+          demo: (t) => demoTutorialCustomerFullFlow(t),
+          duration: 3500 * SPEED,
+        },
+        // Step 2: 设置 → 渠道管理（必须先配，漏斗/消息才有数据来源）
         // 扫码流程：点击 + 等待 3.5s + 已扫 2s + 成功 1.2s ≈ 9s
         {
           path: "/settings?tab=channels",
@@ -842,7 +1028,7 @@ export default function OnboardingTutorial() {
           demo: (t) => demoChannelBind(t),
           duration: 9000 * SPEED,
         },
-        // Step 2: 设置 → AI 助手（配 LLM，后面 AI 功能才工作）
+        // Step 3: 设置 → AI 助手（配 LLM，后面 AI 功能才工作）
         // 不导航到 /settings?tab=ai（React Router 同路由 searchParams 变化可能不触发 re-render），
         // 而是留在 /settings，demo 函数会直接点击 AI tab 按钮
         {
@@ -851,14 +1037,14 @@ export default function OnboardingTutorial() {
           demo: (t) => demoAiSetup(t),
           duration: 5500 * SPEED,
         },
-        // Step 3: 工作台（4 大模块总览）
+        // Step 4: 工作台（4 大模块总览）
         {
           path: "/",
           waitFor: '[data-tour="dashboard-todo"]',
           demo: (t) => demoDashboard(t),
           duration: 4500 * SPEED,
         },
-        // Step 4: 漏斗（拖卡片改阶段）
+        // Step 5: 漏斗（拖卡片改阶段）
         // 修复：waitFor 改为等客户卡片出现，而非只等看板容器（卡片是异步加载的）
         {
           path: "/funnel",
@@ -866,7 +1052,7 @@ export default function OnboardingTutorial() {
           demo: (t) => demoFunnelDrag(t),
           duration: 3500 * SPEED,
         },
-        // Step 5: 消息（AI 话术）— AI 填入可能耗时较长，给够 9s 看完整流程
+        // Step 6: 消息（AI 话术）— AI 填入可能耗时较长，给够 9s 看完整流程
         // 修复：waitFor 改为等联系人出现，而非只等列表容器（联系人是异步加载的）
         {
           path: "/messages",
@@ -874,7 +1060,7 @@ export default function OnboardingTutorial() {
           demo: (t) => demoMessages(t),
           duration: 9000 * SPEED,
         },
-        // Step 6: 客户详情（360° 画像 + 销售 Tab + LTV 预测）
+        // Step 7: 客户详情（360° 画像 + 销售 Tab + LTV 预测）
         // 路径用 Step 5 抓到的真实 contact id，不写死 1（之前写死 /customers/1
         //  经常撞到不存在的客户，详情页 fallback 走"客户不存在"空态）
         // 修复：fallback 改为 /customers/1001（mock 数据第一个客户），而非 /customers（无 id 时
@@ -882,38 +1068,39 @@ export default function OnboardingTutorial() {
         {
           path: "__USE_FIRST_CONTACT__",
           waitFor: '[data-tour="customer-detail"]',
+          waitTimeout: 25000,
           demo: (t) => demoCustomerDetail(t),
           duration: 4500 * SPEED,
         },
-        // Step 7: AI 助手（分析意图）— 轮询等客户选项 + 打字 + 分析，给够 8s
+        // Step 8: AI 助手（分析意图）— 轮询等客户选项 + 打字 + 分析，给够 8s
         {
           path: "/ai",
           waitFor: '[data-tour="ai-analyze"]',
           demo: (t) => demoAiAssistant(t),
           duration: 8000 * SPEED,
         },
-        // Step 8: 自动销售流程 (v3)
+        // Step 9: 自动销售流程 (v3)
         {
           path: "/sales/flow",
           waitFor: '[data-tour="sales-flow-wizard"]',
           demo: () => ({ ok: true }),
           duration: 4000 * SPEED,
         },
-        // Step 9: 开放平台 (v8)
+        // Step 10: 开放平台 (v8)
         {
           path: "/open",
           waitFor: '[data-tour="open-platform-home"]',
           demo: () => ({ ok: true }),
           duration: 4000 * SPEED,
         },
-        // Step 10: 全局搜索（⌘K）
+        // Step 11: 全局搜索（⌘K）
         {
           path: "/",
           waitFor: '[data-tour="topbar-search"]',
           demo: (t) => demoGlobalSearch(t),
           duration: 2500 * SPEED,
         },
-        // Step 11: 收尾（带 CTA）
+        // Step 12: 收尾（带 CTA）
         {
           path: "/",
           waitFor: "body",
@@ -951,7 +1138,7 @@ export default function OnboardingTutorial() {
         //    而非 /customers（无 id 时详情页不渲染 data-tour="customer-detail"）
         let realPath = step.path;
         if (step.path === "__USE_FIRST_CONTACT__") {
-          const cid = (window as unknown as { __tutorialFirstContact?: string | null }).__tutorialFirstContact;
+          const cid = readRememberedTutorialCustomer() || readVisibleTutorialContact();
           realPath = cid ? `/customers/${cid}` : "/customers/1001";
         }
 
@@ -968,7 +1155,7 @@ export default function OnboardingTutorial() {
 
         // c) poll for element（最多 10s，Settings tab 切换需要 React 渲染新内容）
         const start = Date.now();
-        const timeout = 10000;
+        const timeout = step.waitTimeout ?? 10000;
         let elementFound = false;
         while (!cancelled && Date.now() - start < timeout) {
           if (step.waitFor === "body" || document.querySelector(step.waitFor)) {
@@ -986,6 +1173,61 @@ export default function OnboardingTutorial() {
 
         // d) ★ 每步销毁旧 driver + 重建单步 driver + drive()
         const stepDef = TOUR_STEPS[idx];
+        const speechText = buildTourSpeechText(stepDef);
+        let speechDone = !speechText;
+        speechHoldUntilRef.current = 0;
+        const holdForCurrentSpeech = (durationSeconds?: number | null) => {
+          if (!speechText) return;
+          speechHoldUntilRef.current = Math.max(
+            speechHoldUntilRef.current,
+            Date.now() + estimateSpeechHoldMs(speechText, durationSeconds)
+          );
+        };
+        const welcomePreplayedUntil =
+          idx === 0
+            ? Number((window as OnboardingSpeechWindow).__kellaiOnboardingWelcomePreplayedUntil || 0)
+            : 0;
+        const welcomeAlreadyPlaying = Boolean(speechText && idx === 0 && welcomePreplayedUntil > Date.now());
+        if (welcomeAlreadyPlaying) {
+          speechDone = true;
+          speechHoldUntilRef.current = Math.max(speechHoldUntilRef.current, welcomePreplayedUntil);
+        }
+        const playSpeechForStep = async (replayBtn?: HTMLButtonElement) => {
+          if (!speechText) return false;
+          let playbackStarted = false;
+          if (replayBtn) {
+            replayBtn.textContent = "生成中...";
+            replayBtn.title = "正在生成当前步骤语音";
+          }
+          const ok = await speechRef.current.speak(speechText, {
+            preferLocal: true,
+            waitForEnd: true,
+            cacheKey: idx === 0 ? ONBOARDING_WELCOME_CACHE_KEY : undefined,
+            onPlaybackStart: (info) => {
+              playbackStarted = true;
+              holdForCurrentSpeech(info.durationSeconds);
+              if (replayBtn) {
+                replayBtn.textContent = "播放中";
+                replayBtn.title = "语音正在播放，画面会等本段播完";
+              }
+            },
+            onPlaybackEnd: () => {
+              if (replayBtn) {
+                replayBtn.textContent = "重播语音";
+                replayBtn.title = "";
+              }
+            },
+          });
+          if (!ok || !playbackStarted) {
+            holdForCurrentSpeech(null);
+          }
+          if (replayBtn && (!ok || !playbackStarted)) {
+            const errorText = speechRef.current.lastError || "浏览器未允许自动播放，请点击播放语音";
+            replayBtn.textContent = "点击播放语音";
+            replayBtn.title = errorText;
+          }
+          return ok;
+        };
 
         // 销毁旧 driver
         if (driverRef.current) {
@@ -1010,9 +1252,11 @@ export default function OnboardingTutorial() {
           popoverClass: "kellai-tour-popover",
           onDestroyed: () => {
             if (timersRef.current) timersRef.current.clear();
+            speechRef.current.stop();
           },
           onCloseClick: () => {
             if (timersRef.current) timersRef.current.clear();
+            speechRef.current.stop();
             try { window.virtualCursor?.hide(); } catch { /* ignore */ }
             try { document.body.classList.remove("tutorial-active"); } catch { /* ignore */ }
             try { driverRef.current?.destroy(); } catch { /* ignore */ }
@@ -1037,6 +1281,10 @@ export default function OnboardingTutorial() {
                   display:flex; justify-content:space-between; align-items:center;
                   margin-top:12px; padding-top:10px; border-top:1px dashed #e2e8f0;
                 `;
+                const leftCtl = document.createElement("div");
+                leftCtl.style.cssText = `
+                  display:flex; align-items:center; gap:6px;
+                `;
                 const pauseBtn = document.createElement("button");
                 pauseBtn.className = "kellai-tour-btn-pause";
                 pauseBtn.type = "button";
@@ -1059,7 +1307,27 @@ export default function OnboardingTutorial() {
                 pauseBtn.onmouseout = () => (pauseBtn.style.background = "transparent");
                 pauseBtn.onclick = () => {
                   pausedRef.current = !pausedRef.current;
+                  if (pausedRef.current) {
+                    speechRef.current.stop();
+                  } else {
+                    void playSpeechForStep();
+                  }
                   updatePauseUI();
+                };
+
+                const replayBtn = document.createElement("button");
+                replayBtn.type = "button";
+                replayBtn.setAttribute("aria-label", "重播当前步骤语音");
+                replayBtn.textContent = "重播语音";
+                replayBtn.style.cssText = `
+                  background:transparent; border:none; cursor:pointer;
+                  font-size:12px; padding:4px 8px; border-radius:4px;
+                  color:#2563eb; transition:background .15s;
+                `;
+                replayBtn.onmouseover = () => (replayBtn.style.background = "#eff6ff");
+                replayBtn.onmouseout = () => (replayBtn.style.background = "transparent");
+                replayBtn.onclick = () => {
+                  void playSpeechForStep(replayBtn);
                 };
 
                 const skipBtn = document.createElement("button");
@@ -1077,7 +1345,9 @@ export default function OnboardingTutorial() {
                   skipRequestedRef.current = true;
                 };
 
-                ctl.appendChild(pauseBtn);
+                leftCtl.appendChild(pauseBtn);
+                leftCtl.appendChild(replayBtn);
+                ctl.appendChild(leftCtl);
                 ctl.appendChild(skipBtn);
                 popoverEl.appendChild(ctl);
                 updatePauseUI();
@@ -1104,6 +1374,7 @@ export default function OnboardingTutorial() {
                   cta.style.boxShadow = "0 4px 12px rgba(59,130,246,.35)";
                 };
                 cta.onclick = () => {
+                  speechRef.current.stop();
                   markCompleted();
                   try { driverRef.current?.destroy(); } catch { /* ignore */ }
                   try { navigateRef.current("/funnel"); } catch { /* ignore */ }
@@ -1120,13 +1391,47 @@ export default function OnboardingTutorial() {
         }
         // 等 driver.js 渲染完 popover + 蒙版
         await sleep(100);
+        if (speechText && welcomeAlreadyPlaying) {
+          const replayBtn = document.querySelector<HTMLButtonElement>(
+            '.driver-popover.kellai-tour-popover [aria-label="重播当前步骤语音"]'
+          );
+          if (replayBtn) {
+            replayBtn.textContent = "播放中";
+            replayBtn.title = "语音正在播放，画面会等本段播完";
+            window.setTimeout(() => {
+              if (replayBtn.textContent === "播放中") {
+                replayBtn.textContent = "重播语音";
+                replayBtn.title = "";
+              }
+            }, Math.max(500, welcomePreplayedUntil - Date.now()));
+          }
+        } else if (speechText) {
+          const replayBtn = document.querySelector<HTMLButtonElement>(
+            '.driver-popover.kellai-tour-popover [aria-label="重播当前步骤语音"]'
+          );
+          void playSpeechForStep(replayBtn || undefined).then((ok) => {
+            if (!ok) {
+              console.warn("[onboarding] tour speech failed", speechRef.current.lastError);
+              const currentReplayBtn = document.querySelector<HTMLButtonElement>(
+                '.driver-popover.kellai-tour-popover [aria-label="重播当前步骤语音"]'
+              );
+              if (currentReplayBtn) {
+                currentReplayBtn.textContent = "点击播放语音";
+                currentReplayBtn.title = speechRef.current.lastError || "浏览器未允许自动播放，请点击播放语音";
+              }
+            }
+            return ok;
+          }).finally(() => {
+            speechDone = true;
+          });
+        }
 
         // e) run demo（在正确的蒙版下执行动画）
         const t = makeTimerGroup();
         timersRef.current = t;
         let demoResult: DemoResult = { ok: true };
         try {
-          demoResult = step.demo(t);
+          demoResult = await step.demo(t);
         } catch (e) {
           console.warn(`[onboarding] step ${idx} demo failed`, e);
           demoResult = { ok: false, fallbackMsg: "演示遇到问题，已跳过这一步。" };
@@ -1140,6 +1445,19 @@ export default function OnboardingTutorial() {
             desc.innerHTML = `<div style="color:#f59e0b;font-weight:600">⚠️ 这一步的演示没成功</div><div style="margin-top:4px;font-size:12px">${demoResult.fallbackMsg}</div>`;
           }
         }
+        if (!demoResult.ok && demoResult.stop) {
+          await sleep(2800 * SPEED);
+          if (cancelled) return;
+          cancelled = true;
+          if (timersRef.current) timersRef.current.clear();
+          speechRef.current.stop();
+          try { window.virtualCursor?.hide(); } catch { /* ignore */ }
+          try { document.body.classList.remove("tutorial-active"); } catch { /* ignore */ }
+          try { driverRef.current?.destroy(); } catch { /* ignore */ }
+          try { navigateRef.current(demoResult.redirectPath || "/settings?tab=ai"); } catch { /* ignore */ }
+          setActive(false);
+          return;
+        }
 
         // f) 等 duration（期间检查暂停 / 跳过）
         if (idx === SCHEDULE.length - 1) {
@@ -1148,10 +1466,17 @@ export default function OnboardingTutorial() {
         }
         const dur = demoResult.ok ? step.duration : 2000 * SPEED;
         const stepStart = Date.now();
-        while (!cancelled && Date.now() - stepStart < dur) {
+        while (!cancelled) {
           await waitWhilePaused();
           if (skipRequestedRef.current) {
             skipRequestedRef.current = false;
+            break;
+          }
+          const durationDone = Date.now() - stepStart >= dur;
+          const speechHoldDone =
+            !speechText ||
+            (speechHoldUntilRef.current > 0 && Date.now() >= speechHoldUntilRef.current);
+          if (durationDone && speechDone && speechHoldDone) {
             break;
           }
           await sleep(120);
@@ -1180,6 +1505,7 @@ export default function OnboardingTutorial() {
         },
         cta: () => {
           // 收尾 CTA：完成 + 销毁当前 driver + 跳漏斗
+          speechRef.current.stop();
           markCompleted();
           try {
             driverRef.current?.destroy();
@@ -1198,6 +1524,7 @@ export default function OnboardingTutorial() {
         cancelled = true;
         clearTimeout(startTimer);
         if (timersRef.current) timersRef.current.clear();
+        speechRef.current.stop();
         pausedRef.current = false;
         skipRequestedRef.current = false;
         // 销毁当前 driver 实例（蒙版 + popover）
@@ -1220,15 +1547,17 @@ export default function OnboardingTutorial() {
       };
     } else {
       if (timersRef.current) timersRef.current.clear();
+      speechRef.current.stop();
       // active 变 false 时也确保清掉 class
       try { document.body.classList.remove("tutorial-active"); } catch { /* ignore */ }
     }
-  }, [active, markCompleted, markSkipped]);
+  }, [active, markCompleted, markSkipped, setActive, setAdvancedPanelOpen]);
 
   // 组件卸载时清理
   useEffect(() => {
     return () => {
       if (timersRef.current) timersRef.current.clear();
+      speechRef.current.stop();
       if (driverRef.current) {
         try {
           driverRef.current.destroy();

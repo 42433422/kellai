@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 260" role="img" aria-label="客来来商标候选 06">
+  <defs>
+    <linearGradient id="wordAccent" x1="138" y1="186" x2="578" y2="186" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2563eb"/>
+      <stop offset="0.48" stop-color="#06b6d4"/>
+      <stop offset="1" stop-color="#10b981"/>
+    </linearGradient>
+  </defs>
+  <rect width="900" height="260" fill="#ffffff"/>
+  <text x="138" y="142" fill="#0f172a" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, Heiti SC, Arial Unicode MS, sans-serif" font-size="108" font-weight="900" letter-spacing="2">客来来</text>
+  <path d="M146 181h424" stroke="url(#wordAccent)" stroke-width="16" stroke-linecap="round"/>
+  <path d="M608 74h92c30 0 54 24 54 54v18c0 30-24 54-54 54h-33l-58 40v-40h-1c-30 0-54-24-54-54v-18c0-30 24-54 54-54z" fill="#0f172a"/>
+  <circle cx="626" cy="138" r="9" fill="#ffffff"/>
+  <circle cx="656" cy="138" r="9" fill="#ffffff"/>
+  <circle cx="686" cy="138" r="9" fill="#ffffff"/>
+  <text x="140" y="222" fill="#64748b" font-family="Inter, Arial, sans-serif" font-size="25" font-weight="700" letter-spacing="4">KELAILAI GROWTH CRM</text>
+</svg>

@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { Outlet, useNavigate, useLocation } from "react-router-dom";
 import {
   LayoutDashboard,
@@ -35,12 +35,14 @@ import {
   Puzzle,
   Code,
   BookOpen,
+  Sparkles,
   type LucideIcon,
 } from "lucide-react";
 import { useAuthStore } from "../stores/auth";
 import { useThemeStore } from "../stores/theme";
 import { useMessageStore, selectUnreadTotal } from "../stores/message";
 import { useOnboardingStore } from "../stores/onboarding";
+import { useAdvancedPanelStore } from "../stores/advancedPanel";
 import { clsx } from "clsx";
 import SearchModal from "./SearchModal";
 import NotificationDropdown from "./NotificationDropdown";
@@ -49,6 +51,13 @@ import NavGroup from "./NavGroup";
 import OnboardingTutorial from "./OnboardingTutorial";
 import OnboardingStartPanel from "./OnboardingStartPanel";
 import VirtualCursor from "./VirtualCursor";
+import { ONBOARDING_WELCOME_CACHE_KEY, ONBOARDING_WELCOME_SPEECH_TEXT } from "../constants/onboardingTour";
+import { playPreparedTextToSpeech, preloadTextToSpeech, unlockTextToSpeechAudio } from "../hooks/useTextToSpeech";
+import { estimateSpeechHoldMs } from "../utils/onboardingSpeech";
+
+type OnboardingSpeechWindow = Window & {
+  __kellaiOnboardingWelcomePreplayedUntil?: number;
+};
 
 /** 侧边栏导航项配置 */
 type NavConfig = {
@@ -68,6 +77,12 @@ const coreNavConfig: NavConfig[] = [
   { to: "/ai", icon: Bot, label: "AI 助手", badgeFrom: () => 0, tour: "nav-ai" },
   { to: "/settings", icon: Settings, label: "设置", badgeFrom: () => 0, tour: "nav-settings" },
 ];
+
+const advancedPathPrefixes = ["/sales", "/content", "/scout", "/flow", "/finance", "/open"];
+
+function isAdvancedPath(pathname: string): boolean {
+  return advancedPathPrefixes.some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`));
+}
 
 /** 面包屑映射 */
 export const breadcrumbMap: Record<string, string> = {
@@ -113,15 +128,47 @@ export default function Layout() {
   const unreadTotal = useMessageStore(selectUnreadTotal);
   const unreadByCustomer = useMessageStore((s) => s.unreadByCustomer);
   const messageState = { unreadTotal, unreadByCustomer };
+  const advancedOpen = useAdvancedPanelStore((s) => s.open);
+  const setAdvancedOpen = useAdvancedPanelStore((s) => s.setOpen);
   const navigate = useNavigate();
   const location = useLocation();
 
+  const onboardingActive = useOnboardingStore((s) => s.active);
   const setOnboardingActive = useOnboardingStore((s) => s.setActive);
   const resetOnboarding = useOnboardingStore((s) => s.reset);
-  const startOnboarding = (v: boolean) => {
-    if (v) resetOnboarding();
-    setOnboardingActive(v);
-  };
+  useEffect(() => {
+    void preloadTextToSpeech(ONBOARDING_WELCOME_SPEECH_TEXT, ONBOARDING_WELCOME_CACHE_KEY);
+  }, []);
+
+  const startOnboarding = useCallback(() => {
+    unlockTextToSpeechAudio();
+    const speechWindow = window as OnboardingSpeechWindow;
+    const fallbackUntil = Date.now() + estimateSpeechHoldMs(ONBOARDING_WELCOME_SPEECH_TEXT, null);
+    const preplayed = playPreparedTextToSpeech(
+      ONBOARDING_WELCOME_SPEECH_TEXT,
+      ONBOARDING_WELCOME_CACHE_KEY,
+      {
+        onPlaybackStart: (info) => {
+          speechWindow.__kellaiOnboardingWelcomePreplayedUntil =
+            Date.now() + estimateSpeechHoldMs(ONBOARDING_WELCOME_SPEECH_TEXT, info.durationSeconds);
+        },
+        onPlaybackError: () => {
+          speechWindow.__kellaiOnboardingWelcomePreplayedUntil = 0;
+        },
+      }
+    );
+    if (preplayed) {
+      speechWindow.__kellaiOnboardingWelcomePreplayedUntil = fallbackUntil;
+    } else {
+      void preloadTextToSpeech(ONBOARDING_WELCOME_SPEECH_TEXT, ONBOARDING_WELCOME_CACHE_KEY);
+    }
+    resetOnboarding();
+    setAdvancedOpen(true);
+    setOnboardingActive(false);
+    window.setTimeout(() => {
+      setOnboardingActive(true);
+    }, 0);
+  }, [resetOnboarding, setAdvancedOpen, setOnboardingActive]);
 
   const handleLogout = () => {
     logout();
@@ -151,6 +198,25 @@ export default function Layout() {
 
   const currentBreadcrumb = resolveBreadcrumb(location.pathname);
   const isDark = applied === "dark";
+  const advancedActive = isAdvancedPath(location.pathname);
+
+  useEffect(() => {
+    if (onboardingActive) return;
+    if (advancedActive) {
+      setAdvancedOpen(true);
+      return;
+    }
+    if (location.pathname === "/" && !location.search) {
+      setAdvancedOpen(false);
+    }
+  }, [advancedActive, location.pathname, location.search, onboardingActive, setAdvancedOpen]);
+
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    if (params.get("tour") !== "1") return;
+    startOnboarding();
+    navigate(location.pathname || "/", { replace: true });
+  }, [location.pathname, location.search, navigate, startOnboarding]);
 
   return (
     <div className="flex h-screen bg-gray-50 dark:bg-slate-900">
@@ -169,16 +235,12 @@ export default function Layout() {
         >
           {!collapsed && (
             <div className="flex items-center gap-2.5">
-              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-blue-500 to-indigo-600">
-                <span className="text-sm font-bold text-white">客</span>
-              </div>
+              <img src="/brand/kellai-mark.svg" alt="" className="h-8 w-8 rounded-lg" />
               <span className="text-base font-bold text-slate-900 dark:text-white">客来来</span>
             </div>
           )}
           {collapsed && (
-            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-blue-500 to-indigo-600">
-              <span className="text-sm font-bold text-white">客</span>
-            </div>
+            <img src="/brand/kellai-mark.svg" alt="" className="h-8 w-8 rounded-lg" />
           )}
         </div>
 
@@ -196,75 +258,79 @@ export default function Layout() {
             />
           ))}
 
-          <NavGroup
-            id="sales"
-            label="销售增长"
-            icon={TrendingUp}
-            collapsed={collapsed}
-            defaultOpen
-            items={[
-              { to: "/sales/flow", icon: GitBranch, label: "自动销售", dataTour: "nav-sales-flow" },
-              { to: "/sales/performance", icon: BarChart3, label: "业绩看板", dataTour: "nav-sales-performance" },
-            ]}
-          />
-          <NavGroup
-            id="content"
-            label="内容矩阵"
-            icon={PenTool}
-            collapsed={collapsed}
-            items={[
-              { to: "/content/studio", icon: PenTool, label: "内容创作" },
-              { to: "/content/analytics", icon: LineChart, label: "效果分析" },
-            ]}
-          />
-          <NavGroup
-            id="scout"
-            label="精准猎手"
-            icon={Crosshair}
-            collapsed={collapsed}
-            items={[
-              { to: "/scout/hunter", icon: Radar, label: "猎手巡检" },
-              { to: "/scout/sentiment", icon: Activity, label: "舆情监控" },
-            ]}
-          />
-          <NavGroup
-            id="flow"
-            label="流程闭环"
-            icon={Workflow}
-            collapsed={collapsed}
-            items={[
-              { to: "/flow/designer", icon: Workflow, label: "流程设计" },
-              { to: "/flow/monitor", icon: Activity, label: "流程监控" },
-              { to: "/flow/templates", icon: LayoutTemplate, label: "模板市场" },
-            ]}
-          />
-          <NavGroup
-            id="finance"
-            label="智能财务"
-            icon={Wallet}
-            collapsed={collapsed}
-            items={[
-              { to: "/finance/dashboard", icon: Wallet, label: "财务看板" },
-              { to: "/finance/ai", icon: Brain, label: "AI 财务" },
-              { to: "/finance/performance", icon: Trophy, label: "绩效看板" },
-            ]}
-          />
-          <NavGroup
-            id="open"
-            label="开放平台"
-            icon={Globe}
-            collapsed={collapsed}
-            items={[
-              { to: "/open", icon: Globe, label: "生态首页" },
-              { to: "/open/plugins", icon: Puzzle, label: "插件市场" },
-              { to: "/open/developer", icon: Code, label: "开发者" },
-              { to: "/open/app-builder", icon: Zap, label: "应用构建" },
-              { to: "/open/docs", icon: BookOpen, label: "API 文档" },
-            ]}
-          />
+          {advancedOpen && (
+            <div className={clsx("space-y-1", !collapsed && "border-l border-slate-200 pl-2 dark:border-slate-700")}>
+              <NavGroup
+                id="sales"
+                label="销售增长"
+                icon={TrendingUp}
+                collapsed={collapsed}
+                defaultOpen
+                items={[
+                  { to: "/sales/flow", icon: GitBranch, label: "自动销售", dataTour: "nav-sales-flow" },
+                  { to: "/sales/performance", icon: BarChart3, label: "业绩看板", dataTour: "nav-sales-performance" },
+                ]}
+              />
+              <NavGroup
+                id="content"
+                label="内容矩阵"
+                icon={PenTool}
+                collapsed={collapsed}
+                items={[
+                  { to: "/content/studio", icon: PenTool, label: "内容创作" },
+                  { to: "/content/analytics", icon: LineChart, label: "效果分析" },
+                ]}
+              />
+              <NavGroup
+                id="scout"
+                label="精准猎手"
+                icon={Crosshair}
+                collapsed={collapsed}
+                items={[
+                  { to: "/scout/hunter", icon: Radar, label: "猎手巡检" },
+                  { to: "/scout/sentiment", icon: Activity, label: "舆情监控" },
+                ]}
+              />
+              <NavGroup
+                id="flow"
+                label="流程闭环"
+                icon={Workflow}
+                collapsed={collapsed}
+                items={[
+                  { to: "/flow/designer", icon: Workflow, label: "流程设计" },
+                  { to: "/flow/monitor", icon: Activity, label: "流程监控" },
+                  { to: "/flow/templates", icon: LayoutTemplate, label: "模板市场" },
+                ]}
+              />
+              <NavGroup
+                id="finance"
+                label="智能财务"
+                icon={Wallet}
+                collapsed={collapsed}
+                items={[
+                  { to: "/finance/dashboard", icon: Wallet, label: "财务看板" },
+                  { to: "/finance/ai", icon: Brain, label: "AI 财务" },
+                  { to: "/finance/performance", icon: Trophy, label: "绩效看板" },
+                ]}
+              />
+              <NavGroup
+                id="open"
+                label="开放平台"
+                icon={Globe}
+                collapsed={collapsed}
+                items={[
+                  { to: "/open", icon: Globe, label: "生态首页" },
+                  { to: "/open/plugins", icon: Puzzle, label: "插件市场" },
+                  { to: "/open/developer", icon: Code, label: "开发者" },
+                  { to: "/open/app-builder", icon: Zap, label: "应用构建" },
+                  { to: "/open/docs", icon: BookOpen, label: "API 文档" },
+                ]}
+              />
+            </div>
+          )}
         </nav>
 
-        <div className="border-t border-gray-200 p-2 dark:border-slate-700/50">
+        <div className="space-y-2 border-t border-gray-200 p-2 pb-16 dark:border-slate-700/50">
           <button
             onClick={() => setCollapsed(!collapsed)}
             className="flex w-full items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-200"
@@ -281,6 +347,44 @@ export default function Layout() {
           </button>
         </div>
       </aside>
+
+      <label
+        data-tour="nav-advanced"
+        title="进阶功能"
+        className={clsx(
+          "fixed bottom-5 left-4 z-50 inline-flex cursor-pointer items-center gap-2 rounded-full border px-3 py-2 text-sm font-medium shadow-xl shadow-slate-900/10 backdrop-blur transition-colors",
+          advancedOpen || advancedActive
+            ? "border-blue-500 bg-blue-600 text-white"
+            : "border-slate-200 bg-white/95 text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900/95 dark:text-slate-100 dark:hover:bg-slate-800"
+        )}
+      >
+        <input
+          type="checkbox"
+          checked={advancedOpen}
+          onChange={(event) => setAdvancedOpen(event.currentTarget.checked)}
+          className="sr-only"
+          aria-label="进阶功能"
+          aria-expanded={advancedOpen}
+        />
+        <Sparkles className="h-4 w-4" aria-hidden="true" />
+        <span className="max-w-[5rem] truncate">进阶功能</span>
+        <span
+          aria-hidden="true"
+          className={clsx(
+            "relative inline-flex h-5 w-9 shrink-0 rounded-full border transition-colors",
+            advancedOpen
+              ? "border-white/70 bg-white/25"
+              : "border-slate-300 bg-slate-200 dark:border-slate-600 dark:bg-slate-700"
+          )}
+        >
+          <span
+            className={clsx(
+              "absolute top-0.5 h-4 w-4 rounded-full bg-white shadow-sm transition-transform",
+              advancedOpen ? "translate-x-4" : "translate-x-0.5"
+            )}
+          />
+        </span>
+      </label>
 
       <div className="flex flex-1 flex-col overflow-hidden">
         <header className="flex h-14 shrink-0 items-center justify-between border-b border-gray-200 bg-white px-6 dark:border-slate-700 dark:bg-slate-800">
@@ -304,14 +408,21 @@ export default function Layout() {
           </button>
 
           <div className="flex items-center gap-3">
-            <button
-              onClick={() => startOnboarding(true)}
+            <a
+              href="/?tour=1"
+              role="button"
+              onClick={(e) => {
+                e.preventDefault();
+                navigate("/?tour=1");
+                startOnboarding();
+              }}
               title="新手教程"
               aria-label="新手教程"
+              data-testid="start-onboarding-button"
               className="rounded-md p-2 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600 dark:text-slate-400 dark:hover:bg-slate-700 dark:hover:text-slate-200"
             >
               <HelpCircle className="h-5 w-5" />
-            </button>
+            </a>
             <button
               onClick={toggle}
               title={isDark ? "切换到浅色模式" : "切换到暗色模式"}

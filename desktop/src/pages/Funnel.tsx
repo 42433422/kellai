@@ -12,13 +12,13 @@ import { toastStore } from '../stores/toast';
 
 /** 漏斗阶段定义（从左到右） */
 const STAGE_ORDER = [
-  { id: 'no_contact', label: '未接触' },
+  { id: 'idle', label: '未接触' },
   { id: 'connected', label: '已建联' },
-  { id: 'requirement', label: '需求采集' },
-  { id: 'submitted', label: '已提交' },
+  { id: 'intake', label: '需求采集' },
+  { id: 'intake_done', label: '已提交' },
   { id: 'quoted', label: '已报价' },
   { id: 'negotiating', label: '议价' },
-  { id: 'pending_sign', label: '待签' },
+  { id: 'contract_pending', label: '待签' },
   { id: 'signed', label: '已签' },
   { id: 'delivering', label: '交付中' },
   { id: 'delivered', label: '已交付' },

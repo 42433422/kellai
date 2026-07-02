@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 320" role="img" aria-label="客来来商标候选 01">
+  <defs>
+    <linearGradient id="flowBg" x1="40" y1="36" x2="252" y2="276" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2563eb"/>
+      <stop offset="0.54" stop-color="#0891b2"/>
+      <stop offset="1" stop-color="#10b981"/>
+    </linearGradient>
+    <linearGradient id="flowAccent" x1="92" y1="228" x2="168" y2="184" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f59e0b"/>
+      <stop offset="1" stop-color="#fbbf24"/>
+    </linearGradient>
+  </defs>
+  <rect x="36" y="36" width="248" height="248" rx="64" fill="url(#flowBg)"/>
+  <path d="M92 208c26-48 64-75 118-82" fill="none" stroke="#ffffff" stroke-width="20" stroke-linecap="round"/>
+  <path d="M200 92h44c22 0 40 18 40 40v14c0 22-18 40-40 40h-18l-43 30v-32c-14-7-23-21-23-38v-14c0-22 18-40 40-40z" fill="#ffffff"/>
+  <circle cx="214" cy="139" r="7" fill="#0891b2"/>
+  <circle cx="238" cy="139" r="7" fill="#0891b2"/>
+  <rect x="84" y="218" width="18" height="38" rx="7" fill="url(#flowAccent)"/>
+  <rect x="116" y="198" width="18" height="58" rx="7" fill="url(#flowAccent)"/>
+  <rect x="148" y="172" width="18" height="84" rx="7" fill="url(#flowAccent)"/>
+  <text x="330" y="166" fill="#0f172a" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, Heiti SC, Arial Unicode MS, sans-serif" font-size="96" font-weight="850">客来来</text>
+  <text x="336" y="218" fill="#475569" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, Heiti SC, Arial Unicode MS, sans-serif" font-size="26" font-weight="500" letter-spacing="3">智能获客 · 及时跟进</text>
+</svg>

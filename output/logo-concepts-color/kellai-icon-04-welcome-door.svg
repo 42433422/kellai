@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 320" role="img" aria-label="客来来图标 迎客门">
+  <rect width="320" height="320" fill="#ffffff"/>
+  <g transform="translate(22 22)">
+  <defs>
+    <linearGradient id="g4" x1="34" y1="36" x2="236" y2="226" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f97316"/>
+      <stop offset="0.5" stop-color="#f59e0b"/>
+      <stop offset="1" stop-color="#10b981"/>
+    </linearGradient>
+  </defs>
+  <path d="M60 210V92c0-34 28-62 62-62h32c34 0 62 28 62 62v118" fill="none" stroke="url(#g4)" stroke-width="28" stroke-linecap="round"/>
+  <path d="M96 210v-96c0-18 15-33 33-33h18c18 0 33 15 33 33v96" fill="none" stroke="#15315f" stroke-width="22" stroke-linecap="round"/>
+  <path d="M62 218h154" stroke="#2563eb" stroke-width="22" stroke-linecap="round"/>
+  <circle cx="62" cy="82" r="15" fill="#2563eb"/>
+  <circle cx="216" cy="82" r="15" fill="#10b981"/>
+  </g>
+</svg>

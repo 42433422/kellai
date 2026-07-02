@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 320" role="img" aria-label="客来来商标 v3 01 来字核心 横版">
+  <rect width="960" height="320" fill="#ffffff"/>
+  <g transform="translate(74 50) scale(0.46)">
+  <g>
+    <rect x="146" y="94" width="220" height="50" rx="18" fill="#101828"/>
+    <rect x="230" y="94" width="52" height="332" rx="20" fill="#101828"/>
+    <rect x="122" y="206" width="268" height="50" rx="18" fill="#101828"/>
+    <path d="M220 256c-38 72-88 126-150 164" fill="none" stroke="#101828" stroke-width="52" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M292 256c38 72 88 126 150 164" fill="none" stroke="#101828" stroke-width="52" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M130 308c52 34 116 52 190 52s138-18 190-52" fill="none" stroke="#12b981" stroke-width="34" stroke-linecap="round"/>
+  </g>
+  </g>
+  <text x="360" y="158" fill="#101828" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, Heiti SC, Arial Unicode MS, sans-serif" font-size="100" font-weight="900" letter-spacing="2">客来来</text>
+  <path d="M362 194h328" stroke="#12b981" stroke-width="12" stroke-linecap="round"/>
+</svg>

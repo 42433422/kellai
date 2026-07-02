@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 640" role="img" aria-label="客来来商标 v2 07 获客漏斗">
+  <rect width="640" height="640" fill="#ffffff"/>
+  <path d="M104 146h432L380 324v128l-120 56V324z" fill="#0f172a"/>
+  <path d="M166 198h308L356 320v86l-72 34v-120z" fill="#ffffff"/>
+  <path d="M144 510c82-40 168-40 258-2 34 14 68 14 102-4" fill="none" stroke="#10b981" stroke-width="34" stroke-linecap="round"/>
+  <circle cx="204" cy="126" r="28" fill="#2563eb"/>
+  <circle cx="320" cy="96" r="28" fill="#10b981"/>
+  <circle cx="436" cy="126" r="28" fill="#f59e0b"/>
+  <path d="M232 244h176" stroke="#0891b2" stroke-width="28" stroke-linecap="round"/>
+</svg>

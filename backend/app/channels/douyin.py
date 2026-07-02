@@ -8,6 +8,8 @@
 环境变量：
 - KELLAI_DOUYIN_CLIENT_KEY
 - KELLAI_DOUYIN_CLIENT_SECRET
+- KELLAI_DOUYIN_APP_ID（兼容前端字段 app_id）
+- KELLAI_DOUYIN_APP_SECRET（兼容前端字段 app_secret）
 - KELLAI_DOUYIN_BASE_URL（默认 https://open.douyin.com）
 """
 from __future__ import annotations
@@ -20,6 +22,7 @@ from typing import Any
 import httpx
 
 from app.channels.base import ChannelAdapter, UnifiedMessage
+from app.channels.config_store import get_field
 from app.channels.http_client import CachedToken, read_env
 
 logger = logging.getLogger(__name__)
@@ -28,20 +31,44 @@ logger = logging.getLogger(__name__)
 _UNCONFIGURED_MSG = "抖音渠道未配置（缺少 KELLAI_DOUYIN_CLIENT_KEY/SECRET）"
 
 
+def _client_key() -> str:
+    return (
+        get_field("douyin", "client_key")
+        or get_field("douyin", "app_id")
+        or read_env("KELLAI_DOUYIN_CLIENT_KEY")
+        or read_env("KELLAI_DOUYIN_APP_ID")
+    )
+
+
+def _client_secret() -> str:
+    return (
+        get_field("douyin", "client_secret")
+        or get_field("douyin", "app_secret")
+        or read_env("KELLAI_DOUYIN_CLIENT_SECRET")
+        or read_env("KELLAI_DOUYIN_APP_SECRET")
+    )
+
+
 class DouyinAdapter(ChannelAdapter):
     """抖音渠道适配器。"""
 
     channel_type = "douyin"
 
     def __init__(self) -> None:
-        self._client_key: str = read_env("KELLAI_DOUYIN_CLIENT_KEY")
-        self._client_secret: str = read_env("KELLAI_DOUYIN_CLIENT_SECRET")
         self._base_url: str = read_env("KELLAI_DOUYIN_BASE_URL", "https://open.douyin.com")
         self._client: httpx.AsyncClient | None = None
         self._token: CachedToken | None = None
+        self._token_config_key: tuple[str, str] | None = None
 
     def _is_configured(self) -> bool:
-        return bool(self._client_key and self._client_secret)
+        return bool(_client_key() and _client_secret())
+
+    def _ensure_token_cache(self) -> CachedToken:
+        current_key = (_client_key(), _client_secret())
+        if self._token is None or self._token_config_key != current_key:
+            self._token = CachedToken(self._fetch_token, ttl_sec=7000)
+            self._token_config_key = current_key
+        return self._token
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -58,8 +85,8 @@ class DouyinAdapter(ChannelAdapter):
         resp = await client.post(
             "/oauth/client_token/",
             json={
-                "client_key": self._client_key,
-                "client_secret": self._client_secret,
+                "client_key": _client_key(),
+                "client_secret": _client_secret(),
                 "grant_type": "client_credentials",
             },
         )
@@ -74,9 +101,7 @@ class DouyinAdapter(ChannelAdapter):
     async def _auth_headers(self) -> dict[str, str]:
         if not self._is_configured():
             return {}
-        if self._token is None:
-            self._token = CachedToken(self._fetch_token, ttl_sec=7000)
-        token = await self._token.get()
+        token = await self._ensure_token_cache().get()
         return {"access-token": token}
 
     async def _on_token_invalid(self) -> None:
@@ -101,9 +126,7 @@ class DouyinAdapter(ChannelAdapter):
 
         try:
             client = await self._get_client()
-            if self._token is None:
-                self._token = CachedToken(self._fetch_token, ttl_sec=7000)
-            token = await self._token.get()
+            token = await self._ensure_token_cache().get()
             payload = {
                 "to_user_id": contact_id,
                 "message_type": "text",

@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 640" role="img" aria-label="客来来商标 v2 08 可信印章">
+  <rect width="640" height="640" fill="#ffffff"/>
+  <circle cx="320" cy="320" r="248" fill="#ffffff" stroke="#0f172a" stroke-width="26"/>
+  <circle cx="320" cy="320" r="184" fill="#dcfce7" stroke="#10b981" stroke-width="18"/>
+  <path d="M218 304h204c28 0 50 22 50 50v16c0 28-22 50-50 50h-56l-62 48v-48h-86c-28 0-50-22-50-50v-16c0-28 22-50 50-50z" fill="#0f172a"/>
+  <circle cx="268" cy="362" r="13" fill="#ffffff"/>
+  <circle cx="320" cy="362" r="13" fill="#ffffff"/>
+  <circle cx="372" cy="362" r="13" fill="#ffffff"/>
+  <text x="320" y="254" text-anchor="middle" fill="#0f172a" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, Heiti SC, Arial Unicode MS, sans-serif" font-size="96" font-weight="900">客来来</text>
+  <path d="M232 488c56 42 120 42 176 0" fill="none" stroke="#10b981" stroke-width="24" stroke-linecap="round"/>
+</svg>

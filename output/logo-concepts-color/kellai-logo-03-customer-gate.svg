@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 260" role="img" aria-label="客来来 Logo 来客入口">
+  <rect width="880" height="260" fill="#ffffff"/>
+  <g transform="translate(54 24) scale(0.8)">
+  <defs>
+    <linearGradient id="g3" x1="48" y1="24" x2="230" y2="232" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2563eb"/>
+      <stop offset="1" stop-color="#10b981"/>
+    </linearGradient>
+  </defs>
+  <rect x="28" y="38" width="220" height="202" rx="52" fill="#eef8ff"/>
+  <path d="M70 174V98c0-34 27-61 61-61h16c34 0 61 27 61 61v76" fill="none" stroke="url(#g3)" stroke-width="26" stroke-linecap="round"/>
+  <path d="M82 186c36 28 76 42 120 42" fill="none" stroke="#f59e0b" stroke-width="20" stroke-linecap="round"/>
+  <path d="M117 142h114c18 0 33 15 33 33s-15 33-33 33h-42l-44 34v-34h-28c-18 0-33-15-33-33s15-33 33-33z" fill="#15315f"/>
+  <circle cx="139" cy="176" r="7" fill="#ffffff"/>
+  <circle cx="169" cy="176" r="7" fill="#ffffff"/>
+  <circle cx="199" cy="176" r="7" fill="#ffffff"/>
+  </g>
+  <text x="310" y="156" fill="#15315f" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, Heiti SC, Arial Unicode MS, sans-serif" font-size="104" font-weight="900" letter-spacing="3">客来来</text>
+</svg>

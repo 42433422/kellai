@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 512 512" role="img" aria-label="客来来">
+  <defs>
+    <linearGradient id="kellaiBlue" x1="116" y1="300" x2="348" y2="122" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#129bd7"/>
+      <stop offset="1" stop-color="#16b7c7"/>
+    </linearGradient>
+    <linearGradient id="kellaiGold" x1="112" y1="344" x2="386" y2="332" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffd037"/>
+      <stop offset="1" stop-color="#f5a313"/>
+    </linearGradient>
+  </defs>
+  <circle cx="256" cy="256" r="170" fill="#dcf8ee"/>
+  <path d="M131 291C151 176 241 118 347 128" fill="none" stroke="url(#kellaiBlue)" stroke-width="34" stroke-linecap="round"/>
+  <path d="M131 326c56 44 145 61 248 18" fill="none" stroke="url(#kellaiGold)" stroke-width="34" stroke-linecap="round"/>
+  <path d="M248 133v184c0 26 21 47 47 47h88" fill="none" stroke="#102e60" stroke-width="38" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="357" cy="129" r="22" fill="#17c889"/>
+</svg>

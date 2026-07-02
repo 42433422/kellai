@@ -82,6 +82,16 @@ def _env_suffixes(channel_type: str, key: str) -> list[str]:
         ("wecom", "secret"): ["SECRET", "CORP_SECRET", "CORPSECRET"],
         ("wework", "corp_secret"): ["CORP_SECRET", "CORPSECRET", "SECRET"],
         ("wecom", "corp_secret"): ["CORP_SECRET", "CORPSECRET", "SECRET"],
+        ("douyin", "app_id"): ["APP_ID", "APPID", "CLIENT_KEY"],
+        ("douyin", "app_secret"): ["APP_SECRET", "APPSECRET", "CLIENT_SECRET"],
+        ("douyin", "client_key"): ["CLIENT_KEY", "APP_ID", "APPID"],
+        ("douyin", "client_secret"): ["CLIENT_SECRET", "APP_SECRET", "APPSECRET"],
+        ("miniprogram", "app_id"): ["APP_ID", "APPID"],
+        ("miniapp", "app_id"): ["APP_ID", "APPID"],
+        ("miniprogram", "app_secret"): ["APP_SECRET", "SECRET", "APPSECRET"],
+        ("miniapp", "app_secret"): ["APP_SECRET", "SECRET", "APPSECRET"],
+        ("miniprogram", "secret"): ["SECRET", "APP_SECRET", "APPSECRET"],
+        ("miniapp", "secret"): ["SECRET", "APP_SECRET", "APPSECRET"],
     }
     out = aliases.get((channel_type, key), [suffix])
     if suffix not in out:
@@ -146,10 +156,12 @@ def get_all(channel_type: str) -> dict[str, Any]:
 def _expected_fields(channel_type: str) -> list[str]:
     """前端可能配置的所有字段名（key 集合）。"""
     map_: dict[str, list[str]] = {
-        "wework": ["corp_id", "secret", "agent_id", "bot_webhook"],
-        "wecom": ["corp_id", "secret", "agent_id", "bot_webhook"],
-        "douyin": ["app_id", "app_secret"],
+        "wework": ["corp_id", "secret", "agent_id", "bot_webhook", "kf_url", "open_kfid"],
+        "wecom": ["corp_id", "secret", "agent_id", "bot_webhook", "kf_url", "open_kfid"],
+        "wechat": ["bot_webhook"],
+        "douyin": ["app_id", "app_secret", "client_key", "client_secret"],
         "miniprogram": ["app_id", "app_secret", "template_id"],
+        "miniapp": ["app_id", "app_secret", "template_id"],
         "pdd": ["client_id", "client_secret"],
         "taobao": ["app_key", "app_secret"],
         "jd": ["app_key", "app_secret"],
@@ -165,7 +177,7 @@ def _expected_fields(channel_type: str) -> list[str]:
 
 
 def save(channel_type: str, config: dict[str, Any], *, name: Optional[str] = None,
-         enabled: Optional[bool] = None) -> dict[str, Any]:
+         enabled: Optional[bool] = None, connected: Optional[bool] = None) -> dict[str, Any]:
     """保存渠道配置。
 
     写回磁盘并返回该渠道的最终状态 dict（含 name/enabled/connected）。
@@ -175,15 +187,22 @@ def save(channel_type: str, config: dict[str, Any], *, name: Optional[str] = Non
         cur = dict(all_cfg.get(channel_type) or {})
         # 合并：保留原 name/enabled，只覆盖 config
         new_cfg = dict(cur)
+        incoming_config = dict(config or {})
         merged_config = dict(cur.get("config") or {})
-        merged_config.update(dict(config or {}))
+        merged_config.update(incoming_config)
         new_cfg["config"] = merged_config
         if name is not None:
             new_cfg["name"] = str(name)
         if enabled is not None:
             new_cfg["enabled"] = bool(enabled)
+        if connected is not None:
+            new_cfg["connected"] = bool(connected)
+        elif incoming_config:
+            # 凭据变更后必须重新测试，避免“已保存”误显示为“已接入”。
+            new_cfg["connected"] = False
         new_cfg.setdefault("name", channel_type)
         new_cfg.setdefault("enabled", False)
+        new_cfg.setdefault("connected", False)
         all_cfg[channel_type] = new_cfg
         _write_disk(all_cfg)
         return new_cfg

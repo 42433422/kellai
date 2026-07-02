@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 640" role="img" aria-label="客来来商标 v3 02 来客门 黑白核心">
+  <rect width="640" height="640" fill="#ffffff"/>
+  <g transform="translate(64 64)">
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M174 418V242c0-88 70-158 158-158s158 70 158 158v176" stroke="#101828" stroke-width="52"/>
+    <path d="M264 418V252c0-38 30-68 68-68s68 30 68 68v166" stroke="#101828" stroke-width="52"/>
+    <path d="M86 418h492" stroke="#101828" stroke-width="52"/>
+  </g>
+  </g>
+</svg>

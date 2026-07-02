@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 260" role="img" aria-label="客来来 Logo 来客环">
+  <rect width="880" height="260" fill="#ffffff"/>
+  <g transform="translate(52 20) scale(0.82)">
+  <defs>
+    <linearGradient id="arrivalRing" x1="34" y1="30" x2="238" y2="238" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2868f0"/>
+      <stop offset="0.55" stop-color="#10b6d3"/>
+      <stop offset="1" stop-color="#12b981"/>
+    </linearGradient>
+  </defs>
+  <circle cx="138" cy="138" r="104" fill="#dffaf1"/>
+  <path d="M78 150c38-62 86-92 146-90" fill="none" stroke="url(#arrivalRing)" stroke-width="28" stroke-linecap="round"/>
+  <path d="M76 176c60 42 126 48 198 18" fill="none" stroke="#ffb020" stroke-width="22" stroke-linecap="round"/>
+  <path d="M133 62v116c0 14 10 24 24 24h62" fill="none" stroke="#102a56" stroke-width="24" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="222" cy="64" r="15" fill="#12b981"/>
+  </g>
+  <text x="304" y="145" fill="#102a56" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, Heiti SC, Arial Unicode MS, sans-serif" font-size="108" font-weight="900" letter-spacing="2">客来来</text>
+  <path d="M308 176h286" stroke="#12b981" stroke-width="9" stroke-linecap="round"/>
+  <circle cx="628" cy="176" r="9" fill="#ffb020"/>
+  <circle cx="662" cy="176" r="9" fill="#10b6d3"/>
+</svg>

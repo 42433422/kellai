@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 320" role="img" aria-label="客来来商标 v3 03 三来印 横版">
+  <rect width="960" height="320" fill="#ffffff"/>
+  <g transform="translate(74 50) scale(0.46)">
+  <g>
+    <path d="M320 78l168 102v194L320 476 152 374V180z" fill="none" stroke="#101828" stroke-width="40" stroke-linejoin="round"/>
+    <path d="M220 206h200" stroke="#101828" stroke-width="46" stroke-linecap="round"/>
+    <path d="M256 206v152" stroke="#101828" stroke-width="46" stroke-linecap="round"/>
+    <path d="M320 206v152" stroke="#101828" stroke-width="46" stroke-linecap="round"/>
+    <path d="M384 206v152" stroke="#101828" stroke-width="46" stroke-linecap="round"/>
+    <path d="M238 358c44 34 120 34 164 0" fill="none" stroke="#101828" stroke-width="40" stroke-linecap="round"/>
+    <circle cx="256" cy="436" r="22" fill="#12b981"/>
+    <circle cx="320" cy="436" r="22" fill="#12b981"/>
+    <circle cx="384" cy="436" r="22" fill="#12b981"/>
+  </g>
+  </g>
+  <text x="360" y="158" fill="#101828" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, Heiti SC, Arial Unicode MS, sans-serif" font-size="100" font-weight="900" letter-spacing="2">客来来</text>
+  <path d="M362 194h328" stroke="#12b981" stroke-width="12" stroke-linecap="round"/>
+</svg>

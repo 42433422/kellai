@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="客来来图标 05 来字块">
+  <rect width="512" height="512" fill="#ffffff"/>
+  <defs>
+    <linearGradient id="laiTile" x1="80" y1="74" x2="426" y2="436" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2868f0"/>
+      <stop offset="0.48" stop-color="#0ea5e9"/>
+      <stop offset="1" stop-color="#12b981"/>
+    </linearGradient>
+  </defs>
+  <rect x="64" y="64" width="384" height="384" rx="96" fill="url(#laiTile)"/>
+  <path d="M170 164h172" stroke="#ffffff" stroke-width="36" stroke-linecap="round"/>
+  <path d="M256 164v214" stroke="#ffffff" stroke-width="38" stroke-linecap="round"/>
+  <path d="M154 250h204" stroke="#ffffff" stroke-width="36" stroke-linecap="round"/>
+  <path d="M246 254c-34 58-76 102-126 132" fill="none" stroke="#ffffff" stroke-width="38" stroke-linecap="round"/>
+  <path d="M266 254c34 58 76 102 126 132" fill="none" stroke="#ffffff" stroke-width="38" stroke-linecap="round"/>
+  <path d="M160 394c56 28 120 42 192 42" fill="none" stroke="#ffb020" stroke-width="28" stroke-linecap="round"/>
+</svg>

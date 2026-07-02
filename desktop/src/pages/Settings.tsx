@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import {
   MessageCircle,
@@ -23,6 +23,9 @@ import {
   ShieldCheck,
 } from 'lucide-react';
 import { useOnboardingStore } from '../stores/onboarding';
+import { ONBOARDING_WELCOME_CACHE_KEY, ONBOARDING_WELCOME_SPEECH_TEXT } from '../constants/onboardingTour';
+import { playPreparedTextToSpeech, preloadTextToSpeech, unlockTextToSpeechAudio } from '../hooks/useTextToSpeech';
+import { estimateSpeechHoldMs } from '../utils/onboardingSpeech';
 import ChannelLogo, { CHANNEL_BRAND_COLOR } from '../components/ChannelLogo';
 import { clsx } from 'clsx';
 import type {
@@ -38,7 +41,11 @@ import {
   getChannels,
   testChannel,
   saveChannelConfig,
+  syncChannelInbox,
   getLlmStatus,
+  saveLlmConfig,
+  probeLlmConfig,
+  getLlmDiagnostics,
   getTeamInfo,
   getTeamMembers,
   inviteMember,
@@ -48,6 +55,10 @@ import {
   initiateWeworkOAuth,
   checkWeworkOAuthStatus,
 } from '../api/settings';
+
+type OnboardingSpeechWindow = Window & {
+  __kellaiOnboardingWelcomePreplayedUntil?: number;
+};
 
 /* ========== 常量与映射 ========== */
 
@@ -133,6 +144,8 @@ const channelConfigFieldsMap: Record<string, { key: string; label: string; type:
     { key: 'secret', label: 'Secret（应用密钥）', type: 'password', placeholder: '请输入应用 Secret' },
     { key: 'agent_id', label: 'Agent ID（应用 ID）', type: 'text', placeholder: '1000002' },
     { key: 'bot_webhook', label: '群机器人 Webhook（可选）', type: 'text', placeholder: 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...' },
+    { key: 'kf_url', label: '客服接待链接（可选）', type: 'text', placeholder: 'https://work.weixin.qq.com/kfid/...' },
+    { key: 'open_kfid', label: '客服账号 ID（自动解析，可选）', type: 'text', placeholder: 'kfcxxxxxxxxxxxxxxxx' },
   ],
   phone: [
     { key: 'line', label: '外呼线路', type: 'select', options: [
@@ -179,6 +192,20 @@ const channelConfigFieldsMap: Record<string, { key: string; label: string; type:
   ],
 };
 
+const channelRequiredConfigFieldsMap: Record<string, string[]> = {
+  wework: ['corp_id', 'secret', 'agent_id'],
+  douyin: ['app_id', 'app_secret'],
+  miniprogram: ['app_id', 'app_secret'],
+  pdd: ['client_id', 'client_secret'],
+  taobao: ['app_key', 'app_secret'],
+  jd: ['app_key', 'app_secret'],
+  alibaba: ['app_key', 'app_secret'],
+  whatsapp: ['phone_number_id', 'access_token'],
+  telegram: ['bot_token'],
+  line: ['channel_access_token'],
+  phone: ['line'],
+};
+
 /** 默认平台列表（API 返回空时用作兜底） */
 const DEFAULT_PLATFORMS: string[] = channelGroups.flatMap((g) => g.types);
 
@@ -195,15 +222,133 @@ function makeDisconnectedChannel(type: string, _idx: number): Channel {
   };
 }
 
+function fieldLabelOf(channelType: string, fieldKey: string) {
+  const field = (channelConfigFieldsMap[channelType] ?? []).find((item) => item.key === fieldKey);
+  return field?.label ?? fieldKey;
+}
+
+function onboardingFallback(channel: Channel) {
+  const fields = channelConfigFieldsMap[channel.type] ?? [];
+  const requiredFields = channelRequiredConfigFieldsMap[channel.type] ?? fields.map((item) => item.key);
+  const optionalFields = fields.map((item) => item.key).filter((key) => !requiredFields.includes(key));
+  const savedFields = Object.entries(channel.config || {})
+    .filter(([, value]) => String(value ?? '').trim())
+    .map(([key]) => key);
+  const missing = requiredFields.filter((key) => !String(channel.config?.[key] ?? '').trim());
+  const requiredComplete = missing.length === 0;
+  const mode = channelAuthModeMap[channel.type] ?? 'form';
+  const hasScan = mode === 'scan' || mode === 'both';
+  const hasManual = fields.length > 0;
+  const status = channel.connected ? 'connected' : savedFields.length > 0 ? 'saved' : mode === 'none' ? 'ready' : 'not_started';
+  return {
+    status,
+    recommended_mode: mode === 'both' ? 'scan' : mode,
+    auth_modes: mode === 'both' ? ['scan', 'form'] : [mode],
+    required_fields: requiredFields,
+    optional_fields: optionalFields,
+    missing_required_fields: missing,
+    saved_fields: savedFields,
+    materials: hasManual ? ['准备平台后台账号和应用凭据'] : [],
+    external_steps: mode === 'none'
+      ? ['无需平台侧动作，可直接使用该来源']
+      : hasScan
+        ? ['在对应平台后台确认授权账号', '扫码或回填凭据后测试连接']
+        : ['按字段回填凭据后测试连接'],
+    success_criteria: ['测试连接通过', '同步收件箱后能在消息中心看到客户消息'],
+    stages: [
+      { key: 'prepare', label: '准备材料', status: savedFields.length || channel.connected || !requiredFields.length ? 'done' : 'current' },
+      {
+        key: 'configure',
+        label: '授权/配置',
+        status: channel.connected || (savedFields.length && requiredComplete)
+          ? 'done'
+          : savedFields.length && !requiredComplete
+            ? 'current'
+            : requiredFields.length
+              ? 'pending'
+              : 'skipped',
+      },
+      { key: 'test', label: '测试连接', status: channel.connected ? 'done' : savedFields.length && requiredComplete ? 'current' : 'pending' },
+      { key: 'sync', label: '同步收件箱', status: channel.connected ? 'current' : 'pending' },
+    ],
+    next_action: channel.connected
+      ? '同步收件箱，确认客户消息能进入漏斗。'
+      : savedFields.length
+        ? requiredComplete
+          ? '点击测试连接，确认平台凭据可用。'
+          : '补齐必填字段并保存后，再测试连接。'
+        : mode === 'none'
+          ? '无需配置，可直接作为客户来源使用。'
+          : '先准备平台材料，然后按向导授权或回填字段。',
+    can_scan: hasScan,
+    can_manual: hasManual,
+    enabled: channel.enabled,
+  } as NonNullable<Channel['onboarding']>;
+}
+
+function onboardingOf(channel: Channel) {
+  return channel.onboarding ?? onboardingFallback(channel);
+}
+
+function connectedOnboarding(profile: NonNullable<Channel['onboarding']>) {
+  return {
+    ...profile,
+    status: 'connected' as const,
+    missing_required_fields: [],
+    stages: profile.stages.map((step) => ({
+      ...step,
+      status: step.key === 'sync' ? 'current' as const : 'done' as const,
+    })),
+    next_action: '同步收件箱，确认客户消息能进入漏斗。',
+  };
+}
+
 /** LLM 模型选项 */
 const LLM_MODELS = [
+  { label: '自定义兼容', value: 'custom' },
   { label: 'DeepSeek', value: 'deepseek' },
   { label: 'OpenAI', value: 'openai' },
   { label: '通义千问', value: 'qwen' },
   { label: 'Moonshot', value: 'moonshot' },
   { label: 'SiliconFlow', value: 'siliconflow' },
+  { label: '火山方舟/豆包', value: 'ark' },
+  { label: '智谱 GLM', value: 'zhipu' },
+  { label: 'MiniMax', value: 'minimax' },
+  { label: 'Xiaomi MiMo', value: 'mimo' },
+  { label: 'xAI Grok', value: 'xai' },
   { label: 'XCauto（修茈）', value: 'xcauto' },
 ];
+
+const LLM_DEFAULT_PARAMS: Record<string, { model: string; baseUrl: string }> = {
+  custom: { model: 'gpt-4o-mini', baseUrl: 'https://api.openai.com/v1' },
+  deepseek: { model: 'deepseek-chat', baseUrl: 'https://api.deepseek.com/v1' },
+  openai: { model: 'gpt-4o-mini', baseUrl: 'https://api.openai.com/v1' },
+  qwen: { model: 'qwen-plus', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1' },
+  moonshot: { model: 'moonshot-v1-8k', baseUrl: 'https://api.moonshot.cn/v1' },
+  siliconflow: { model: 'deepseek-ai/DeepSeek-V3', baseUrl: 'https://api.siliconflow.cn/v1' },
+  ark: { model: 'doubao-seed-1-6', baseUrl: 'https://ark.cn-beijing.volces.com/api/v3' },
+  zhipu: { model: 'glm-4-flash', baseUrl: 'https://open.bigmodel.cn/api/paas/v4' },
+  minimax: { model: 'MiniMax-Text-01', baseUrl: 'https://api.minimax.chat/v1' },
+  mimo: { model: 'mimo-v2.5-pro', baseUrl: 'https://token-plan-cn.xiaomimimo.com/v1' },
+  xai: { model: 'grok-3-mini', baseUrl: 'https://api.x.ai/v1' },
+  xcauto: { model: 'deepseek-chat', baseUrl: 'https://api.deepseek.com/v1' },
+};
+
+const LLM_PROVIDER_VALUES = new Set(LLM_MODELS.map((item) => item.value));
+
+function isKnownLlmProvider(value: string) {
+  return LLM_PROVIDER_VALUES.has(value);
+}
+
+function normalizeLlmProvider(value: string) {
+  const raw = String(value || '').trim().toLowerCase();
+  if (raw === 'auto') return 'xcauto';
+  if (['volcengine', 'volcengine-ark', 'volcengine_ark', 'doubao', 'doubao-ark', 'doubao_ark', 'huoshan', '火山', '方舟'].includes(raw)) return 'ark';
+  if (['zhipuai', 'glm', 'bigmodel', '智谱'].includes(raw)) return 'zhipu';
+  if (['xiaomi', 'xiaomi-mimo', 'xiaomi_mimo', 'xiaomimimo', 'mi-mimo', 'mi_mimo', '小米'].includes(raw)) return 'mimo';
+  if (raw === 'grok') return 'xai';
+  return isKnownLlmProvider(raw) ? raw : 'deepseek';
+}
 
 /** 自动回复适用阶段 */
 const AUTO_REPLY_STAGES = [
@@ -314,15 +459,21 @@ function ChannelTab() {
   const [error, setError] = useState('');
   const [configChannel, setConfigChannel] = useState<Channel | null>(null);
   const [scanChannel, setScanChannel] = useState<Channel | null>(null);
+  const [onboardingChannel, setOnboardingChannel] = useState<Channel | null>(null);
   const [configValues, setConfigValues] = useState<Record<string, string>>({});
   const [testingChannel, setTestingChannel] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<Record<string, { success: boolean; message: string }>>({});
+  const [syncingChannel, setSyncingChannel] = useState<string | null>(null);
+  const [syncResult, setSyncResult] = useState<Record<string, { success: boolean; message: string }>>({});
 
   useEffect(() => {
     getChannels()
       .then((res) => {
-        const data = (res as any)?.data ?? res;
-        setChannels(Array.isArray(data) ? data : []);
+        const data = (res as any)?.data?.data ?? (res as any)?.data ?? res;
+        const normalized = Array.isArray(data)
+          ? data.filter((item) => DEFAULT_PLATFORMS.includes(String(item?.type ?? item?.channel_type ?? '')))
+          : [];
+        setChannels(normalized);
       })
       .catch(() => setError('加载渠道列表失败'))
       .finally(() => setLoading(false));
@@ -339,20 +490,40 @@ function ChannelTab() {
     setConfigValues(values);
   };
 
+  const openOnboarding = (channel: Channel) => {
+    setOnboardingChannel(channel);
+    const fields = channelConfigFieldsMap[channel.type] ?? [];
+    const values: Record<string, string> = {};
+    fields.forEach((f) => {
+      values[f.key] = (channel.config[f.key] as string) ?? '';
+    });
+    setConfigValues(values);
+  };
+
   /** 测试连接 */
   const handleTest = async (channelType: string) => {
     setTestingChannel(channelType);
     setTestResult((prev) => ({ ...prev, [channelType]: { success: false, message: '测试中...' } }));
     try {
       const res = (await testChannel(channelType)) as any;
-      const data = res?.data ?? res;
-      const message = data?.message || '连接成功';
-      const ok = Boolean(res?.success && (data?.success ?? res?.success));
+      const body = res?.data ?? res;
+      const data = body?.data ?? body;
+      const message = data?.message || body?.message || body?.error || '连接成功';
+      const ok = Boolean(body?.success && (data?.connected ?? data?.success ?? body?.success));
       setTestResult((prev) => ({ ...prev, [channelType]: { success: ok, message } }));
       if (ok) {
+        const markConnected = (c: Channel): Channel => ({
+          ...c,
+          connected: true,
+          enabled: true,
+          onboarding: connectedOnboarding(onboardingOf({ ...c, connected: true, enabled: true })),
+        });
         setChannels((prev) =>
-          prev.map((c) => (c.type === channelType ? { ...c, connected: true, enabled: true } : c))
+          prev.map((c) => (c.type === channelType ? markConnected(c) : c))
         );
+        if (onboardingChannel?.type === channelType) {
+          setOnboardingChannel((prev) => (prev ? markConnected(prev) : prev));
+        }
       }
     } catch (err) {
       const data = (err as any)?.response?.data;
@@ -368,17 +539,67 @@ function ChannelTab() {
   /** 保存渠道配置到后端 */
   const handleSaveConfig = async (channelType: string, values: Record<string, string>) => {
     try {
-      await saveChannelConfig(channelType, values, { enabled: true });
+      const res = (await saveChannelConfig(channelType, values, { enabled: true })) as any;
+      const data = res?.data?.data ?? res?.data ?? res;
       setChannels((prev) =>
-        prev.map((c) => (c.type === channelType ? { ...c, config: { ...c.config, ...values } } : c))
+        prev.map((c) => {
+          if (c.type !== channelType) return c;
+          const mergedConfig = { ...c.config, ...values };
+          return {
+            ...c,
+            enabled: Boolean(data?.enabled ?? true),
+            connected: Boolean(data?.connected ?? false),
+            config: mergedConfig,
+            onboarding: data?.onboarding ?? onboardingFallback({ ...c, connected: false, enabled: Boolean(data?.enabled ?? true), config: mergedConfig }),
+          };
+        })
       );
-      setTestResult((prev) => ({ ...prev, [channelType]: { success: true, message: '已保存配置' } }));
+      if (onboardingChannel?.type === channelType) {
+        setOnboardingChannel((prev) => {
+          if (!prev) return prev;
+          const mergedConfig = { ...prev.config, ...values };
+          return {
+            ...prev,
+            enabled: Boolean(data?.enabled ?? true),
+            connected: Boolean(data?.connected ?? false),
+            config: mergedConfig,
+            onboarding: data?.onboarding ?? onboardingFallback({ ...prev, connected: false, enabled: Boolean(data?.enabled ?? true), config: mergedConfig }),
+          };
+        });
+      }
+      setTestResult((prev) => ({ ...prev, [channelType]: { success: true, message: '已保存配置，下一步测试连接' } }));
     } catch (err) {
       setTestResult((prev) => ({
         ...prev,
         [channelType]: { success: false, message: `保存失败: ${(err as Error)?.message ?? '未知错误'}` },
       }));
       throw err;
+    }
+  };
+
+  const handleSyncInbox = async (channelType: string) => {
+    setSyncingChannel(channelType);
+    setSyncResult((prev) => ({ ...prev, [channelType]: { success: false, message: '同步中...' } }));
+    try {
+      const res = (await syncChannelInbox(channelType, 20)) as any;
+      const data = res?.data?.data ?? res?.data ?? res;
+      const synced = Number(data?.synced ?? 0);
+      const errors = Array.isArray(data?.errors) ? data.errors : [];
+      const ok = errors.length === 0;
+      setSyncResult((prev) => ({
+        ...prev,
+        [channelType]: {
+          success: ok,
+          message: ok ? `已同步 ${synced} 条消息` : `同步完成，${errors.length} 个错误`,
+        },
+      }));
+    } catch (err) {
+      setSyncResult((prev) => ({
+        ...prev,
+        [channelType]: { success: false, message: `同步失败: ${(err as Error)?.message ?? '未知错误'}` },
+      }));
+    } finally {
+      setSyncingChannel(null);
     }
   };
 
@@ -390,12 +611,21 @@ function ChannelTab() {
     return <div className="flex items-center justify-center py-20"><AlertCircle className="h-5 w-5 text-red-400" /><span className="ml-2 text-sm text-red-500">{error}</span></div>;
   }
 
-  /** API 返回空时，用 DEFAULT_PLATFORMS 作兜底展示（让用户能看见所有支持的渠道并点配置） */
-  const displayChannels: Channel[] = channels.length > 0
-    ? channels
-    : DEFAULT_PLATFORMS.map((t, i) => makeDisconnectedChannel(t, i));
-  // 按 type → channel 建索引，方便合并 connected + default
-  const channelsByType = new Map(displayChannels.map((c) => [c.type, c]));
+  /** 用 DEFAULT_PLATFORMS 补齐后端尚未注册的轻量入口，保持接入页固定完整。 */
+  const channelsByType = new Map<Channel['type'], Channel>(
+    DEFAULT_PLATFORMS.map((t, i) => {
+      const ch = makeDisconnectedChannel(t, i);
+      return [ch.type, ch];
+    })
+  );
+  channels.forEach((channel) => {
+    if (DEFAULT_PLATFORMS.includes(channel.type)) {
+      channelsByType.set(channel.type, channel);
+    }
+  });
+  const displayChannels: Channel[] = DEFAULT_PLATFORMS
+    .map((type) => channelsByType.get(type as Channel['type']))
+    .filter(Boolean) as Channel[];
 
   return (
     <div data-tour="settings-channels">
@@ -429,6 +659,10 @@ function ChannelTab() {
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
               {groupChannels.map((channel) => {
                 const result = testResult[channel.type];
+                const sync = syncResult[channel.type];
+                const profile = onboardingOf(channel);
+                const missingCount = profile.missing_required_fields.length;
+                const doneSteps = profile.stages.filter((step) => step.status === 'done').length;
                 return (
                   <div
                     key={channel.id}
@@ -446,7 +680,19 @@ function ChannelTab() {
                   <ChannelLogo type={channel.type} size={28} />
                 </div>
                 <div className="flex-1">
-                  <p className="font-medium text-gray-900">{channelNameMap[channel.type] ?? channel.name}</p>
+                  <div className="flex items-start justify-between gap-2">
+                    <p className="font-medium text-gray-900">{channelNameMap[channel.type] ?? channel.name}</p>
+                    <span className={clsx(
+                      'rounded-full px-2 py-0.5 text-[11px] font-medium',
+                      channel.connected
+                        ? 'bg-green-50 text-green-700'
+                        : profile.status === 'saved'
+                          ? 'bg-blue-50 text-blue-700'
+                          : 'bg-gray-100 text-gray-500'
+                    )}>
+                      {channel.connected ? '已接入' : profile.status === 'saved' ? '待测试' : profile.status === 'ready' ? '可用' : '未接入'}
+                    </span>
+                  </div>
                   <div className="mt-0.5 flex items-center gap-1.5">
                     {channel.connected ? (
                       <>
@@ -463,43 +709,60 @@ function ChannelTab() {
                 </div>
               </div>
 
-              {/* 操作按钮 */}
-              <div className="mt-4 flex items-center gap-2">
-                {channelAuthModeMap[channel.type] &&
-                 channelAuthModeMap[channel.type] !== 'none' && (
-                  channelAuthModeMap[channel.type] === 'both' ? (
-                    <div className="flex items-center gap-2">
-                      <button
-                        onClick={() => openConfig(channel)}
-                        className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-600 transition hover:bg-gray-50"
-                      >
-                        手动配置
-                      </button>
-                      <button
-                        onClick={() => setScanChannel(channel)}
-                        className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-1.5 text-xs font-medium text-blue-600 transition hover:bg-blue-100"
-                      >
-                        扫码授权
-                      </button>
-                    </div>
-                  ) : (
-                    <button
-                      onClick={() => openConfig(channel)}
-                      aria-label={`配置 ${channelNameMap[channel.type] ?? channel.name}`}
-                      data-tour="settings-channel-config-btn"
-                      className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-600 transition hover:bg-gray-50"
-                    >
-                      {channelAuthModeMap[channel.type] === 'scan' ? '扫码授权' : '配置'}
-                    </button>
-                  )
+              <div className="mt-4 rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-600">
+                <div className="flex items-center justify-between gap-2">
+                  <span>接入进度 {doneSteps}/{profile.stages.length}</span>
+                  <span>{profile.recommended_mode === 'scan' ? '推荐扫码' : profile.recommended_mode === 'form' ? '回填凭据' : profile.recommended_mode === 'select' ? '选择线路' : '无需配置'}</span>
+                </div>
+                <div className="mt-2 grid grid-cols-4 gap-1">
+                  {profile.stages.map((step) => (
+                    <span
+                      key={step.key}
+                      title={step.label}
+                      className={clsx(
+                        'h-1.5 rounded-full',
+                        step.status === 'done'
+                          ? 'bg-green-500'
+                          : step.status === 'current'
+                            ? 'bg-blue-500'
+                            : step.status === 'skipped'
+                              ? 'bg-slate-200'
+                              : 'bg-slate-300'
+                      )}
+                    />
+                  ))}
+                </div>
+                <p className="mt-2 line-clamp-2">{profile.next_action}</p>
+                {missingCount > 0 && (
+                  <p className="mt-1 text-amber-700">缺少 {missingCount} 项：{profile.missing_required_fields.map((key) => fieldLabelOf(channel.type, key)).join('、')}</p>
                 )}
+              </div>
+
+              {/* 操作按钮 */}
+              <div className="mt-4 flex flex-wrap items-center gap-2">
+                <button
+                  onClick={() => openOnboarding(channel)}
+                  aria-label={`接入 ${channelNameMap[channel.type] ?? channel.name}`}
+                  data-tour="settings-channel-config-btn"
+                  className="rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-blue-700"
+                >
+                  接入向导
+                </button>
                 <button
                   onClick={() => handleTest(channel.type)}
                   disabled={testingChannel === channel.type}
                   aria-label={`测试 ${channelNameMap[channel.type] ?? channel.name} 连接`}
-                  className="rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-blue-700 disabled:opacity-50"
+                  className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-600 transition hover:bg-gray-50 disabled:opacity-50"
                 >
                   {testingChannel === channel.type ? '测试中...' : '测试连接'}
+                </button>
+                <button
+                  onClick={() => handleSyncInbox(channel.type)}
+                  disabled={syncingChannel === channel.type}
+                  aria-label={`同步 ${channelNameMap[channel.type] ?? channel.name} 收件箱`}
+                  className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-600 transition hover:bg-gray-50 disabled:opacity-50"
+                >
+                  {syncingChannel === channel.type ? '同步中...' : '同步收件箱'}
                 </button>
               </div>
 
@@ -510,6 +773,12 @@ function ChannelTab() {
                   {result.message}
                 </div>
               )}
+              {sync && (
+                <div className={clsx('mt-2 flex items-center gap-1.5 rounded-lg px-3 py-2 text-xs', sync.success ? 'bg-green-50 text-green-700' : 'bg-amber-50 text-amber-700')}>
+                  {sync.success ? <CheckCircle2 className="h-3.5 w-3.5" /> : <AlertCircle className="h-3.5 w-3.5" />}
+                  {sync.message}
+                </div>
+              )}
                   </div>
                 );
               })}
@@ -517,6 +786,33 @@ function ChannelTab() {
           </section>
         );
       })}
+
+      {/* 接入向导弹窗 - 主流程：准备材料 → 授权/配置 → 测试连接 → 同步收件箱 */}
+      {onboardingChannel && (
+        <ChannelOnboardingModal
+          channel={onboardingChannel}
+          values={configValues}
+          testResult={testResult[onboardingChannel.type]}
+          syncResult={syncResult[onboardingChannel.type]}
+          testing={testingChannel === onboardingChannel.type}
+          syncing={syncingChannel === onboardingChannel.type}
+          onChange={setConfigValues}
+          onClose={() => setOnboardingChannel(null)}
+          onSave={handleSaveConfig}
+          onTest={handleTest}
+          onSync={handleSyncInbox}
+          onScan={() => {
+            const ch = onboardingChannel;
+            setOnboardingChannel(null);
+            setScanChannel(ch);
+          }}
+          onOpenStandaloneConfig={() => {
+            const ch = onboardingChannel;
+            setOnboardingChannel(null);
+            openConfig(ch);
+          }}
+        />
+      )}
 
       {/* 手动配置弹窗 - both 模式或 form 模式 */}
       {configChannel && (channelAuthModeMap[configChannel.type] === 'form' || channelAuthModeMap[configChannel.type] === 'both') && (
@@ -549,6 +845,313 @@ function ChannelTab() {
           }}
         />
       )}
+    </div>
+  );
+}
+
+/** 渠道接入向导弹窗 */
+function ChannelOnboardingModal({
+  channel,
+  values,
+  testResult,
+  syncResult,
+  testing,
+  syncing,
+  onChange,
+  onClose,
+  onSave,
+  onTest,
+  onSync,
+  onScan,
+  onOpenStandaloneConfig,
+}: {
+  channel: Channel;
+  values: Record<string, string>;
+  testResult?: { success: boolean; message: string };
+  syncResult?: { success: boolean; message: string };
+  testing: boolean;
+  syncing: boolean;
+  onChange: (v: Record<string, string>) => void;
+  onClose: () => void;
+  onSave: (channelType: string, values: Record<string, string>) => Promise<void>;
+  onTest: (channelType: string) => Promise<void>;
+  onSync: (channelType: string) => Promise<void>;
+  onScan: () => void;
+  onOpenStandaloneConfig: () => void;
+}) {
+  const [saving, setSaving] = useState(false);
+  const profile = onboardingOf(channel);
+  const fields = channelConfigFieldsMap[channel.type] ?? [];
+  const channelLabel = channelNameMap[channel.type] ?? channel.name;
+  const doneSteps = profile.stages.filter((step) => step.status === 'done').length;
+  const progress = profile.stages.length ? Math.round((doneSteps / profile.stages.length) * 100) : 100;
+  const liveMissingFields = profile.required_fields.filter((key) => {
+    const currentValue = values[key] ?? (channel.config?.[key] as string | undefined) ?? '';
+    return !String(currentValue).trim();
+  });
+  const modeLabel: Record<string, string> = {
+    scan: '推荐扫码授权',
+    form: '回填平台凭据',
+    select: '选择业务线路',
+    none: '无需额外配置',
+  };
+
+  const saveConfig = async () => {
+    setSaving(true);
+    try {
+      await onSave(channel.type, values);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div
+      data-tour="channel-config-modal"
+      data-channel-onboarding-modal="true"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/45 p-3 backdrop-blur-sm sm:p-6"
+      onClick={onClose}
+    >
+      <div
+        data-tour="channel-config-modal-body"
+        className="flex max-h-[92vh] w-full max-w-5xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between gap-4 border-b border-slate-100 px-5 py-4 sm:px-6">
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl" style={{ background: `${CHANNEL_BRAND_COLOR[channel.type] ?? '#3b82f6'}1a` }}>
+              <ChannelLogo type={channel.type} size={30} />
+            </div>
+            <div className="min-w-0">
+              <h3 className="truncate text-base font-semibold text-slate-950">接入向导 - {channelLabel}</h3>
+              <p className="mt-1 text-xs text-slate-500">{profile.next_action}</p>
+            </div>
+          </div>
+          <button onClick={onClose} aria-label="关闭接入向导" className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-slate-700">
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        <div className="overflow-y-auto px-5 py-5 sm:px-6">
+          <div className="grid gap-5 lg:grid-cols-[1fr_1.1fr]">
+            <section className="space-y-4">
+              <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-semibold text-slate-900">接入进度</p>
+                    <p className="mt-1 text-xs text-slate-500">{doneSteps}/{profile.stages.length} 项完成</p>
+                  </div>
+                  <span className="rounded-full bg-white px-3 py-1 text-xs font-medium text-slate-600 ring-1 ring-slate-200">
+                    {modeLabel[profile.recommended_mode] ?? '回填平台凭据'}
+                  </span>
+                </div>
+                <div className="mt-3 h-2 overflow-hidden rounded-full bg-slate-200">
+                  <div className="h-full rounded-full bg-blue-600 transition-all" style={{ width: `${progress}%` }} />
+                </div>
+                <div className="mt-4 space-y-2">
+                  {profile.stages.map((step) => (
+                    <div key={step.key} className="flex items-center gap-3 rounded-lg bg-white px-3 py-2 ring-1 ring-slate-100">
+                      <span
+                        className={clsx(
+                          'flex h-7 w-7 shrink-0 items-center justify-center rounded-full',
+                          step.status === 'done'
+                            ? 'bg-green-100 text-green-700'
+                            : step.status === 'current'
+                              ? 'bg-blue-100 text-blue-700'
+                              : step.status === 'skipped'
+                                ? 'bg-slate-100 text-slate-400'
+                                : 'bg-slate-100 text-slate-500'
+                        )}
+                      >
+                        {step.status === 'done' ? <CheckCircle2 className="h-4 w-4" /> : <Clock className="h-4 w-4" />}
+                      </span>
+                      <div className="min-w-0">
+                        <p className="text-sm font-medium text-slate-800">{step.label}</p>
+                        <p className="text-xs text-slate-500">
+                          {step.status === 'done' ? '已完成' : step.status === 'current' ? '当前步骤' : step.status === 'skipped' ? '已跳过' : '待处理'}
+                        </p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-1">
+                <div className="rounded-xl border border-slate-200 p-4">
+                  <p className="text-sm font-semibold text-slate-900">需要准备</p>
+                  {profile.materials.length > 0 ? (
+                    <ul className="mt-3 space-y-2 text-xs leading-relaxed text-slate-600">
+                      {profile.materials.map((item) => (
+                        <li key={item} className="flex gap-2">
+                          <span className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-blue-500" />
+                          <span>{item}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="mt-3 text-xs text-slate-500">当前渠道无需额外材料。</p>
+                  )}
+                </div>
+
+                <div className="rounded-xl border border-slate-200 p-4">
+                  <p className="text-sm font-semibold text-slate-900">平台侧动作</p>
+                  <ul className="mt-3 space-y-2 text-xs leading-relaxed text-slate-600">
+                    {profile.external_steps.map((item, index) => (
+                      <li key={`${index}-${item}`} className="flex gap-2">
+                        <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-slate-100 text-[10px] font-semibold text-slate-500">{index + 1}</span>
+                        <span>{item}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+            </section>
+
+            <section className="space-y-4">
+              <div className="rounded-xl border border-blue-100 bg-blue-50/60 p-4">
+                <div className="flex items-start gap-3">
+                  <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-blue-600" />
+                  <div>
+                    <p className="text-sm font-semibold text-blue-950">下一步</p>
+                    <p className="mt-1 text-xs leading-relaxed text-blue-800">{profile.next_action}</p>
+                    {liveMissingFields.length > 0 && (
+                      <p className="mt-2 text-xs text-amber-700">
+                        还缺少：{liveMissingFields.map((key) => fieldLabelOf(channel.type, key)).join('、')}
+                      </p>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {profile.can_scan && (
+                <button
+                  type="button"
+                  data-tour="channel-onboarding-scan"
+                  onClick={onScan}
+                  className="flex w-full items-center justify-center gap-2 rounded-xl bg-slate-950 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-800"
+                >
+                  <QrCode className="h-4 w-4" />
+                  扫码授权
+                </button>
+              )}
+
+              {fields.length > 0 ? (
+                <div className="rounded-xl border border-slate-200 p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="text-sm font-semibold text-slate-900">凭据配置</p>
+                    <button
+                      type="button"
+                      onClick={onOpenStandaloneConfig}
+                      className="text-xs font-medium text-blue-600 hover:text-blue-700"
+                    >
+                      单独配置
+                    </button>
+                  </div>
+                  <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                    {fields.map((field) => {
+                      const required = profile.required_fields.includes(field.key);
+                      return (
+                        <div key={field.key} className={field.type === 'password' ? 'sm:col-span-2' : undefined}>
+                          <label className="mb-1 flex items-center gap-1 text-xs font-medium text-slate-700">
+                            {field.label}
+                            {required && <span className="text-amber-600">*</span>}
+                          </label>
+                          {field.type === 'select' ? (
+                            <select
+                              value={values[field.key] ?? ''}
+                              onChange={(e) => onChange({ ...values, [field.key]: e.target.value })}
+                              aria-label={field.label}
+                              className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                            >
+                              <option value="">请选择</option>
+                              {field.options?.map((opt) => (
+                                <option key={opt.value} value={opt.value}>{opt.label}</option>
+                              ))}
+                            </select>
+                          ) : (
+                            <input
+                              type={field.type}
+                              placeholder={field.placeholder}
+                              value={values[field.key] ?? ''}
+                              onChange={(e) => onChange({ ...values, [field.key]: e.target.value })}
+                              aria-label={field.label}
+                              className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900 placeholder-slate-400 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                            />
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={saveConfig}
+                    disabled={saving}
+                    data-tour="channel-config-save"
+                    className="mt-4 inline-flex w-full items-center justify-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:opacity-60"
+                  >
+                    {saving && <Loader2 className="h-4 w-4 animate-spin" />}
+                    {saving ? '保存中...' : '保存配置'}
+                  </button>
+                </div>
+              ) : (
+                <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">
+                  该渠道无需额外配置，直接测试连接或同步收件箱即可。
+                </div>
+              )}
+
+              <div className="grid gap-3 sm:grid-cols-2">
+                <button
+                  type="button"
+                  onClick={() => onTest(channel.type)}
+                  disabled={testing}
+                  className="inline-flex items-center justify-center gap-2 rounded-lg border border-slate-200 px-4 py-2 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 disabled:opacity-60"
+                >
+                  {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+                  {testing ? '测试中...' : '测试连接'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onSync(channel.type)}
+                  disabled={syncing}
+                  className="inline-flex items-center justify-center gap-2 rounded-lg border border-slate-200 px-4 py-2 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 disabled:opacity-60"
+                >
+                  {syncing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                  {syncing ? '同步中...' : '同步收件箱'}
+                </button>
+              </div>
+
+              {(testResult || syncResult) && (
+                <div className="space-y-2">
+                  {testResult && (
+                    <div className={clsx('flex items-center gap-2 rounded-lg px-3 py-2 text-xs', testResult.success ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700')}>
+                      {testResult.success ? <CheckCircle2 className="h-4 w-4" /> : <XCircle className="h-4 w-4" />}
+                      <span>{testResult.message}</span>
+                    </div>
+                  )}
+                  {syncResult && (
+                    <div className={clsx('flex items-center gap-2 rounded-lg px-3 py-2 text-xs', syncResult.success ? 'bg-green-50 text-green-700' : 'bg-amber-50 text-amber-700')}>
+                      {syncResult.success ? <CheckCircle2 className="h-4 w-4" /> : <AlertCircle className="h-4 w-4" />}
+                      <span>{syncResult.message}</span>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <div className="rounded-xl border border-slate-200 p-4">
+                <p className="text-sm font-semibold text-slate-900">验收标准</p>
+                <ul className="mt-3 space-y-2 text-xs leading-relaxed text-slate-600">
+                  {profile.success_criteria.map((item) => (
+                    <li key={item} className="flex gap-2">
+                      <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-green-600" />
+                      <span>{item}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            </section>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -914,8 +1517,26 @@ function ChannelScanModal({
 /* ========== Tab 2：AI 助手 ========== */
 
 function AIAssistantTab() {
+  type LlmDiagnostics = {
+    config_path?: string;
+    config_exists?: boolean;
+    saved_provider?: string;
+    saved_model?: string;
+    saved_has_api_key?: boolean;
+    effective_provider?: string;
+    effective_model?: string;
+    effective_base_url?: string;
+    effective_source?: string;
+    effective_has_api_key?: boolean;
+    dotenvs?: Array<{ path?: string; exists?: boolean; llm_keys_present?: string[] }>;
+    env_presence?: Record<string, boolean>;
+    last_probe?: { success?: boolean; checked_at?: string; provider?: string; model?: string; latency_ms?: number; error?: string };
+  };
   const [config, setConfig] = useState<LLMConfig>({
     model: 'xcauto',
+    llmModel: '',
+    baseUrl: '',
+    keyPrefix: '',
     apiKey: '',
     connected: false,
     autoReplyEnabled: false,
@@ -924,17 +1545,34 @@ function AIAssistantTab() {
   });
   const [showApiKey, setShowApiKey] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [probing, setProbing] = useState(false);
   const [saveMessage, setSaveMessage] = useState('');
+  const [saveMessageType, setSaveMessageType] = useState<'success' | 'error' | 'info'>('info');
+  const [diagnostics, setDiagnostics] = useState<LlmDiagnostics | null>(null);
+
+  const refreshDiagnostics = useCallback(() => {
+    getLlmDiagnostics()
+      .then((res) => {
+        const data = (res as any)?.data?.data ?? (res as any)?.data ?? res;
+        setDiagnostics(data && typeof data === 'object' ? data : null);
+      })
+      .catch(() => setDiagnostics(null));
+  }, []);
 
   useEffect(() => {
     getLlmStatus()
       .then((res) => {
-        const data = (res as any)?.data ?? res;
+        const data = (res as any)?.data?.data ?? (res as any)?.data ?? res;
         if (data && typeof data === 'object') {
+          const provider = normalizeLlmProvider(String(data.provider || data.model || config.model));
           setConfig((prev) => ({
             ...prev,
-            model: data.model ?? prev.model,
-            connected: data.connected ?? prev.connected,
+            model: provider,
+            llmModel: String(data.model || prev.llmModel || ''),
+            baseUrl: String(data.base_url || prev.baseUrl || ''),
+            keyPrefix: String(data.key_prefix || prev.keyPrefix || ''),
+            message: String(data.message || prev.message || ''),
+            connected: Boolean(data.connected ?? prev.connected),
             autoReplyEnabled: data.autoReplyEnabled ?? prev.autoReplyEnabled,
             autoReplyStages: data.autoReplyStages ?? prev.autoReplyStages,
             confirmScenarios: data.confirmScenarios ?? prev.confirmScenarios,
@@ -942,16 +1580,77 @@ function AIAssistantTab() {
         }
       })
       .catch(() => {});
-  }, []);
+    refreshDiagnostics();
+  }, [refreshDiagnostics]);
 
   const handleSave = async () => {
     setSaving(true);
     setSaveMessage('');
-    // 模拟保存
-    await new Promise((r) => setTimeout(r, 800));
-    setSaving(false);
-    setSaveMessage('配置已保存');
-    setTimeout(() => setSaveMessage(''), 3000);
+    try {
+      const provider = normalizeLlmProvider(config.model);
+      const res = await saveLlmConfig({
+        provider: provider === 'xcauto' ? 'auto' : provider,
+        model: config.llmModel || LLM_DEFAULT_PARAMS[provider]?.model || '',
+        base_url: config.baseUrl || LLM_DEFAULT_PARAMS[provider]?.baseUrl || '',
+        api_key: config.apiKey,
+        auto_reply_enabled: config.autoReplyEnabled,
+        auto_reply_stages: config.autoReplyStages,
+        confirm_scenarios: config.confirmScenarios,
+      });
+      const data = (res as any)?.data?.data ?? (res as any)?.data ?? res;
+      const connected = Boolean(data?.connected);
+      setConfig((prev) => ({
+        ...prev,
+        model: normalizeLlmProvider(String(data?.provider || provider)),
+        llmModel: String(data?.model || prev.llmModel || ''),
+        baseUrl: String(data?.base_url || prev.baseUrl || ''),
+        keyPrefix: String(data?.key_prefix || prev.keyPrefix || ''),
+        message: String(data?.message || prev.message || ''),
+        apiKey: '',
+        connected,
+        autoReplyEnabled: Boolean(data?.autoReplyEnabled ?? prev.autoReplyEnabled),
+        autoReplyStages: Array.isArray(data?.autoReplyStages) ? data.autoReplyStages : prev.autoReplyStages,
+        confirmScenarios: Array.isArray(data?.confirmScenarios) ? data.confirmScenarios : prev.confirmScenarios,
+      }));
+      setSaveMessageType(connected ? 'success' : 'error');
+      setSaveMessage(data?.message || (connected ? '配置已保存并连通' : '配置已保存，但真实连通测试未通过'));
+      refreshDiagnostics();
+    } catch (error) {
+      setSaveMessageType('error');
+      setSaveMessage('保存失败，请检查后端服务和 API Key');
+    } finally {
+      setSaving(false);
+      setTimeout(() => setSaveMessage(''), 3000);
+    }
+  };
+
+  const handleProbe = async () => {
+    setProbing(true);
+    setSaveMessage('');
+    try {
+      const res = await probeLlmConfig();
+      const data = (res as any)?.data?.data ?? (res as any)?.data ?? res;
+      const connected = Boolean(data?.connected);
+      setConfig((prev) => ({
+        ...prev,
+        model: normalizeLlmProvider(String(data?.provider || prev.model)),
+        llmModel: String(data?.model || prev.llmModel || ''),
+        baseUrl: String(data?.base_url || prev.baseUrl || ''),
+        keyPrefix: String(data?.key_prefix || prev.keyPrefix || ''),
+        message: String(data?.message || prev.message || ''),
+        connected,
+      }));
+      const probe = data?.probe || data?.lastProbe || {};
+      setSaveMessageType(connected ? 'success' : 'error');
+      setSaveMessage(connected ? '真实 LLM 连通测试通过' : String(probe?.error || data?.message || '真实 LLM 连通测试未通过'));
+      refreshDiagnostics();
+    } catch {
+      setSaveMessageType('error');
+      setSaveMessage('测试连接失败，请检查后端服务');
+    } finally {
+      setProbing(false);
+      setTimeout(() => setSaveMessage(''), 4000);
+    }
   };
 
   return (
@@ -970,7 +1669,16 @@ function AIAssistantTab() {
               <div className="relative">
                 <select
                   value={config.model}
-                  onChange={(e) => setConfig({ ...config, model: e.target.value })}
+                  onChange={(e) => {
+                    const provider = normalizeLlmProvider(e.target.value);
+                    const defaults = LLM_DEFAULT_PARAMS[provider];
+                    setConfig({
+                      ...config,
+                      model: provider,
+                      llmModel: config.llmModel || defaults?.model || '',
+                      baseUrl: config.baseUrl || defaults?.baseUrl || '',
+                    });
+                  }}
                   aria-label="LLM 模型"
                   className="w-full appearance-none rounded-lg border border-gray-300 px-3 py-2 pr-8 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
                 >
@@ -980,6 +1688,32 @@ function AIAssistantTab() {
                 </select>
                 <ChevronDown className="pointer-events-none absolute right-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
               </div>
+            </div>
+
+            {/* 模型名称 */}
+            <div>
+              <label className="mb-1 block text-sm font-medium text-gray-700">模型名称</label>
+              <input
+                type="text"
+                value={config.llmModel ?? ''}
+                onChange={(e) => setConfig({ ...config, llmModel: e.target.value })}
+                placeholder={LLM_DEFAULT_PARAMS[config.model]?.model || '请输入模型名'}
+                aria-label="模型名称"
+                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+              />
+            </div>
+
+            {/* Base URL */}
+            <div>
+              <label className="mb-1 block text-sm font-medium text-gray-700">Base URL</label>
+              <input
+                type="text"
+                value={config.baseUrl ?? ''}
+                onChange={(e) => setConfig({ ...config, baseUrl: e.target.value })}
+                placeholder={LLM_DEFAULT_PARAMS[config.model]?.baseUrl || 'https://example.com/v1'}
+                aria-label="Base URL"
+                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+              />
             </div>
 
             {/* API Key */}
@@ -1017,7 +1751,58 @@ function AIAssistantTab() {
                   <XCircle className="h-3.5 w-3.5" /> 未连接
                 </span>
               )}
+              {config.keyPrefix && (
+                <span className="rounded bg-gray-100 px-2 py-0.5 text-[11px] text-gray-500">{config.keyPrefix}</span>
+              )}
             </div>
+
+            {diagnostics && (
+              <div className="rounded-lg border border-gray-100 bg-gray-50 p-3 text-xs text-gray-600">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2">
+                    {diagnostics.effective_has_api_key ? (
+                      <CheckCircle2 className="h-4 w-4 text-green-500" />
+                    ) : (
+                      <AlertCircle className="h-4 w-4 text-amber-500" />
+                    )}
+                    <span className="font-medium text-gray-700">后端读取诊断</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={refreshDiagnostics}
+                    className="text-blue-600 hover:text-blue-700"
+                  >
+                    刷新
+                  </button>
+                </div>
+                <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                  <div>
+                    <span className="text-gray-400">配置文件：</span>
+                    {diagnostics.config_exists ? '已存在' : '不存在'}
+                  </div>
+                  <div>
+                    <span className="text-gray-400">有效来源：</span>
+                    {diagnostics.effective_source || '未读取到 Key'}
+                  </div>
+                  <div>
+                    <span className="text-gray-400">有效模型：</span>
+                    {diagnostics.effective_model || diagnostics.saved_model || '-'}
+                  </div>
+                  <div>
+                    <span className="text-gray-400">最近探测：</span>
+                    {diagnostics.last_probe?.success ? '通过' : diagnostics.last_probe?.error || '未探测'}
+                  </div>
+                </div>
+                <p className="mt-2 break-all text-[11px] text-gray-400">
+                  {diagnostics.config_path}
+                </p>
+                {!diagnostics.effective_has_api_key && (
+                  <div className="mt-2 rounded-md bg-amber-50 px-2 py-1.5 text-amber-700">
+                    当前后端没有读到真实 API Key。请在本页保存 API Key，或在项目根目录、`backend`、`desktop` 下的 `.env` / `.env.local` / `.env.production` 写入对应环境变量后重启后端。
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </div>
 
@@ -1065,16 +1850,29 @@ function AIAssistantTab() {
         <div className="flex items-center gap-3">
           <button
             onClick={handleSave}
-            disabled={saving}
+            disabled={saving || probing}
             aria-label="保存配置"
             data-tour="ai-save-config"
             className="rounded-lg bg-blue-600 px-5 py-2 text-sm font-medium text-white transition hover:bg-blue-700 disabled:opacity-50"
           >
             {saving ? '保存中...' : '保存配置'}
           </button>
+          <button
+            onClick={handleProbe}
+            disabled={saving || probing}
+            aria-label="测试 LLM 连接"
+            className="rounded-lg border border-gray-200 bg-white px-4 py-2 text-sm font-medium text-gray-700 transition hover:bg-gray-50 disabled:opacity-50"
+          >
+            {probing ? '测试中...' : '测试连接'}
+          </button>
           {saveMessage && (
-            <span className="flex items-center gap-1 text-sm text-green-600">
-              <CheckCircle2 className="h-4 w-4" /> {saveMessage}
+            <span
+              className={clsx(
+                'flex items-center gap-1 text-sm',
+                saveMessageType === 'success' ? 'text-green-600' : saveMessageType === 'error' ? 'text-red-500' : 'text-gray-500'
+              )}
+            >
+              {saveMessageType === 'error' ? <AlertCircle className="h-4 w-4" /> : <CheckCircle2 className="h-4 w-4" />} {saveMessage}
             </span>
           )}
         </div>
@@ -1496,6 +2294,7 @@ function ProfileTab() {
   });
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [mockReloading, setMockReloading] = useState(false);
   // Mock 数据开关
   const [mockOn, setMockOn] = useState<boolean>(() => {
     try {
@@ -1506,12 +2305,14 @@ function ProfileTab() {
   });
   const toggleMock = (v: boolean) => {
     setMockOn(v);
+    setMockReloading(true);
     try {
       if (v) localStorage.setItem('kellai:useMock', '1');
       else localStorage.removeItem('kellai:useMock');
     } catch {
       // ignore
     }
+    window.setTimeout(() => window.location.reload(), 450);
   };
   const [saveMessage, setSaveMessage] = useState('');
 
@@ -1525,6 +2326,37 @@ function ProfileTab() {
       : onboardingState === "skipped"
       ? "已跳过"
       : "未开始";
+
+  useEffect(() => {
+    void preloadTextToSpeech(ONBOARDING_WELCOME_SPEECH_TEXT, ONBOARDING_WELCOME_CACHE_KEY);
+  }, []);
+
+  const handleRestartOnboarding = () => {
+    unlockTextToSpeechAudio();
+    const speechWindow = window as OnboardingSpeechWindow;
+    const fallbackUntil = Date.now() + estimateSpeechHoldMs(ONBOARDING_WELCOME_SPEECH_TEXT, null);
+    const preplayed = playPreparedTextToSpeech(
+      ONBOARDING_WELCOME_SPEECH_TEXT,
+      ONBOARDING_WELCOME_CACHE_KEY,
+      {
+        onPlaybackStart: (info) => {
+          speechWindow.__kellaiOnboardingWelcomePreplayedUntil =
+            Date.now() + estimateSpeechHoldMs(ONBOARDING_WELCOME_SPEECH_TEXT, info.durationSeconds);
+        },
+        onPlaybackError: () => {
+          speechWindow.__kellaiOnboardingWelcomePreplayedUntil = 0;
+        },
+      }
+    );
+    if (preplayed) {
+      speechWindow.__kellaiOnboardingWelcomePreplayedUntil = fallbackUntil;
+    } else {
+      void preloadTextToSpeech(ONBOARDING_WELCOME_SPEECH_TEXT, ONBOARDING_WELCOME_CACHE_KEY);
+    }
+    resetOnboarding();
+    setOnboardingActive(false);
+    window.setTimeout(() => setOnboardingActive(true), 0);
+  };
 
   useEffect(() => {
     getUserInfo()
@@ -1673,10 +2505,7 @@ function ProfileTab() {
           </p>
           <div className="mt-3 flex items-center gap-3">
             <button
-              onClick={() => {
-                resetOnboarding();
-                setOnboardingActive(true);
-              }}
+              onClick={handleRestartOnboarding}
               className="flex items-center gap-1.5 rounded-lg bg-gradient-to-r from-blue-500 to-indigo-600 px-4 py-2 text-sm font-medium text-white shadow-sm transition hover:from-blue-600 hover:to-indigo-700"
             >
               <HelpCircle className="h-4 w-4" />
@@ -1693,7 +2522,7 @@ function ProfileTab() {
           <h3 className="text-sm font-semibold text-amber-800">🧪 Mock 测试数据</h3>
           <p className="mt-1 text-xs text-amber-700">
             后端没起 / 想测 UI 时打开。开启后所有 <code className="rounded bg-amber-100 px-1">/api/kellai/*</code> 会用本地 12 个测试客户响应。
-            关闭后刷新即可恢复真实后端。
+            切换后会自动刷新，让请求 adapter 立即生效。
           </p>
           <div className="mt-3 flex items-center gap-3">
             <Toggle
@@ -1702,7 +2531,11 @@ function ProfileTab() {
               ariaLabel="使用 Mock 数据"
             />
             <span className="text-xs text-amber-700">
-              {mockOn ? '当前：Mock 模式已开启' : '当前：Mock 模式关闭'}
+              {mockReloading
+                ? `正在切换到${mockOn ? ' Mock 模式' : '真实后端'}...`
+                : mockOn
+                ? '当前：Mock 模式已开启'
+                : '当前：Mock 模式关闭'}
             </span>
             <button
               onClick={() => window.location.reload()}

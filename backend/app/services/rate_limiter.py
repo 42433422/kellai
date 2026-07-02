@@ -90,11 +90,12 @@ class InMemoryTokenBucketLimiter:
             self._buckets.pop(key, None)
 
 
-# --- 单例：LLM 限流 ---
-# 每用户每分钟最多 20 次：capacity=20, refill_rate=20/60 ≈ 0.333
+# --- 单例：LLM/AI 辅助端点限流 ---
+# 客户详情会并行读取画像、洞察、质检、工单、自学习、外呼、自助解决等本地 AI 辅助结果；
+# 这些端点多数不触发真实 LLM 调用。桌面端默认给到 120/min，避免详情页刷新和后台轮询误伤。
 _llm_limiter = InMemoryTokenBucketLimiter()
-LLM_LIMITER_CAPACITY = 20
-LLM_LIMITER_REFILL_PER_SEC = 20.0 / 60.0  # 每秒 1/3 个令牌
+LLM_LIMITER_CAPACITY = 120
+LLM_LIMITER_REFILL_PER_SEC = 120.0 / 60.0
 
 
 def check_llm_rate_limit(user_key: str) -> tuple[bool, float]:

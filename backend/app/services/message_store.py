@@ -87,13 +87,25 @@ def _connect():
 def save_message(msg: UnifiedMessage) -> UnifiedMessage:
     """保存一条消息到数据库。"""
     ensure_messages_schema()
+    if int(msg.customer_id or 0) <= 0:
+        try:
+            from app.services.growth_loop import resolve_customer_for_message
+            from app.services.pipeline import _customer_id_from_doc
+
+            doc = resolve_customer_for_message(msg)
+            uid = _customer_id_from_doc(doc)
+            if uid > 0:
+                msg = msg.model_copy(update={"customer_id": uid})
+        except Exception:
+            logger.warning("保存消息前解析客户失败: message_id=%s", msg.id, exc_info=True)
+    is_read = 0 if str(msg.direction or "").lower() == "inbound" else 1
     with _connect() as conn:
         conn.execute(
             """
             INSERT OR REPLACE INTO kellai_messages
                 (id, customer_id, channel_type, contact_id, contact_name,
                  direction, content, content_type, metadata_json, created_at, is_read)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 msg.id,
@@ -106,8 +118,15 @@ def save_message(msg: UnifiedMessage) -> UnifiedMessage:
                 msg.content_type,
                 json.dumps(msg.metadata, ensure_ascii=False),
                 msg.created_at,
+                is_read,
             ),
         )
+    try:
+        from app.services.growth_loop import apply_message_to_growth_loop
+
+        apply_message_to_growth_loop(msg)
+    except Exception:
+        logger.warning("消息已保存但增长闭环更新失败: message_id=%s", msg.id, exc_info=True)
     return msg
 
 
@@ -158,6 +177,80 @@ def get_messages(
             )
         )
     return messages
+
+
+def get_messages_with_state(
+    customer_id: int,
+    channel_type: str = "",
+    limit: int = 50,
+    since: str = "",
+) -> list[dict[str, Any]]:
+    """获取消息列表，包含前端闭环展示需要的 read/customer/stage/intent 字段。"""
+    ensure_messages_schema()
+    with _connect() as conn:
+        clauses: list[str] = ["customer_id = ?"]
+        params: list[Any] = [int(customer_id)]
+        if channel_type:
+            clauses.append("channel_type = ?")
+            params.append(channel_type)
+        if since:
+            clauses.append("created_at > ?")
+            params.append(since)
+        where = " AND ".join(clauses)
+        params.append(limit)
+        rows = conn.execute(
+            f"SELECT * FROM kellai_messages WHERE {where} ORDER BY created_at DESC LIMIT ?",
+            params,
+        ).fetchall()
+
+    try:
+        from app.services.growth_loop import customer_message_context
+
+        ctx = customer_message_context(int(customer_id))
+    except Exception:
+        logger.debug("获取客户消息上下文失败: customer_id=%s", customer_id, exc_info=True)
+        ctx = {
+            "customer_id": int(customer_id),
+            "customer_name": f"客户{customer_id}",
+            "stage": "",
+            "stage_label": "",
+            "ai_score": 0.0,
+            "ai_intent": "",
+            "pending_follow_up": False,
+            "next_action": "",
+        }
+
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        metadata: dict = {}
+        raw_meta = row["metadata_json"]
+        if raw_meta:
+            try:
+                metadata = json.loads(raw_meta)
+            except (json.JSONDecodeError, TypeError):
+                metadata = {}
+        item = {
+            "id": row["id"],
+            "customer_id": int(row["customer_id"]),
+            "customer_name": ctx.get("customer_name") or f"客户{customer_id}",
+            "contact_id": row["contact_id"],
+            "contact_name": row["contact_name"],
+            "channel_type": row["channel_type"],
+            "direction": row["direction"],
+            "content": row["content"],
+            "content_type": row["content_type"],
+            "metadata": metadata,
+            "read": bool(row["is_read"]),
+            "created_at": row["created_at"],
+            "stage": ctx.get("stage") or "",
+            "stage_label": ctx.get("stage_label") or "",
+            "ai_score": ctx.get("ai_score") or 0.0,
+            "ai_intent": metadata.get("ai_intent") or ctx.get("ai_intent") or "",
+            "pending_follow_up": bool(ctx.get("pending_follow_up")),
+            "next_action": ctx.get("next_action") or "",
+        }
+        result.append(item)
+    return result
 
 
 def get_unread_count(customer_id: int) -> int:

@@ -7,6 +7,7 @@
 
 环境变量：
 - KELLAI_MINIAPP_APPID
+- KELLAI_MINIAPP_APP_ID（兼容前端字段 app_id）
 - KELLAI_MINIAPP_SECRET
 - KELLAI_MINIAPP_TEMPLATE_ID（默认订阅消息模板）
 """
@@ -20,28 +21,64 @@ from typing import Any
 import httpx
 
 from app.channels.base import ChannelAdapter, UnifiedMessage
+from app.channels.config_store import get_field
 from app.channels.http_client import CachedToken, read_env
 
 logger = logging.getLogger(__name__)
 
 
-_UNCONFIGURED_MSG = "小程序渠道未配置（缺少 KELLAI_MINIAPP_APPID/SECRET）"
+_UNCONFIGURED_MSG = "小程序渠道未配置（缺少 app_id/app_secret）"
+
+
+def _app_id() -> str:
+    return (
+        get_field("miniprogram", "app_id")
+        or get_field("miniapp", "app_id")
+        or read_env("KELLAI_MINIAPP_APPID")
+        or read_env("KELLAI_MINIAPP_APP_ID")
+        or read_env("KELLAI_MINIPROGRAM_APPID")
+        or read_env("KELLAI_MINIPROGRAM_APP_ID")
+    )
+
+
+def _app_secret() -> str:
+    return (
+        get_field("miniprogram", "app_secret")
+        or get_field("miniapp", "app_secret")
+        or get_field("miniprogram", "secret")
+        or get_field("miniapp", "secret")
+        or read_env("KELLAI_MINIAPP_SECRET")
+        or read_env("KELLAI_MINIAPP_APP_SECRET")
+        or read_env("KELLAI_MINIPROGRAM_SECRET")
+        or read_env("KELLAI_MINIPROGRAM_APP_SECRET")
+    )
+
+
+def _template_id() -> str:
+    return (
+        get_field("miniprogram", "template_id")
+        or get_field("miniapp", "template_id")
+        or read_env("KELLAI_MINIAPP_TEMPLATE_ID")
+        or read_env("KELLAI_MINIPROGRAM_TEMPLATE_ID")
+    )
+
+
+def _inbox_channel_types() -> list[str]:
+    return ["miniprogram", "miniapp"]
 
 
 class MiniAppAdapter(ChannelAdapter):
     """小程序渠道适配器。"""
 
-    channel_type = "miniapp"
+    channel_type = "miniprogram"
 
     def __init__(self) -> None:
-        self._appid: str = read_env("KELLAI_MINIAPP_APPID")
-        self._secret: str = read_env("KELLAI_MINIAPP_SECRET")
-        self._template_id: str = read_env("KELLAI_MINIAPP_TEMPLATE_ID")
         self._client: httpx.AsyncClient | None = None
         self._token: CachedToken | None = None
+        self._token_config_key: tuple[str, str] | None = None
 
     def _is_configured(self) -> bool:
-        return bool(self._appid and self._secret)
+        return bool(_app_id() and _app_secret())
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -56,7 +93,7 @@ class MiniAppAdapter(ChannelAdapter):
         client = await self._get_client()
         resp = await client.get(
             "/cgi-bin/token",
-            params={"grant_type": "client_credential", "appid": self._appid, "secret": self._secret},
+            params={"grant_type": "client_credential", "appid": _app_id(), "secret": _app_secret()},
         )
         try:
             body = resp.json()
@@ -71,8 +108,10 @@ class MiniAppAdapter(ChannelAdapter):
         return token, ttl
 
     def _ensure_token_cache(self) -> CachedToken:
-        if self._token is None:
+        current_key = (_app_id(), _app_secret())
+        if self._token is None or self._token_config_key != current_key:
             self._token = CachedToken(self._fetch_token, ttl_sec=7000)
+            self._token_config_key = current_key
         return self._token
 
     async def _on_token_invalid(self) -> None:
@@ -95,9 +134,9 @@ class MiniAppAdapter(ChannelAdapter):
         if not contact_id:
             return {"success": False, "message_id": "", "error": "contact_id (openid) 不能为空"}
 
-        template_id = str(kwargs.get("template_id") or self._template_id)
+        template_id = str(kwargs.get("template_id") or _template_id())
         if not template_id:
-            return {"success": False, "message_id": "", "error": "缺少 template_id（设置 KELLAI_MINIAPP_TEMPLATE_ID 或传 template_id）"}
+            return {"success": False, "message_id": "", "error": "缺少 template_id（设置渠道 template_id 或传 template_id）"}
 
         # 兼容两种调用：直接传 content 走默认 "thing" 字段；或传 data 走完整模板
         data: dict[str, dict[str, str]] = kwargs.get("data") or {}
@@ -149,7 +188,11 @@ class MiniAppAdapter(ChannelAdapter):
         """从收件箱表读取（云函数 HTTP 触发已写入）。"""
         try:
             from app.services.message_store import list_inbox
-            rows = list_inbox(self.channel_type, limit=int(limit))
+            rows: list[dict[str, Any]] = []
+            for channel_type in _inbox_channel_types():
+                rows.extend(list_inbox(channel_type, limit=max(int(limit), 1)))
+            rows.sort(key=lambda item: str(item.get("received_at", "")), reverse=True)
+            rows = rows[: int(limit)]
         except Exception as exc:
             logger.warning("读取小程序收件箱失败: %s", exc)
             return []
@@ -162,7 +205,7 @@ class MiniAppAdapter(ChannelAdapter):
                 UnifiedMessage(
                     id=str(r["id"]),
                     customer_id=0,
-                    channel_type=self.channel_type,
+                    channel_type=str(r.get("channel_type") or self.channel_type),
                     contact_id=str(r.get("contact_id", "")),
                     contact_name=str(r.get("contact_name", "")),
                     direction=str(r.get("direction", "inbound")),
@@ -180,7 +223,9 @@ class MiniAppAdapter(ChannelAdapter):
         """小程序联系人：从收件箱聚合 openid 集合。"""
         try:
             from app.services.message_store import list_inbox
-            rows = list_inbox(self.channel_type, limit=500, include_consumed=True)
+            rows: list[dict[str, Any]] = []
+            for channel_type in _inbox_channel_types():
+                rows.extend(list_inbox(channel_type, limit=500, include_consumed=True))
         except Exception:
             return []
         seen: dict[str, dict] = {}
@@ -191,7 +236,7 @@ class MiniAppAdapter(ChannelAdapter):
             seen[cid] = {
                 "id": cid,
                 "name": str(r.get("contact_name", "")) or cid,
-                "channel": self.channel_type,
+                "channel": str(r.get("channel_type") or self.channel_type),
             }
             if keyword and keyword.lower() not in seen[cid]["name"].lower():
                 seen.pop(cid)

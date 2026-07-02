@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1520" height="480" viewBox="0 0 760 240" role="img" aria-label="客来来">
+  <defs>
+    <linearGradient id="kellaiLogoBlue" x1="58" y1="153" x2="174" y2="64" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#129bd7"/>
+      <stop offset="1" stop-color="#16b7c7"/>
+    </linearGradient>
+    <linearGradient id="kellaiLogoGold" x1="56" y1="170" x2="194" y2="164" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffd037"/>
+      <stop offset="1" stop-color="#f5a313"/>
+    </linearGradient>
+  </defs>
+  <circle cx="126" cy="120" r="86" fill="#dcf8ee"/>
+  <path d="M63 138c10-58 56-87 109-82" fill="none" stroke="url(#kellaiLogoBlue)" stroke-width="17" stroke-linecap="round"/>
+  <path d="M63 156c28 22 73 31 125 9" fill="none" stroke="url(#kellaiLogoGold)" stroke-width="17" stroke-linecap="round"/>
+  <path d="M122 59v93c0 13 11 24 24 24h44" fill="none" stroke="#102e60" stroke-width="19" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="177" cy="56" r="11" fill="#17c889"/>
+  <text x="244" y="132" fill="#102e60" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, Heiti SC, Arial Unicode MS, sans-serif" font-size="74" font-weight="800" letter-spacing="0">客来来</text>
+  <path d="M248 157h192" fill="none" stroke="#102e60" stroke-width="6" stroke-linecap="round"/>
+  <circle cx="462" cy="157" r="7" fill="#f5a313"/>
+  <circle cx="486" cy="157" r="7" fill="#16b7c7"/>
+</svg>

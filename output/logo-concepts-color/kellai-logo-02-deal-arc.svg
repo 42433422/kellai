@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 260" role="img" aria-label="客来来 Logo 成交弧线">
+  <rect width="880" height="260" fill="#ffffff"/>
+  <g transform="translate(54 24) scale(0.8)">
+  <defs>
+    <linearGradient id="g2" x1="26" y1="30" x2="238" y2="230" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0ea5e9"/>
+      <stop offset="0.54" stop-color="#10b981"/>
+      <stop offset="1" stop-color="#84cc16"/>
+    </linearGradient>
+  </defs>
+  <path d="M138 34c64 0 110 46 110 110s-46 110-110 110S28 208 28 144 74 34 138 34z" fill="url(#g2)"/>
+  <path d="M78 154c36-42 74-64 116-66" fill="none" stroke="#ffffff" stroke-width="22" stroke-linecap="round"/>
+  <path d="M98 176l38 34 62-78" fill="none" stroke="#ffffff" stroke-width="24" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="86" cy="98" r="12" fill="#f59e0b"/>
+  <circle cx="124" cy="78" r="12" fill="#ffffff"/>
+  <circle cx="164" cy="80" r="12" fill="#ffffff"/>
+  </g>
+  <text x="310" y="156" fill="#15315f" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, Heiti SC, Arial Unicode MS, sans-serif" font-size="104" font-weight="900" letter-spacing="3">客来来</text>
+</svg>

@@ -79,6 +79,10 @@ DEFAULT_CORS_ORIGINS: list[str] = [
     "tauri://127.0.0.1",
     "http://localhost:1420",
     "http://127.0.0.1:1420",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
     "http://localhost:8790",
     "http://127.0.0.1:8790",
 ]

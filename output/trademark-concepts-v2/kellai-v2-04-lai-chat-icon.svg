@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 640" role="img" aria-label="客来来商标 v2 04 来字气泡">
+  <rect width="640" height="640" fill="#ffffff"/>
+  <defs>
+    <linearGradient id="chatIconBg" x1="112" y1="100" x2="528" y2="540" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="0.55" stop-color="#2563eb"/>
+      <stop offset="1" stop-color="#10b981"/>
+    </linearGradient>
+  </defs>
+  <rect x="84" y="84" width="472" height="472" rx="122" fill="url(#chatIconBg)"/>
+  <path d="M180 190h280c42 0 76 34 76 76v66c0 42-34 76-76 76h-84l-96 80v-80H180c-42 0-76-34-76-76v-66c0-42 34-76 76-76z" fill="#ffffff"/>
+  <text x="320" y="378" text-anchor="middle" fill="#0f172a" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, Heiti SC, Arial Unicode MS, sans-serif" font-size="192" font-weight="900">来</text>
+  <circle cx="412" cy="286" r="14" fill="#10b981"/>
+  <circle cx="462" cy="286" r="14" fill="#10b981"/>
+  <circle cx="512" cy="286" r="14" fill="#10b981"/>
+</svg>

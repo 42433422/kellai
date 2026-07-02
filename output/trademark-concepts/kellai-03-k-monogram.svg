@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="客来来商标候选 03">
+  <defs>
+    <linearGradient id="monoBg" x1="58" y1="68" x2="446" y2="444" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="0.45" stop-color="#1d4ed8"/>
+      <stop offset="1" stop-color="#059669"/>
+    </linearGradient>
+  </defs>
+  <rect x="44" y="44" width="424" height="424" rx="96" fill="url(#monoBg)"/>
+  <path d="M160 134v244" stroke="#ffffff" stroke-width="42" stroke-linecap="round"/>
+  <path d="M342 132L188 256l158 124" fill="none" stroke="#ffffff" stroke-width="46" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M244 256h90c28 0 50 22 50 50v12c0 28-22 50-50 50h-28l-56 38v-38h-6" fill="none" stroke="#fbbf24" stroke-width="24" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="302" cy="312" r="8" fill="#fbbf24"/>
+  <circle cx="330" cy="312" r="8" fill="#fbbf24"/>
+  <text x="256" y="438" text-anchor="middle" fill="#dbeafe" font-family="Inter, Arial, sans-serif" font-size="42" font-weight="800" letter-spacing="2">KELAILAI</text>
+</svg>

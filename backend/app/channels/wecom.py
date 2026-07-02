@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 from typing import Any
 
 import httpx
@@ -23,7 +24,7 @@ from app.channels.http_client import BaseChannelClient, CachedToken, read_env
 
 logger = logging.getLogger(__name__)
 
-_UNCONFIGURED_MSG = "企业微信渠道未配置（缺少 corp_id/secret/agent_id 或 bot_webhook）"
+_UNCONFIGURED_MSG = "企业微信渠道未配置（缺少 corp_id/secret/agent_id、bot_webhook 或 kf_url）"
 
 
 def _cfg(field: str, default: str = "") -> str:
@@ -35,6 +36,24 @@ def _cfg(field: str, default: str = "") -> str:
 def _inbox_channel_types() -> list[str]:
     """企微历史上同时出现过 wework/wecom，收件箱读取要兼容。"""
     return ["wework", "wecom"]
+
+
+def _extract_open_kfid(raw: str) -> str:
+    """Extract open_kfid from a WeCom customer-service URL or raw id."""
+    value = (raw or "").strip()
+    if not value:
+        return ""
+    if "/" not in value:
+        return value if value.startswith("kf") else ""
+    try:
+        parsed = urlparse(value)
+    except Exception:
+        return ""
+    path = parsed.path.rstrip("/")
+    marker = "/kfid/"
+    if marker not in path:
+        return ""
+    return path.rsplit(marker, 1)[-1].strip()
 
 
 class _WeComClient(BaseChannelClient):
@@ -113,11 +132,19 @@ class WeComAdapter(ChannelAdapter):
     def _bot_webhook(self) -> str:
         return _cfg("bot_webhook")
 
+    def _kf_url(self) -> str:
+        return _cfg("kf_url")
+
+    def _open_kfid(self) -> str:
+        return _cfg("open_kfid") or _extract_open_kfid(self._kf_url())
+
     def _is_configured(self) -> bool:
         """是否已配置（任一方式）。"""
         if self._bot_webhook():
             return True
         if self._corp_id() and self._corp_secret() and self._agent_id():
+            return True
+        if self._kf_url() and self._open_kfid():
             return True
         return False
 
@@ -147,6 +174,12 @@ class WeComAdapter(ChannelAdapter):
             return {"success": False, "message_id": "", "error": "消息内容为空"}
         if not contact_id:
             return {"success": False, "message_id": "", "error": "contact_id 不能为空"}
+        if self._kf_url() and not (self._bot_webhook() or (self._corp_id() and self._corp_secret() and self._agent_id())):
+            return {
+                "success": False,
+                "message_id": "",
+                "error": "已配置企业微信客服接待链接；该入口可引导客户发起会话，API 发信还需 corp_id/secret/agent_id 或 bot_webhook",
+            }
 
         try:
             if contact_id.startswith("@chat"):
@@ -331,6 +364,11 @@ class WeComAdapter(ChannelAdapter):
             return {
                 "connected": True,
                 "message": "企微群机器人 Webhook 已配置（无需 access_token）",
+            }
+        if self._kf_url() and self._open_kfid():
+            return {
+                "connected": True,
+                "message": f"企业微信客服接待链接已保存（open_kfid={self._open_kfid()}）。API 收发还需配置企业微信客服回调或应用凭据",
             }
         try:
             corp_id = self._corp_id()

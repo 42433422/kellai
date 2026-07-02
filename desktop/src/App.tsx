@@ -70,6 +70,8 @@ function AuthGuard({ children }: { children: React.ReactNode }) {
 function AuthBootstrap({ children }: { children: React.ReactNode }) {
   const loadFromStorage = useAuthStore((s) => s.loadFromStorage);
   const attemptSilentAutoLogin = useAuthStore((s) => s.attemptSilentAutoLogin);
+  const fetchMe = useAuthStore((s) => s.fetchMe);
+  const logout = useAuthStore((s) => s.logout);
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
   const [phase, setPhase] = useState<"idle" | "trying" | "done">("idle");
 
@@ -79,6 +81,14 @@ function AuthBootstrap({ children }: { children: React.ReactNode }) {
       loadFromStorage();
       if (cancelled) return;
       if (useAuthStore.getState().isAuthenticated) {
+        setPhase("trying");
+        try {
+          await fetchMe();
+        } catch {
+          logout();
+          await attemptSilentAutoLogin();
+        }
+        if (cancelled) return;
         setPhase("done");
         return;
       }
@@ -87,7 +97,7 @@ function AuthBootstrap({ children }: { children: React.ReactNode }) {
       if (!cancelled) setPhase("done");
     })();
     return () => { cancelled = true; };
-  }, [loadFromStorage, attemptSilentAutoLogin]);
+  }, [loadFromStorage, fetchMe, logout, attemptSilentAutoLogin]);
 
   if (phase !== "done" && !isAuthenticated) {
     return (

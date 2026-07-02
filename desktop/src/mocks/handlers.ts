@@ -21,6 +21,7 @@
  *   POST   /api/kellai/ai/suggest-reply
  *   POST   /api/kellai/ai/auto-reply
  *   GET    /api/kellai/ai/profile/:id
+ *   GET    /api/kellai/ai/operating-insight/:id
  *   GET    /api/kellai/ai/reminders
  *
  *   GET    /api/kellai/channels
@@ -39,6 +40,7 @@ import {
   updateMockCustomer,
   deleteMockCustomer,
   setMockCustomerStage,
+  stageLabelOf,
   mockStageDefinitions,
 } from './customers';
 
@@ -50,9 +52,53 @@ const messageStore: Record<number, ReturnType<typeof getMockMessages>> = {};
 MOCK_CUSTOMERS.forEach((c) => {
   messageStore[c.customer_id] = getMockMessages(c.customer_id);
 });
+const mockServiceTickets: Record<number, any[]> = {};
+const mockServiceLearning: Record<number, any> = {};
+const mockSelfServiceSessions: Record<number, any[]> = {};
+const mockOutboundCalls: Record<number, any[]> = {};
 
 /** mock 短信验证码存储：phone → code（找回密码 / 验证码登录用） */
 const mockSmsCodes: Record<string, string> = {};
+const mockLlmConfig = {
+  provider: 'deepseek',
+  model: 'deepseek-chat',
+  base_url: 'https://api.deepseek.com/v1',
+  key_prefix: 'mock-key',
+  ready: true,
+  connected: true,
+  verified: true,
+  lastProbe: {
+    success: true,
+    connected: true,
+    checked_at: '2026-06-13T00:00:00Z',
+    provider: 'deepseek',
+    model: 'deepseek-chat',
+    latency_ms: 120,
+    error: '',
+  },
+  autoReplyEnabled: true,
+  autoReplyStages: ['已建联', '需求采集', '已报价', '谈判中'],
+  confirmScenarios: ['价格优惠', '合同条款'],
+  message: 'Mock LLM 已就绪',
+};
+
+const mockKnowledgeArticles: Array<{
+  id: string;
+  title: string;
+  content: string;
+  tags: string[];
+  source: string;
+  updated_at: string;
+}> = [
+  {
+    id: 'mock_kb_wework_offer',
+    title: '企微接入与首月优惠',
+    content: '企业微信接入需要客服链接或 open_kfid。首月优惠需在客户确认合同后申请，付款后安排交付清单、渠道配置和团队培训。',
+    tags: ['企业微信', '优惠', '交付'],
+    source: 'mock',
+    updated_at: '2026-06-13T00:00:00Z',
+  },
+];
 
 /* ============================================================
  *  渠道 mock 状态（按 channelGroups 分组，跨请求持久化）
@@ -487,6 +533,471 @@ export const mockAdapter: AxiosAdapter = async (config) => {
     return ok(config, { success: true, data: p });
   }
 
+  const insightMatch = url.match(/^\/api\/kellai\/ai\/operating-insight\/(\d+)$/);
+  if (insightMatch && method === 'get') {
+    await sendDelay();
+    const cid = Number(insightMatch[1]);
+    const customer = MOCK_CUSTOMERS.find((item) => item.customer_id === cid);
+    if (!customer) return notFound(config, '客户不存在');
+    const messages = messageStore[cid] ?? getMockMessages(cid);
+    return ok(config, {
+      success: true,
+      data: {
+        customer_id: cid,
+        memory_summary: `${customer.display_name} 当前处于 ${stageLabelOf(customer.stage)} 阶段；已打通渠道：${(customer.channel_sources || []).join(' / ') || '暂无'}；最近消息：${messages[messages.length - 1]?.content || '暂无'}`,
+        channel_sources: customer.channel_sources || [],
+        channel_contacts: { [customer.channel_sources?.[0] || 'wework']: customer.contact_id || `mock_${cid}` },
+        last_inbound_preview: messages.filter((msg) => msg.direction === 'inbound').slice(-1)[0]?.content || '',
+        risk_signals: [
+          { key: 'price_objection', label: '价格异议', matched: '预算、报价' },
+        ],
+        management_insights: [
+          { key: 'omnichannel_one_id', label: '跨渠道 One ID 已形成', value: (customer.channel_sources || []).join(' / ') },
+          { key: 'pricing_signal', label: '价格敏感客户', value: '准备阶梯套餐' },
+          { key: 'active_customer', label: '客户多轮主动咨询', value: `${messages.filter((msg) => msg.direction === 'inbound').length} 轮入站消息` },
+        ],
+        active_task: '跟进报价反馈，处理异议',
+        pending_follow_up: true,
+        ai_score: customer.ai_score,
+        message_count: messages.length,
+      },
+    });
+  }
+
+  const qualityMatch = url.match(/^\/api\/kellai\/ai\/quality-inspection\/(\d+)$/);
+  if (qualityMatch && method === 'get') {
+    await sendDelay();
+    const cid = Number(qualityMatch[1]);
+    const customer = MOCK_CUSTOMERS.find((item) => item.customer_id === cid);
+    if (!customer) return notFound(config, '客户不存在');
+    const messages = messageStore[cid] ?? getMockMessages(cid);
+    const inbound = messages.filter((msg) => msg.direction === 'inbound');
+    const outbound = messages.filter((msg) => msg.direction === 'outbound');
+    const risky = inbound.some((msg) => /投诉|差评|退款|不满意|太慢/.test(msg.content));
+    return ok(config, {
+      success: true,
+      data: {
+        customer_id: cid,
+        customer_name: customer.display_name,
+        score: risky ? 62 : 86,
+        grade: risky ? 'C' : 'B',
+        review_required: risky,
+        risk_level: risky ? 'high' : 'low',
+        message_count: messages.length,
+        inbound_count: inbound.length,
+        outbound_count: outbound.length,
+        response_coverage: inbound.length ? Math.min(1, outbound.length / inbound.length) : 1,
+        unanswered_inbound: inbound.length > outbound.length,
+        failed_rules: risky
+          ? [
+              { key: 'negative_sentiment', label: '客户负面情绪', severity: 'high', matched: '投诉、退款' },
+              { key: 'handoff_required', label: '需要人工/主管介入', severity: 'medium', matched: '主管' },
+            ]
+          : [],
+        recommendations: risky
+          ? ['优先安抚客户，承认问题并给出明确处理时限。', '生成主管待办，并把客户诉求、最近消息和风险原因带过去。']
+          : ['当前会话无明显质检风险，保持标准回复节奏并继续沉淀知识库。'],
+        manager_report: {
+          summary: `${customer.display_name} 质检得分 ${risky ? 62 : 86}，共检查 ${messages.length} 条消息。`,
+          suggested_action: risky ? '主管介入复盘话术并安排补救跟进' : '继续自动跟进并抽样复查',
+          risk_level: risky ? 'high' : 'low',
+        },
+      },
+    });
+  }
+
+  const serviceTicketListMatch = url.match(/^\/api\/kellai\/ai\/service-tickets\/(\d+)$/);
+  if (serviceTicketListMatch && method === 'get') {
+    await sendDelay();
+    const cid = Number(serviceTicketListMatch[1]);
+    const tickets = mockServiceTickets[cid] ?? [];
+    const sorted = [...tickets].sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')));
+    const open = sorted.filter((item) => item.status !== 'resolved');
+    return ok(config, {
+      success: true,
+      data: {
+        customer_id: cid,
+        total: sorted.length,
+        open: open.length,
+        resolved: sorted.length - open.length,
+        latest: sorted[0] ?? null,
+        tickets: sorted,
+      },
+    });
+  }
+
+  if (url === '/api/kellai/ai/service-tickets' && method === 'post') {
+    await sendDelay();
+    const cid = Number(data?.customer_id || 0);
+    if (!cid) return notFound(config, '客户不存在');
+    const now = new Date().toISOString();
+    const ticket = {
+      id: `mock_ticket_${Date.now()}`,
+      customer_id: cid,
+      title: String(data?.title || '主管介入：客服质检高风险'),
+      status: 'open',
+      priority: String(data?.priority || 'urgent'),
+      risk_level: 'high',
+      assignee: String(data?.assignee || ''),
+      reason: 'Mock 质检命中高风险，需要主管复核。',
+      recommendations: ['优先安抚客户，承认问题并给出明确处理时限。', '删除绝对化承诺，改为明确交付条件和时间边界。'],
+      due_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+      ai_rehost_action: '',
+      created_at: now,
+      updated_at: now,
+      events: [{ action: 'created', actor: 'mock', at: now }],
+    };
+    mockServiceTickets[cid] = [ticket, ...(mockServiceTickets[cid] ?? [])];
+    return ok(config, { success: true, data: ticket });
+  }
+
+  const ticketAssignMatch = url.match(/^\/api\/kellai\/ai\/service-tickets\/([^/]+)\/assign$/);
+  if (ticketAssignMatch && method === 'post') {
+    await sendDelay();
+    const ticketId = ticketAssignMatch[1];
+    for (const tickets of Object.values(mockServiceTickets)) {
+      const ticket = tickets.find((item) => item.id === ticketId);
+      if (!ticket) continue;
+      ticket.status = 'assigned';
+      ticket.assignee = String(data?.assignee || '质检主管');
+      ticket.updated_at = new Date().toISOString();
+      ticket.events.push({ action: 'assigned', actor: 'mock', at: ticket.updated_at });
+      return ok(config, { success: true, data: ticket });
+    }
+    return notFound(config, '工单不存在');
+  }
+
+  const ticketResolveMatch = url.match(/^\/api\/kellai\/ai\/service-tickets\/([^/]+)\/resolve$/);
+  if (ticketResolveMatch && method === 'post') {
+    await sendDelay();
+    const ticketId = ticketResolveMatch[1];
+    for (const tickets of Object.values(mockServiceTickets)) {
+      const ticket = tickets.find((item) => item.id === ticketId);
+      if (!ticket) continue;
+      ticket.status = 'resolved';
+      ticket.resolution = String(data?.resolution || '已处理');
+      ticket.resolved_at = new Date().toISOString();
+      ticket.updated_at = ticket.resolved_at;
+      ticket.ai_rehost_action = '主管已处理高风险会话，AI 可继续按合规话术跟进客户下一步。';
+      ticket.events.push({ action: 'resolved', actor: 'mock', at: ticket.updated_at });
+      ticket.events.push({ action: 'rehosted_to_ai', actor: 'mock', at: ticket.updated_at });
+      return ok(config, { success: true, data: ticket });
+    }
+    return notFound(config, '工单不存在');
+  }
+
+  const serviceLearningMatch = url.match(/^\/api\/kellai\/ai\/service-learning\/(\d+)$/);
+  if (serviceLearningMatch && (method === 'get' || method === 'post')) {
+    await sendDelay();
+    const cid = Number(serviceLearningMatch[1]);
+    const customer = MOCK_CUSTOMERS.find((item) => item.customer_id === cid);
+    if (!customer) return notFound(config, '客户不存在');
+    const messages = messageStore[cid] ?? getMockMessages(cid);
+    const tickets = mockServiceTickets[cid] ?? [];
+    const resolvedTickets = tickets.filter((item) => item.status === 'resolved');
+    const article = {
+      id: `service_learning_${cid}`,
+      title: `服务复盘：${customer.display_name}`,
+      content: '把质检规则、主管处理结论和 AI 回托口径沉淀成客服知识库 SOP。',
+      tags: ['服务复盘', '质检', '工单', '合规', '回托AI'],
+      source: 'service_learning',
+      updated_at: new Date().toISOString(),
+    };
+    if (method === 'post') {
+      mockServiceLearning[cid] = article;
+    }
+    const persistedArticle = mockServiceLearning[cid] ?? null;
+    return ok(config, {
+      success: true,
+      data: {
+        customer_id: cid,
+        customer_name: customer.display_name,
+        generated_at: new Date().toISOString(),
+        persisted: Boolean(persistedArticle),
+        passed: Boolean(persistedArticle) && messages.length > 0,
+        metrics: {
+          inspected_conversations: messages.length,
+          inbound_count: messages.filter((msg) => msg.direction === 'inbound').length,
+          outbound_count: messages.filter((msg) => msg.direction === 'outbound').length,
+          quality_score: 82,
+          response_coverage: 1,
+          high_risk_cases: resolvedTickets.length ? 1 : 0,
+          ticket_total: tickets.length,
+          ticket_open: tickets.filter((item) => item.status !== 'resolved').length,
+          ticket_resolved: resolvedTickets.length,
+          ai_rehosted: tickets.filter((item) => item.ai_rehost_action).length,
+          kb_articles_created: persistedArticle ? 1 : 0,
+          top_risk_rules: resolvedTickets.length ? ['客户负面情绪', '需要人工/主管介入'] : [],
+        },
+        recommendations: [
+          '将主管已确认的回托口径加入后续自动回复确认清单。',
+          '把命中的高风险规则作为客服培训抽查项。',
+        ],
+        article: persistedArticle,
+        article_preview: article,
+        search_hits: persistedArticle ? [{ id: article.id, title: article.title, score: 1 }] : [],
+      },
+    });
+  }
+
+  const selfServiceMatch = url.match(/^\/api\/kellai\/ai\/self-service\/(\d+)$/);
+  if (selfServiceMatch && method === 'get') {
+    await sendDelay();
+    const cid = Number(selfServiceMatch[1]);
+    const customer = MOCK_CUSTOMERS.find((item) => item.customer_id === cid);
+    if (!customer) return notFound(config, '客户不存在');
+    const sessions = [...(mockSelfServiceSessions[cid] ?? [])].sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')));
+    const resolved = sessions.filter((item) => item.status === 'resolved');
+    const handoff = sessions.filter((item) => item.status === 'handoff_required');
+    return ok(config, {
+      success: true,
+      data: {
+        customer_id: cid,
+        total: sessions.length,
+        resolved: resolved.length,
+        handoff: handoff.length,
+        resolution_rate: sessions.length ? resolved.length / sessions.length : 0,
+        latest: sessions[0] ?? null,
+        sessions,
+      },
+    });
+  }
+
+  if (selfServiceMatch && method === 'post') {
+    await sendDelay();
+    const cid = Number(selfServiceMatch[1]);
+    const customer = MOCK_CUSTOMERS.find((item) => item.customer_id === cid);
+    if (!customer) return notFound(config, '客户不存在');
+    const now = new Date().toISOString();
+    const query = String(data?.query || customer.last_message_preview || '企微接入和付款后交付怎么安排？');
+    const matched = !/火星|硬件维修|离线探针|未知/.test(query);
+    const session: any = {
+      id: `mock_ssr_${Date.now()}`,
+      customer_id: cid,
+      customer_name: customer.display_name,
+      query,
+      channel_type: String(data?.channel_type || customer.channel_sources?.[0] || 'wework'),
+      status: matched ? 'resolved' : 'handoff_required',
+      matched,
+      confidence: matched ? 0.92 : 0,
+      answer: matched
+        ? '可按知识库回复：企微接入需要提供客服链接或 open_kfid。付款后发送交付清单，并安排渠道配置和团队培训。'
+        : '知识库暂未命中，请补充相关产品、价格、交付或售后知识后再回复客户。',
+      sources: matched ? [{ id: 'mock_kb_wework_offer', title: '企微接入与首月优惠', score: 1 }] : [],
+      message_ids: [`mock-ssr-${cid}-in`, ...(matched ? [`mock-ssr-${cid}-out`] : [])],
+      ticket_id: '',
+      next_action: matched ? 'AI 已按知识库完成自助解答。' : 'AI 未命中知识库，已生成转人工工单补充答案。',
+      created_at: now,
+      updated_at: now,
+    };
+    const inboundMessage = {
+      id: session.message_ids[0],
+      customer_id: cid,
+      customer_name: customer.display_name,
+      channel_type: session.channel_type,
+      contact_id: customer.contact_id,
+      direction: 'inbound' as const,
+      content: query,
+      read: false,
+      created_at: now,
+    } as ReturnType<typeof getMockMessages>[number] & { customer_name?: string; read?: boolean };
+    const nextMessages = [inboundMessage, ...(messageStore[cid] ?? getMockMessages(cid))];
+    if (matched) {
+      nextMessages.unshift({
+        id: session.message_ids[1],
+        customer_id: cid,
+        customer_name: customer.display_name,
+        channel_type: session.channel_type,
+        contact_id: customer.contact_id,
+        direction: 'outbound' as const,
+        content: `【AI自助解答】${session.answer}`,
+        read: true,
+        created_at: now,
+      } as ReturnType<typeof getMockMessages>[number] & { customer_name?: string; read?: boolean });
+    } else {
+      const ticket = {
+        id: `mock_ticket_ssr_${Date.now()}`,
+        customer_id: cid,
+        title: 'AI 自助未解决：转人工补充知识',
+        status: 'open',
+        priority: 'normal',
+        risk_level: 'medium',
+        assignee: '',
+        reason: `客户问题未命中知识库：${query}`,
+        recommendations: ['人工客服补充标准答案后沉淀到知识库。', '处理后回托 AI，后续同类问题自动自助解决。'],
+        due_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        ai_rehost_action: '',
+        created_at: now,
+        updated_at: now,
+        events: [{ action: 'created', actor: 'mock', at: now }],
+      };
+      mockServiceTickets[cid] = [ticket, ...(mockServiceTickets[cid] ?? [])];
+      session.ticket_id = ticket.id;
+      session.ticket = ticket;
+    }
+    messageStore[cid] = nextMessages;
+    customer.last_message_preview = query;
+    customer.tags = Array.from(new Set([...(customer.tags ?? []), 'AI自助', matched ? '知识库命中' : '转人工补知识']));
+    mockSelfServiceSessions[cid] = [session, ...(mockSelfServiceSessions[cid] ?? [])];
+    return ok(config, { success: true, data: session });
+  }
+
+  const outboundCallsMatch = url.match(/^\/api\/kellai\/ai\/outbound-calls\/(\d+)$/);
+  if (outboundCallsMatch && method === 'get') {
+    await sendDelay();
+    const cid = Number(outboundCallsMatch[1]);
+    const customer = MOCK_CUSTOMERS.find((item) => item.customer_id === cid);
+    if (!customer) return notFound(config, '客户不存在');
+    const calls = [...(mockOutboundCalls[cid] ?? [])].sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')));
+    const completed = calls.filter((item) => item.status === 'completed');
+    const phoneMessages = (messageStore[cid] ?? []).filter((msg) => msg.channel_type === 'phone');
+    return ok(config, {
+      success: true,
+      data: {
+        customer_id: cid,
+        total: calls.length,
+        planned: calls.length - completed.length,
+        completed: completed.length,
+        latest: calls[0] ?? null,
+        calls,
+        phone_message_count: phoneMessages.length,
+      },
+    });
+  }
+
+  if (url === '/api/kellai/ai/outbound-calls' && method === 'post') {
+    await sendDelay();
+    const cid = Number(data?.customer_id || 0);
+    const customer = MOCK_CUSTOMERS.find((item) => item.customer_id === cid);
+    if (!customer) return notFound(config, '客户不存在');
+    const now = new Date().toISOString();
+    const call = {
+      id: `mock_call_${Date.now()}`,
+      customer_id: cid,
+      customer_name: customer.display_name,
+      purpose: String(data?.purpose || 'follow_up'),
+      status: 'planned',
+      assignee: String(data?.assignee || 'AI外呼助手'),
+      stage_label: stageLabelOf(stageMap.get(cid) || customer.stage),
+      script: {
+        opening: `您好，我是客来来 AI 外呼助手，想跟进 ${customer.display_name} 的方案和演示安排。`,
+        context: `客户当前阶段：${stageLabelOf(stageMap.get(cid) || customer.stage)}`,
+        key_points: ['确认需求', '预约演示', '发送方案报价'],
+        close_next_action: '发送报价方案，按约定时间完成演示。',
+      },
+      transcript: [],
+      summary: '',
+      next_action: '发送报价方案，按约定时间完成演示。',
+      created_at: now,
+      updated_at: now,
+    };
+    mockOutboundCalls[cid] = [call, ...(mockOutboundCalls[cid] ?? [])];
+    return ok(config, { success: true, data: call });
+  }
+
+  const outboundExecuteMatch = url.match(/^\/api\/kellai\/ai\/outbound-calls\/([^/]+)\/execute$/);
+  if (outboundExecuteMatch && method === 'post') {
+    await sendDelay();
+    const callId = outboundExecuteMatch[1];
+    for (const [cidText, calls] of Object.entries(mockOutboundCalls)) {
+      const call = calls.find((item) => item.id === callId);
+      if (!call) continue;
+      if (call.status === 'completed') return ok(config, { success: true, data: call });
+      const cid = Number(cidText);
+      const customer = MOCK_CUSTOMERS.find((item) => item.customer_id === cid);
+      if (!customer) return notFound(config, '客户不存在');
+      const now = new Date().toISOString();
+      const contactId = customer.contact_id || `mock_phone_${cid}`;
+      const outboundMessage = {
+        id: `${call.id}-outbound`,
+        customer_id: cid,
+        customer_name: customer.display_name,
+        channel_type: 'phone',
+        contact_id: contactId,
+        direction: 'outbound' as const,
+        content: `【AI外呼】${call.script?.opening || '您好，我是客来来 AI 外呼助手。'}`,
+        read: true,
+        created_at: now,
+      } as ReturnType<typeof getMockMessages>[number] & { customer_name?: string; read?: boolean };
+      const inboundMessage = {
+        id: `${call.id}-inbound`,
+        customer_id: cid,
+        customer_name: customer.display_name,
+        channel_type: 'phone',
+        contact_id: contactId,
+        direction: 'inbound' as const,
+        content: '【电话纪要】客户愿意看演示，也需要方案和报价。下一步：发送报价方案，按约定时间完成演示。',
+        intent: '演示邀约',
+        ai_intent: '演示邀约',
+        read: false,
+        created_at: now,
+      } as ReturnType<typeof getMockMessages>[number] & { customer_name?: string; ai_intent?: string; read?: boolean };
+      messageStore[cid] = [outboundMessage, inboundMessage, ...(messageStore[cid] ?? getMockMessages(cid))];
+      stageMap.set(cid, 'quoted');
+      customer.stage = 'quoted';
+      customer.stage_label = stageLabelOf('quoted');
+      customer.channel_sources = Array.from(new Set([...(customer.channel_sources ?? []), 'phone']));
+      customer.last_message_preview = inboundMessage.content;
+      call.status = 'completed';
+      call.outcome = String(data?.outcome || 'demo_booked');
+      call.outcome_label = '已约演示';
+      call.summary = '客户接受电话跟进并约定演示，需要发送方案和报价。';
+      call.next_action = '发送报价方案，按约定时间完成演示。';
+      call.duration_sec = 82;
+      call.transcript = [
+        { role: 'agent', content: call.script?.opening || '您好，我是客来来 AI 外呼助手。', at: now },
+        { role: 'customer', content: '可以，我愿意看演示，也麻烦把方案和报价发我。', at: now },
+        { role: 'agent', content: '收到，我会发送报价方案，按约定时间完成演示。', at: now },
+      ];
+      call.message_ids = [outboundMessage.id, inboundMessage.id];
+      call.pipeline_stage_label = stageLabelOf('quoted');
+      call.executed_at = now;
+      call.updated_at = now;
+      return ok(config, { success: true, data: call });
+    }
+    return notFound(config, '外呼任务不存在');
+  }
+
+  if (url === '/api/kellai/ai/knowledge-base' && method === 'get') {
+    await sendDelay();
+    return ok(config, { success: true, data: { articles: mockKnowledgeArticles } });
+  }
+
+  if (url === '/api/kellai/ai/knowledge-base' && method === 'post') {
+    await sendDelay();
+    const article = {
+      id: String(data?.id || `mock_kb_${Date.now()}`),
+      title: String(data?.title || '未命名知识'),
+      content: String(data?.content || ''),
+      tags: Array.isArray(data?.tags) ? data.tags.map(String) : [],
+      source: String(data?.source || 'mock'),
+      updated_at: new Date().toISOString(),
+    };
+    const index = mockKnowledgeArticles.findIndex((item) => item.id === article.id);
+    if (index >= 0) mockKnowledgeArticles[index] = article;
+    else mockKnowledgeArticles.push(article);
+    return ok(config, { success: true, data: article });
+  }
+
+  if (url === '/api/kellai/ai/knowledge-base/suggest' && method === 'post') {
+    await sendDelay();
+    const query = String(data?.query || '');
+    const hit = query.includes('企微') || query.includes('企业微信') || query.includes('优惠')
+      ? mockKnowledgeArticles[0]
+      : mockKnowledgeArticles[0];
+    return ok(config, {
+      success: true,
+      data: {
+        answer: hit
+          ? `可按知识库《${hit.title}》回复：${hit.content}`
+          : '知识库暂未命中，请先沉淀标准答案。',
+        matched: Boolean(hit),
+        sources: hit ? [{ id: hit.id, title: hit.title, score: 1 }] : [],
+        confidence: hit ? 1 : 0,
+      },
+    });
+  }
+
   if (url === '/api/kellai/ai/reminders' && method === 'get') {
     await sendDelay();
     return ok(config, { success: true, data: { reminders: getMockReminders() } });
@@ -506,7 +1017,382 @@ export const mockAdapter: AxiosAdapter = async (config) => {
     await sendDelay();
     return ok(config, {
       success: true,
-      data: { connected: true, model: 'deepseek', message: 'LLM 已就绪' },
+      data: mockLlmConfig,
+    });
+  }
+
+  if (url === '/api/kellai/ai/llm-config' && method === 'put') {
+    await sendDelay();
+    const provider = String(data?.provider || mockLlmConfig.provider || 'deepseek');
+    mockLlmConfig.provider = provider === 'auto' ? 'xcauto' : provider;
+    mockLlmConfig.model = String(data?.model || mockLlmConfig.model || 'deepseek-chat');
+    mockLlmConfig.base_url = String(data?.base_url || mockLlmConfig.base_url || 'https://api.deepseek.com/v1');
+    mockLlmConfig.connected = true;
+    mockLlmConfig.ready = true;
+    mockLlmConfig.verified = true;
+    mockLlmConfig.lastProbe = {
+      success: true,
+      connected: true,
+      checked_at: new Date().toISOString(),
+      provider: mockLlmConfig.provider,
+      model: mockLlmConfig.model,
+      latency_ms: 90,
+      error: '',
+    };
+    mockLlmConfig.autoReplyEnabled = Boolean(data?.auto_reply_enabled ?? mockLlmConfig.autoReplyEnabled);
+    if (Array.isArray(data?.auto_reply_stages)) mockLlmConfig.autoReplyStages = data.auto_reply_stages.map(String);
+    if (Array.isArray(data?.confirm_scenarios)) mockLlmConfig.confirmScenarios = data.confirm_scenarios.map(String);
+    mockLlmConfig.message = '配置已保存，Mock LLM 已就绪';
+    return ok(config, { success: true, data: mockLlmConfig });
+  }
+
+  if (url === '/api/kellai/ai/llm-probe' && method === 'post') {
+    await sendDelay();
+    mockLlmConfig.connected = true;
+    mockLlmConfig.ready = true;
+    mockLlmConfig.verified = true;
+    mockLlmConfig.lastProbe = {
+      success: true,
+      connected: true,
+      checked_at: new Date().toISOString(),
+      provider: mockLlmConfig.provider,
+      model: mockLlmConfig.model,
+      latency_ms: 88,
+      error: '',
+    };
+    return ok(config, { success: true, data: { ...mockLlmConfig, probe: mockLlmConfig.lastProbe } });
+  }
+
+  if (url === '/api/kellai/demo/simulate-customer-behavior' && method === 'post') {
+    await sendDelay();
+    const count = Math.max(1, Math.min(Number(data?.count || 5), 8));
+    const scenarios = [
+      {
+        key: 'late_price_inquiry',
+        label: '夜间价格咨询',
+        channel_type: 'douyin',
+        name: '抖音-夜间咨询',
+        company: '三店餐饮',
+        content: '你们这个多少钱？我晚上刷到的，想看一下套餐和案例。',
+        stage: 'submitted',
+        score: 0.82,
+        action: '发送三门店套餐和同城案例',
+      },
+      {
+        key: 'repeat_customer_discount',
+        label: '老客户复购优惠',
+        channel_type: 'wechat',
+        name: '微信-私域复购',
+        company: '私域老客户',
+        content: '之前买过一次，老客户还有优惠吗？合适的话这周再订。',
+        stage: 'requirement',
+        score: 0.74,
+        action: '确认复购数量并给老客户折扣',
+      },
+      {
+        key: 'form_submitted',
+        label: '需求表已提交',
+        channel_type: 'miniprogram',
+        name: '小程序-留资客户',
+        company: '小程序留资',
+        content: '我已经提交需求表了，麻烦尽快给我一个方案。',
+        stage: 'submitted',
+        score: 0.86,
+        action: '根据需求表生成方案并预约演示',
+      },
+      {
+        key: 'price_sensitive_compare',
+        label: '比价异议',
+        channel_type: 'pdd',
+        name: '拼多多-售前比价',
+        company: '电商商家',
+        content: '别家便宜一点，你们能不能优惠？有现货吗？',
+        stage: 'requirement',
+        score: 0.69,
+        action: '解释差异价值并给限时方案',
+      },
+      {
+        key: 'contract_urgent',
+        label: '签约交付追问',
+        channel_type: 'wework',
+        name: '企微-签约推进',
+        company: '连锁服务商',
+        content: '合同怎么签？如果今天付款多久能开始交付？',
+        stage: 'pending_sign',
+        score: 0.9,
+        action: '发送合同和交付排期',
+      },
+      {
+        key: 'paid_delivery',
+        label: '付款后交付',
+        channel_type: 'wework',
+        name: '企微-付款客户',
+        company: '已付款客户',
+        content: '合同确认了，已经付款了，发我交付清单吧。',
+        stage: 'signed',
+        score: 0.95,
+        action: '发送交付清单并安排上线培训',
+      },
+      {
+        key: 'social_link_request',
+        label: '社媒求链接',
+        channel_type: 'xiaohongshu',
+        name: '小红书-求链接',
+        company: '社媒访客',
+        content: '怎么买呀？求链接，可以加微信详细说吗？',
+        stage: 'requirement',
+        score: 0.71,
+        action: '引导加微信并收集需求',
+      },
+      {
+        key: 'low_intent_noise',
+        label: '低意向闲聊',
+        channel_type: 'douyin',
+        name: '抖音-围观用户',
+        company: '围观访客',
+        content: '先收藏了，回头看看，你们页面做得还不错。',
+        stage: 'connected',
+        score: 0.42,
+        action: '轻量触达并延后跟进',
+      },
+    ].slice(0, count);
+    const now = new Date().toISOString();
+    const inboxIds: string[] = [];
+    const scenarioResults = scenarios.map((scenario, idx) => {
+      const storedChannel = scenario.channel_type === 'xiaohongshu' ? 'douyin' : scenario.channel_type;
+      const rec = addMockCustomer({
+        name: scenario.name,
+        company: scenario.company,
+        stage: scenario.stage,
+        channel_sources: [storedChannel],
+        tags: ['客户行为模拟', scenario.label],
+      });
+      rec.contact_id = `mock_sim_${scenario.key}_${rec.customer_id}`;
+      rec.ai_score = scenario.score;
+      rec.ai_tags = scenario.stage === 'signed' || scenario.stage === 'pending_sign'
+        ? ['高意向', '成交推进']
+        : ['客户行为模拟', '需跟进'];
+      rec.last_message_preview = scenario.content;
+      stageMap.set(rec.customer_id, scenario.stage);
+      const messageId = `mock-sim-${rec.customer_id}-${idx}`;
+      inboxIds.push(messageId);
+      const inboundMessage = {
+          id: messageId,
+          customer_id: rec.customer_id,
+          customer_name: rec.display_name,
+          channel_type: storedChannel,
+          contact_id: rec.contact_id,
+          direction: 'inbound' as const,
+          content: scenario.content,
+          intent: scenario.label,
+          ai_intent: scenario.label,
+          read: false,
+          created_at: now,
+        } as ReturnType<typeof getMockMessages>[number] & { customer_name?: string; ai_intent?: string; read?: boolean };
+      const outboundMessage = {
+          id: `${messageId}-reply`,
+          customer_id: rec.customer_id,
+          customer_name: rec.display_name,
+          channel_type: storedChannel,
+          contact_id: rec.contact_id,
+          direction: 'outbound' as const,
+          content: scenario.action,
+          read: true,
+          created_at: now,
+        } as ReturnType<typeof getMockMessages>[number] & { customer_name?: string; read?: boolean };
+      messageStore[rec.customer_id] = [inboundMessage, outboundMessage];
+      return {
+        key: scenario.key,
+        label: scenario.label,
+        channel_type: scenario.channel_type,
+        stored_channel: storedChannel,
+        contact_id: rec.contact_id,
+        customer_id: rec.customer_id,
+        expected_stage: scenario.stage,
+        final_stage: scenario.stage,
+        stage_label: stageLabelOf(scenario.stage),
+        ai_score: rec.ai_score,
+        next_action: scenario.action,
+        passed: true,
+      };
+    });
+    return ok(config, {
+      success: true,
+      data: {
+        created: scenarioResults.length,
+        scenario_set: String(data?.scenario_set || 'mock'),
+        inbox_message_ids: inboxIds,
+        sync: { synced: scenarioResults.length, messages: [] },
+        summary: {
+          total: scenarioResults.length,
+          passed: scenarioResults.length,
+          failed: 0,
+          synced: scenarioResults.length,
+        },
+        scenario_results: scenarioResults,
+        passed: true,
+      },
+    });
+  }
+
+  if (url === '/api/kellai/demo/llm-full-flow-test' && method === 'post') {
+    await sendDelay();
+    const rec = addMockCustomer({
+      name: 'LLM-抖音闭环客户',
+      company: '连锁餐饮门店',
+      stage: 'signed',
+      channel_sources: ['douyin'],
+      tags: ['LLM闭环', '已成交'],
+    });
+    rec.contact_id = `mock_llm_${rec.customer_id}`;
+    rec.ai_score = 0.93;
+    rec.ai_tags = ['高意向', '价格敏感', '已成交'];
+    rec.last_message_preview = '合同确认了，已经付款，麻烦发我交付清单。';
+    stageMap.set(rec.customer_id, 'signed');
+    const now = new Date().toISOString();
+    messageStore[rec.customer_id] = [
+      {
+        id: `mock-llm-${rec.customer_id}-1`,
+        customer_id: rec.customer_id,
+        channel_type: 'douyin',
+        contact_id: rec.contact_id,
+        direction: 'inbound',
+        content: '你们这个怎么收费？我想把抖音和企微线索都接起来。',
+        created_at: now,
+      },
+      {
+        id: `mock-llm-${rec.customer_id}-2`,
+        customer_id: rec.customer_id,
+        channel_type: 'douyin',
+        contact_id: rec.contact_id,
+        direction: 'outbound',
+        content: '我先按你的渠道和消息量给一版方案和报价，首周完成配置和培训。',
+        created_at: now,
+      },
+      {
+        id: `mock-llm-${rec.customer_id}-3`,
+        customer_id: rec.customer_id,
+        channel_type: 'douyin',
+        contact_id: rec.contact_id,
+        direction: 'inbound',
+        content: '合同确认了，已经付款，麻烦发我交付清单。',
+        created_at: now,
+      },
+    ];
+    return ok(config, {
+      success: true,
+      data: {
+        simulation_id: `mock-${rec.customer_id}`,
+        mode: 'llm',
+        llm_ready: true,
+        llm_used: true,
+        llm_customer_turns: 3,
+        llm_agent_turns: 3,
+        provider: mockLlmConfig.provider,
+        model: mockLlmConfig.model,
+        customer_id: rec.customer_id,
+        contact_id: rec.contact_id,
+        contact_name: rec.display_name,
+        channel_type: 'douyin',
+        turns_run: 3,
+        target_stage: String(data?.target_stage || 'signed'),
+        target_stage_label: '已签',
+        final_stage: 'signed',
+        final_stage_label: '已签',
+        ai_score: rec.ai_score,
+        next_action: '发送交付清单并安排上线培训',
+        passed: true,
+        failure_reason: '',
+        summary: 'Mock LLM 客户完成 3 轮消息，最终阶段：已签，测试通过。',
+        assertions: [
+          { key: 'customer_created', label: '已自动建客户', passed: true, required: true },
+          { key: 'llm_customer_generated', label: 'LLM 已生成客户行为', passed: true, required: true },
+          { key: 'llm_agent_replied', label: 'LLM 已生成销售回复', passed: true, required: true, value: 3 },
+          { key: 'target_stage_reached', label: '漏斗已到达已签', passed: true, required: true, value: 'signed' },
+        ],
+        events: messageStore[rec.customer_id],
+      },
+    });
+  }
+
+  if (url === '/api/kellai/demo/closed-loop-audit' && method === 'post') {
+    await sendDelay();
+    const rec = addMockCustomer({
+      name: '闭环验收客户',
+      company: '本地连锁餐饮',
+      stage: 'signed',
+      channel_sources: ['douyin', 'wework'],
+      tags: ['闭环验收', '已成交'],
+    });
+    rec.contact_id = `mock_audit_${rec.customer_id}`;
+    rec.ai_score = 0.91;
+    rec.ai_tags = ['高意向', '已成交'];
+    stageMap.set(rec.customer_id, 'signed');
+    return ok(config, {
+      success: true,
+      data: {
+        audit_id: `mock-audit-${rec.customer_id}`,
+        passed: true,
+        require_llm: Boolean(data?.require_llm ?? true),
+        target_stage: 'signed',
+        target_stage_label: '已签',
+        checked_at: new Date().toISOString(),
+        summary: { total: 33, passed: 33, failed_required: 0, skipped_optional: 0 },
+        llm_status: mockLlmConfig,
+        benchmark_profile: {
+          name: '红熊/黑熊 AI Agent 客服对标',
+          summary: { total: 9, passed: 9, failed_required: 0, skipped_optional: 0 },
+          failed_required_labels: [],
+          dimensions: [
+            { key: 'omnichannel_service', label: '全渠道统一接待', required: true, passed: true },
+            { key: 'unified_memory', label: '跨渠道长期记忆', required: true, passed: true },
+            { key: 'semantic_emotion_understanding', label: '复杂意图、情绪、风险识别', required: true, passed: true },
+            { key: 'autonomous_execution', label: '主动执行、工单、回访闭环', required: true, passed: true },
+            { key: 'knowledge_learning', label: '知识库沉淀与服务自学习', required: true, passed: true },
+            { key: 'growth_revenue_ops', label: '获客、销售、经营增长闭环', required: true, passed: true },
+            { key: 'open_business_integration', label: 'CRM、开放平台、Webhook 集成', required: true, passed: true },
+            { key: 'multimodal_service', label: '文本、图片、语音多模态服务链路', required: true, passed: true },
+            { key: 'real_llm_agent', label: '真实大模型 Agent 成交链路', required: true, passed: true },
+          ],
+        },
+        audit_customer_id: rec.customer_id,
+        failure_reason: '',
+        checks: [
+          { key: 'llm_ready', label: '真实 LLM 已连通', status: 'passed', passed: true, required: true },
+          { key: 'customer_created', label: '客户已从消息自动建档', status: 'passed', passed: true, required: true },
+          { key: 'messages_persisted', label: '入站/出站消息已入库', status: 'passed', passed: true, required: true },
+          { key: 'pipeline_auto_progressed', label: '消息驱动漏斗自动推进', status: 'passed', passed: true, required: true },
+          { key: 'ai_score_and_action', label: 'AI 意向分与下一步动作已生成', status: 'passed', passed: true, required: true },
+          { key: 'memory_continuity_loop', label: '跨渠道客户记忆连续闭环', status: 'passed', passed: true, required: true },
+          { key: 'agent_service_ops_loop', label: 'Agent 客服运营洞察闭环', status: 'passed', passed: true, required: true },
+          { key: 'quality_inspection_loop', label: '客服质检、合规、主管复盘闭环', status: 'passed', passed: true, required: true },
+          { key: 'human_handoff_ticket_loop', label: '人机协同转人工、工单、回托 AI 闭环', status: 'passed', passed: true, required: true },
+          { key: 'service_learning_loop', label: '服务自学习、指标、知识沉淀闭环', status: 'passed', passed: true, required: true },
+          { key: 'outbound_call_loop', label: 'AI 外呼、电话跟进、漏斗推进闭环', status: 'passed', passed: true, required: true },
+          { key: 'self_service_resolution_loop', label: 'AI 自助解决、知识库回复、未命中转人工闭环', status: 'passed', passed: true, required: true },
+          { key: 'agent_assist_autofill_loop', label: '坐席助手、知识推荐、风险提醒、自动填单闭环', status: 'passed', passed: true, required: true },
+          { key: 'multimodal_service_loop', label: '多模态消息入库、识别摘要、服务上下文闭环', status: 'passed', passed: true, required: true },
+          { key: 'ai_intent', label: 'AI 意图识别可用', status: 'passed', passed: true, required: true },
+          { key: 'ai_replies', label: 'AI 推荐话术可用', status: 'passed', passed: true, required: true },
+          { key: 'ai_profile', label: '客户画像可生成', status: 'passed', passed: true, required: true },
+          { key: 'follow_up_reminder', label: '跟进提醒可生成', status: 'passed', passed: true, required: true },
+          { key: 'manual_stage_update', label: '手动阶段变更可保存', status: 'passed', passed: true, required: true },
+          { key: 'funnel_summary', label: '漏斗汇总可读取', status: 'passed', passed: true, required: true },
+          { key: 'customer_list', label: '客户列表可读取', status: 'passed', passed: true, required: true },
+          { key: 'sales_revenue_loop', label: '销售推进、报价、合同闭环', status: 'passed', passed: true, required: true },
+          { key: 'customer_management_loop', label: '客户管理新增、编辑、批量、删除闭环', status: 'passed', passed: true, required: true },
+          { key: 'llm_settings_loop', label: 'AI 设置保存、读回、探测、恢复闭环', status: 'passed', passed: true, required: true },
+          { key: 'knowledge_base_loop', label: '知识库沉淀、检索、回复闭环', status: 'passed', passed: true, required: true },
+          { key: 'content_growth_loop', label: '内容生成、投放、数据闭环', status: 'passed', passed: true, required: true },
+          { key: 'scout_lead_loop', label: '公域线索发现、触达、转化闭环', status: 'passed', passed: true, required: true },
+          { key: 'flow_automation_loop', label: '自动化流程创建、执行、Webhook 闭环', status: 'passed', passed: true, required: true },
+          { key: 'finance_decision_loop', label: '财务看板、问答、预算、决策闭环', status: 'passed', passed: true, required: true },
+          { key: 'open_platform_loop', label: '开放平台密钥、插件、Webhook 闭环', status: 'passed', passed: true, required: true },
+          { key: 'channel_onboarding_loop', label: '渠道接入配置、测试、断开闭环', status: 'passed', passed: true, required: true },
+          { key: 'llm_full_flow', label: 'LLM 客户行为到签约闭环', status: 'passed', passed: true, required: true },
+          { key: 'redbear_benchmark_coverage', label: '红熊/黑熊 AI 对标能力覆盖', status: 'passed', passed: true, required: true },
+        ],
+      },
     });
   }
 

@@ -1,6 +1,13 @@
 import { useEffect, useState } from "react";
 import { useOnboardingStore } from "../stores/onboarding";
 import { X, ChevronRight } from "lucide-react";
+import { ONBOARDING_WELCOME_CACHE_KEY, ONBOARDING_WELCOME_SPEECH_TEXT } from "../constants/onboardingTour";
+import { playPreparedTextToSpeech, preloadTextToSpeech, unlockTextToSpeechAudio } from "../hooks/useTextToSpeech";
+import { estimateSpeechHoldMs } from "../utils/onboardingSpeech";
+
+type OnboardingSpeechWindow = Window & {
+  __kellaiOnboardingWelcomePreplayedUntil?: number;
+};
 
 /**
  * 教程启动面板
@@ -12,9 +19,10 @@ export default function OnboardingStartPanel() {
   const state = useOnboardingStore((s) => s.state);
   const active = useOnboardingStore((s) => s.active);
   const setActive = useOnboardingStore((s) => s.setActive);
-  const markCompleted = useOnboardingStore((s) => s.markCompleted);
+  const markSkipped = useOnboardingStore((s) => s.markSkipped);
   const [show, setShow] = useState(false);
   const [visible, setVisible] = useState(false);
+  const [voiceState, setVoiceState] = useState<"idle" | "preloading" | "ready" | "slow">("idle");
 
   useEffect(() => {
     if (state !== "not_started") {
@@ -34,9 +42,44 @@ export default function OnboardingStartPanel() {
     return () => window.clearTimeout(t);
   }, [state, active]);
 
+  useEffect(() => {
+    if (!show) {
+      setVoiceState("idle");
+      return;
+    }
+    let cancelled = false;
+    setVoiceState("preloading");
+    void preloadTextToSpeech(ONBOARDING_WELCOME_SPEECH_TEXT, ONBOARDING_WELCOME_CACHE_KEY).then((ok) => {
+      if (!cancelled) setVoiceState(ok ? "ready" : "slow");
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [show]);
+
   if (!show) return null;
 
   const handleStart = () => {
+    if (voiceState === "preloading") return;
+    unlockTextToSpeechAudio();
+    const speechWindow = window as OnboardingSpeechWindow;
+    const fallbackUntil = Date.now() + estimateSpeechHoldMs(ONBOARDING_WELCOME_SPEECH_TEXT, null);
+    const preplayed = playPreparedTextToSpeech(
+      ONBOARDING_WELCOME_SPEECH_TEXT,
+      ONBOARDING_WELCOME_CACHE_KEY,
+      {
+        onPlaybackStart: (info) => {
+          speechWindow.__kellaiOnboardingWelcomePreplayedUntil =
+            Date.now() + estimateSpeechHoldMs(ONBOARDING_WELCOME_SPEECH_TEXT, info.durationSeconds);
+        },
+        onPlaybackError: () => {
+          speechWindow.__kellaiOnboardingWelcomePreplayedUntil = 0;
+        },
+      }
+    );
+    if (preplayed) {
+      speechWindow.__kellaiOnboardingWelcomePreplayedUntil = fallbackUntil;
+    }
     setVisible(false);
     window.setTimeout(() => {
       setActive(true);
@@ -47,7 +90,7 @@ export default function OnboardingStartPanel() {
   const handleSkip = () => {
     setVisible(false);
     window.setTimeout(() => {
-      markCompleted();
+      markSkipped();
       setShow(false);
     }, 200);
   };
@@ -226,6 +269,7 @@ export default function OnboardingStartPanel() {
           <button
             type="button"
             onClick={handleStart}
+            disabled={voiceState === "preloading"}
             style={{
               display: "flex",
               alignItems: "center",
@@ -239,18 +283,21 @@ export default function OnboardingStartPanel() {
               borderRadius: 8,
               fontSize: 14,
               fontWeight: 500,
-              cursor: "pointer",
+              cursor: voiceState === "preloading" ? "wait" : "pointer",
+              opacity: voiceState === "preloading" ? 0.78 : 1,
               transition: "background .15s",
             }}
             onMouseEnter={(e) => {
+              if (voiceState === "preloading") return;
               e.currentTarget.style.background = "#1e293b";
             }}
             onMouseLeave={(e) => {
+              if (voiceState === "preloading") return;
               e.currentTarget.style.background = "#0f172a";
             }}
           >
-            开始引导
-            <ChevronRight size={14} />
+            {voiceState === "preloading" ? "语音准备中..." : "开始引导"}
+            {voiceState !== "preloading" && <ChevronRight size={14} />}
           </button>
 
           <div

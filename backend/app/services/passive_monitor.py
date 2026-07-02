@@ -62,22 +62,30 @@ def _save_config(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _llm_configured() -> tuple[bool, str]:
-    keys = (
-        "DEEPSEEK_API_KEY",
-        "OPENAI_API_KEY",
-        "SILICONFLOW_API_KEY",
-        "DASHSCOPE_API_KEY",
-        "MOONSHOT_API_KEY",
-    )
-    for key in keys:
-        if (os.environ.get(key) or "").strip():
-            return True, f"已配置 {key}"
-    return False, "请配置 DEEPSEEK_API_KEY 或 OPENAI_API_KEY 等 LLM 密钥"
+    try:
+        from app.services.llm_config import effective_config
+
+        cfg = effective_config()
+        if cfg.get("api_key"):
+            return True, f"已配置 {cfg.get('provider') or 'LLM'}（{cfg.get('source') or 'saved_config'}）"
+    except Exception:
+        logger.debug("读取 LLM 配置失败", exc_info=True)
+    return False, "请在设置页保存真实 LLM API Key，或配置 DEEPSEEK_API_KEY/OPENAI_API_KEY 等环境变量"
 
 
 def probe_passive_llm_ready() -> dict[str, Any]:
     ready, message = _llm_configured()
-    return {"ready": ready, "message": message}
+    try:
+        from app.services.llm_config import public_config
+
+        data = public_config()
+        data["ready"] = ready
+        if not ready:
+            data["connected"] = False
+        data["message"] = data.get("message") or message
+        return data
+    except Exception:
+        return {"ready": ready, "connected": False, "message": message}
 
 
 def get_passive_poll_config(customer_id: int, *, username: str = "") -> dict[str, Any]:

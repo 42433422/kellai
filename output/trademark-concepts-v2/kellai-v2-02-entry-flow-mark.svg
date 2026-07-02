@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 640" role="img" aria-label="客来来商标 v2 02 来客入口">
+  <rect width="640" height="640" fill="#ffffff"/>
+  <defs>
+    <linearGradient id="entryBg" x1="120" y1="92" x2="520" y2="548" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2563eb"/>
+      <stop offset="0.58" stop-color="#0891b2"/>
+      <stop offset="1" stop-color="#10b981"/>
+    </linearGradient>
+  </defs>
+  <rect x="88" y="84" width="464" height="472" rx="116" fill="url(#entryBg)"/>
+  <path d="M222 442V256c0-76 46-126 116-126s116 50 116 126v186h-78V258c0-34-14-58-38-58s-38 24-38 58v184z" fill="#ffffff"/>
+  <path d="M180 456c92 54 188 54 280 0" fill="none" stroke="#f59e0b" stroke-width="32" stroke-linecap="round"/>
+  <path d="M326 294h138c28 0 50 22 50 50v10c0 28-22 50-50 50h-50l-54 44v-44h-34c-28 0-50-22-50-50v-10c0-28 22-50 50-50z" fill="#ffffff"/>
+  <circle cx="366" cy="350" r="11" fill="#0891b2"/>
+  <circle cx="408" cy="350" r="11" fill="#0891b2"/>
+  <circle cx="450" cy="350" r="11" fill="#0891b2"/>
+</svg>

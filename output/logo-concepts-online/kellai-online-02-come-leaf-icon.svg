@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 320" role="img" aria-label="客来来图标 来叶">
+  <rect width="320" height="320" fill="#ffffff"/>
+  <g transform="translate(22 22)">
+  <defs>
+    <linearGradient id="comeLeaf" x1="38" y1="36" x2="238" y2="230" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2868f0"/>
+      <stop offset="0.45" stop-color="#10b6d3"/>
+      <stop offset="1" stop-color="#12b981"/>
+    </linearGradient>
+  </defs>
+  <path d="M42 154c0-70 56-126 126-126h76v78c0 70-56 126-126 126H42z" fill="url(#comeLeaf)"/>
+  <path d="M82 170c44-54 88-82 132-84" fill="none" stroke="#ffffff" stroke-width="22" stroke-linecap="round"/>
+  <path d="M122 88v104" stroke="#ffffff" stroke-width="22" stroke-linecap="round"/>
+  <path d="M164 112v80" stroke="#ffffff" stroke-width="22" stroke-linecap="round"/>
+  <path d="M100 208c42 16 82 18 120 6" fill="none" stroke="#ffb020" stroke-width="18" stroke-linecap="round"/>
+  </g>
+</svg>
