@@ -77,6 +77,8 @@ _validate_configuration()
 DEFAULT_CORS_ORIGINS: list[str] = [
     "tauri://localhost",
     "tauri://127.0.0.1",
+    "http://tauri.localhost",
+    "https://tauri.localhost",
     "http://localhost:1420",
     "http://127.0.0.1:1420",
     "http://localhost:5173",
@@ -194,8 +196,43 @@ _SOFT_AUTH_WHITELIST: set[str] = {
     "/api/kellai/auth/login",
     "/api/kellai/auth/register",
     "/api/kellai/auth/refresh",
+    "/api/kellai/auth/qr/start",
+    "/api/kellai/auth/qr/status",
+    "/api/kellai/auth/qr/scan",
+    "/api/kellai/auth/qr/cancel",
+    "/api/kellai/auth/xcmax-desktop",
     "/api/kellai/auth/sms/send",
     "/api/kellai/auth/forgot-password",
+    "/api/kellai/webhook/douyin",
+    "/api/kellai/webhook/wechat",
+    "/api/kellai/webhook/wework",
+    "/api/kellai/webhook/wework/suite",
+    "/api/kellai/channels/douyin/oauth/callback",
+    "/api/kellai/channels/wework/customer-entry",
+    "/api/kellai/channels/wechat/oauth/callback",
+    "/api/kellai/channels/wechat/oauth/qrcode",
+    "/api/kellai/channels/wework/oauth/callback",
+    "/api/kellai/channels/wework/install/callback",
+    # 服务间企业微信桥接使用独立的高熵请求头认证，不使用终端用户 JWT。
+    "/api/kellai/internal/wework/readiness",
+    "/api/kellai/internal/wework/install",
+    "/api/kellai/internal/wework/install/status",
+    "/api/kellai/internal/wework/customers/sync",
+    "/api/kellai/internal/wework/customers",
+    "/api/kellai/internal/wework/acquisition/members",
+    "/api/kellai/internal/wework/acquisition/links",
+    "/api/kellai/internal/douyin/readiness",
+    "/api/kellai/internal/douyin/config",
+    "/api/kellai/internal/douyin/oauth/initiate",
+    "/api/kellai/internal/douyin/oauth/status",
+    "/api/kellai/internal/douyin/connection",
+    "/api/kellai/internal/douyin/messages/send",
+    "/api/kellai/internal/douyin/inbox",
+    "/api/kellai/internal/douyin/inbox/ack",
+    # XCMAX uses a separate local pairing token for these endpoints.  They do
+    # not accept the user JWT and validate that token again in the route.
+    "/api/kellai/integrations/xcmax/data-status",
+    "/api/kellai/integrations/xcmax/customers",
 }
 
 
@@ -228,6 +265,7 @@ async def _request_log_middleware(
     """
     start = time.perf_counter()
     path = request.url.path
+    is_xcmax_data_route = path.startswith("/api/kellai/integrations/xcmax/customers/")
     user_id: object = "-"
     user_info: dict | None = None
 
@@ -242,7 +280,7 @@ async def _request_log_middleware(
                 user_id = info["id"]
             else:
                 # token 无效
-                if path not in _SOFT_AUTH_WHITELIST:
+                if path not in _SOFT_AUTH_WHITELIST and not is_xcmax_data_route:
                     if _STRICT_AUTH:
                         return JSONResponse(
                             status_code=401,
@@ -252,7 +290,7 @@ async def _request_log_middleware(
         except Exception as exc:  # pragma: no cover - 解析失败不影响主流程
             logger.debug("软认证解析异常: %s", exc)
     else:
-        if path not in _SOFT_AUTH_WHITELIST:
+        if path not in _SOFT_AUTH_WHITELIST and not is_xcmax_data_route:
             if _STRICT_AUTH:
                 return JSONResponse(
                     status_code=401,
@@ -329,6 +367,17 @@ def create_app() -> FastAPI:
     app.include_router(flow.router)
     app.include_router(finance.router)
     app.include_router(open_api.router)
+
+    @app.on_event("startup")
+    async def _resume_douyin_web_portal_monitors():
+        try:
+            from app.services.douyin_web_portal import resume_connected_monitors
+
+            result = await resume_connected_monitors()
+            if result["started"] or result["failed"]:
+                logger.info("抖音网站私信监听恢复完成: %s", result)
+        except Exception as exc:
+            logger.warning("恢复抖音网站私信监听失败: %s", exc)
 
     @app.get("/health")
     def health():

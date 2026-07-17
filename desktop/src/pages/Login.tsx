@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import QRCode from "qrcode";
 import {
   useAuthStore,
   getRememberedEmails,
@@ -13,7 +14,15 @@ import {
   type RememberedAccount,
 } from "../stores/auth";
 import { clsx } from "clsx";
-import { sendSmsCode, resetPasswordByPhone } from "../api/auth";
+import {
+  sendSmsCode,
+  resetPasswordByPhone,
+  startQrLogin,
+  checkQrLoginStatus,
+  markQrLoginScanned,
+  confirmQrLogin,
+  cancelQrLogin,
+} from "../api/auth";
 import { toastStore } from "../stores/toast";
 import {
   Mail,
@@ -28,6 +37,11 @@ import {
   X,
   KeyRound,
   Check,
+  QrCode,
+  RefreshCw,
+  Loader2,
+  ShieldCheck,
+  Smartphone,
 } from "lucide-react";
 
 /* ============ 通用：复选框 ============ */
@@ -228,10 +242,18 @@ function avatarChar(label: string): string {
 
 /* ============ 主组件 ============ */
 
-type LoginTab = "email" | "phone";
+type LoginTab = "email" | "phone" | "qr";
 type AuthMode = "login" | "register" | "forgot";
+type QrStatus = "idle" | "loading" | "waiting" | "scanned" | "authorized" | "expired" | "canceled" | "failed";
+type QrConfirmStatus = "loading" | "ready" | "confirming" | "confirmed" | "login_required" | "expired" | "error";
 
 export default function Login() {
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const qrSessionParam = searchParams.get("qr_session") || "";
+  const qrSecretParam = searchParams.get("qr_secret") || "";
+  const isQrConfirm = Boolean(qrSessionParam && qrSecretParam);
+
   const [tab, setTab] = useState<LoginTab>("email");
   const [mode, setMode] = useState<AuthMode>("login");
   const [loading, setLoading] = useState(false);
@@ -277,6 +299,20 @@ export default function Login() {
   const [regConfirmPassword, setRegConfirmPassword] = useState("");
   const [regName, setRegName] = useState("");
 
+  // 桌面扫码登录
+  const [qrSessionId, setQrSessionId] = useState("");
+  const [, setQrSecret] = useState("");
+  const [qrLoginUrl, setQrLoginUrl] = useState("");
+  const [qrImageUrl, setQrImageUrl] = useState("");
+  const [qrStatus, setQrStatus] = useState<QrStatus>("idle");
+  const [qrExpiresIn, setQrExpiresIn] = useState(0);
+  const [qrError, setQrError] = useState("");
+  const [qrRefreshSeed, setQrRefreshSeed] = useState(0);
+
+  // 扫码设备确认页
+  const [qrConfirmStatus, setQrConfirmStatus] = useState<QrConfirmStatus>("loading");
+  const [qrConfirmMessage, setQrConfirmMessage] = useState("");
+
   // 表单验证错误
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
 
@@ -286,8 +322,9 @@ export default function Login() {
   /** 避免"邮箱输入到一半焦点被偷"：只有显式调用 focusPasswordSoon 才聚焦。 */
   const initialFocusDoneRef = useRef(false);
 
-  const { login, loginBySms, register } = useAuthStore();
-  const navigate = useNavigate();
+  const { login, loginBySms, register, acceptLoginResponse } = useAuthStore();
+  const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
+  const currentUser = useAuthStore((s) => s.user);
 
   /* ====== 工具：清空错误状态 ====== */
   const clearMessages = useCallback(() => {
@@ -350,10 +387,10 @@ export default function Login() {
 
   /* ====== 已登录用户：直接重定向到首页，不让输密码 ====== */
   useEffect(() => {
-    if (useAuthStore.getState().isAuthenticated) {
+    if (!isQrConfirm && useAuthStore.getState().isAuthenticated) {
       navigate("/", { replace: true });
     }
-  }, [navigate]);
+  }, [isQrConfirm, navigate]);
 
   /* ====== activeEmail 变化 → 检查凭据（不触发聚焦） ====== */
   useEffect(() => {
@@ -372,6 +409,133 @@ export default function Login() {
     const timer = window.setTimeout(() => setCountdown((c) => c - 1), 1000);
     return () => window.clearTimeout(timer);
   }, [countdown]);
+
+  const createDesktopQrLogin = useCallback(async () => {
+    setQrStatus("loading");
+    setQrError("");
+    setQrSessionId("");
+    setQrSecret("");
+    setQrLoginUrl("");
+    setQrImageUrl("");
+    setQrExpiresIn(0);
+    try {
+      const qr = await startQrLogin();
+      const image = await QRCode.toDataURL(qr.login_url, {
+        width: 224,
+        margin: 1,
+        color: { dark: "#0f172a", light: "#ffffff" },
+      });
+      setQrSessionId(qr.session_id);
+      setQrSecret(qr.secret);
+      setQrLoginUrl(qr.login_url);
+      setQrImageUrl(image);
+      setQrExpiresIn(qr.expires_in || 180);
+      setQrStatus("waiting");
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "二维码生成失败";
+      setQrStatus("failed");
+      setQrError(message);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (isQrConfirm || mode !== "login" || tab !== "qr") return;
+    void createDesktopQrLogin();
+  }, [createDesktopQrLogin, isQrConfirm, mode, qrRefreshSeed, tab]);
+
+  useEffect(() => {
+    if (
+      isQrConfirm ||
+      mode !== "login" ||
+      tab !== "qr" ||
+      !qrSessionId ||
+      !["waiting", "scanned"].includes(qrStatus)
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const result = await checkQrLoginStatus(qrSessionId);
+        if (cancelled) return;
+        if (typeof result.expires_in === "number") {
+          setQrExpiresIn(result.expires_in);
+        }
+        if (result.status === "authorized") {
+          if (!result.login) {
+            setQrStatus("failed");
+            setQrError("授权结果缺少登录凭证");
+            return;
+          }
+          setQrStatus("authorized");
+          acceptLoginResponse(result.login);
+          navigate("/", { replace: true });
+          return;
+        }
+        setQrStatus(result.status);
+        if (result.status === "expired") {
+          setQrError("二维码已过期");
+        } else if (result.status === "canceled") {
+          setQrError("已取消本次扫码登录");
+        } else if (result.status === "failed") {
+          setQrError(result.error || "扫码登录失败");
+        }
+      } catch (err: unknown) {
+        if (cancelled) return;
+        setQrStatus("failed");
+        setQrError(err instanceof Error ? err.message : "扫码状态查询失败");
+      }
+    };
+
+    void poll();
+    const timer = window.setInterval(() => void poll(), 1600);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [acceptLoginResponse, isQrConfirm, mode, navigate, qrSessionId, qrStatus, tab]);
+
+  useEffect(() => {
+    if (qrExpiresIn <= 0 || !["waiting", "scanned"].includes(qrStatus)) return;
+    const timer = window.setTimeout(() => {
+      setQrExpiresIn((v) => Math.max(0, v - 1));
+    }, 1000);
+    return () => window.clearTimeout(timer);
+  }, [qrExpiresIn, qrStatus]);
+
+  useEffect(() => {
+    if (!isQrConfirm) return;
+    let cancelled = false;
+    const scan = async () => {
+      setQrConfirmStatus("loading");
+      setQrConfirmMessage("");
+      try {
+        const result = await markQrLoginScanned(qrSessionParam, qrSecretParam);
+        if (cancelled) return;
+        if (result.success === false) {
+          setQrConfirmStatus("expired");
+          setQrConfirmMessage(result.error || "二维码已失效");
+          return;
+        }
+        if (!isAuthenticated) {
+          setQrConfirmStatus("login_required");
+          setQrConfirmMessage("请先在当前设备登录后重新扫码");
+          return;
+        }
+        setQrConfirmStatus("ready");
+        setQrConfirmMessage("将授权当前账号登录桌面端");
+      } catch (err: unknown) {
+        if (cancelled) return;
+        setQrConfirmStatus("error");
+        setQrConfirmMessage(err instanceof Error ? err.message : "二维码校验失败");
+      }
+    };
+    void scan();
+    return () => {
+      cancelled = true;
+    };
+  }, [isAuthenticated, isQrConfirm, qrSecretParam, qrSessionParam]);
 
   /* ====== 通用：跑一个异步动作并自动管理 loading/error ====== */
   const run = useCallback(
@@ -564,6 +728,42 @@ export default function Login() {
       setCountdown(0);
       clearMessages();
     }, "重置失败，请检查验证码或稍后重试");
+  };
+
+  const handleConfirmQrLogin = () => {
+    if (!isAuthenticated) {
+      setQrConfirmStatus("login_required");
+      setQrConfirmMessage("请先在当前设备登录后重新扫码");
+      return;
+    }
+    void (async () => {
+      setQrConfirmStatus("confirming");
+      setQrConfirmMessage("");
+      try {
+        const result = await confirmQrLogin(qrSessionParam, qrSecretParam);
+        if (result.success === false) {
+          throw new Error(result.error || "确认失败");
+        }
+        setQrConfirmStatus("confirmed");
+        setQrConfirmMessage("已确认，可回到桌面端");
+        toastStore.success("已确认扫码登录");
+      } catch (err: unknown) {
+        setQrConfirmStatus("error");
+        setQrConfirmMessage(err instanceof Error ? err.message : "确认失败");
+      }
+    })();
+  };
+
+  const handleCancelQrLogin = () => {
+    void (async () => {
+      try {
+        await cancelQrLogin(qrSessionParam, qrSecretParam);
+      } catch {
+        /* ignore */
+      }
+      setQrConfirmStatus("error");
+      setQrConfirmMessage("已取消本次登录");
+    })();
   };
 
   /* ====== 切模式 / 切 tab ====== */
@@ -808,6 +1008,141 @@ export default function Login() {
     </Checkbox>
   );
 
+  const qrConfirmUserLabel =
+    currentUser?.display_name || currentUser?.name || currentUser?.email || "当前账号";
+
+  if (isQrConfirm) {
+    return (
+      <div className="flex h-screen">
+        <div className="relative hidden w-[480px] shrink-0 flex-col items-center justify-center bg-gradient-to-br from-slate-900 to-slate-800 lg:flex">
+          <div className="relative z-10 flex flex-col items-center px-12 text-center">
+            <div className="mb-6 flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-blue-500 to-indigo-600 shadow-lg shadow-blue-500/25">
+              <span className="text-2xl font-bold text-white">客</span>
+            </div>
+            <h1 className="mb-3 text-4xl font-bold tracking-tight text-white">客来来</h1>
+            <p className="text-lg text-slate-300">AI 驱动的智能获客助手</p>
+          </div>
+        </div>
+
+        <div className="flex flex-1 items-center justify-center bg-gray-50 px-6">
+          <div className="w-full max-w-[420px] rounded-2xl border border-gray-200 bg-white p-6 shadow-sm">
+            <div className="mb-5 flex items-center gap-3">
+              <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-blue-50 text-blue-600">
+                {qrConfirmStatus === "confirmed" ? (
+                  <ShieldCheck className="h-6 w-6" />
+                ) : (
+                  <Smartphone className="h-6 w-6" />
+                )}
+              </div>
+              <div>
+                <h2 className="text-xl font-bold text-gray-900">确认扫码登录</h2>
+                <p className="mt-0.5 text-sm text-gray-500">客来来桌面端</p>
+              </div>
+            </div>
+
+            {qrConfirmStatus === "loading" && (
+              <div className="flex items-center gap-2 rounded-lg bg-gray-50 px-4 py-3 text-sm text-gray-600">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                正在校验二维码
+              </div>
+            )}
+
+            {qrConfirmStatus !== "loading" && (
+              <div className="space-y-4">
+                {isAuthenticated ? (
+                  <div className="flex items-center gap-3 rounded-lg border border-blue-100 bg-blue-50/60 px-3 py-3">
+                    <AvatarBadge char={avatarChar(qrConfirmUserLabel)} />
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-medium text-gray-900">
+                        {qrConfirmUserLabel}
+                      </div>
+                      {currentUser?.email && (
+                        <div className="truncate text-xs text-gray-500">
+                          {currentUser.email}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
+                    {qrConfirmMessage || "请先在当前设备登录后重新扫码"}
+                  </div>
+                )}
+
+                {qrConfirmMessage && isAuthenticated && (
+                  <div
+                    className={clsx(
+                      "rounded-lg px-4 py-3 text-sm",
+                      qrConfirmStatus === "confirmed"
+                        ? "bg-green-50 text-green-700"
+                        : qrConfirmStatus === "error" || qrConfirmStatus === "expired"
+                        ? "bg-red-50 text-red-600"
+                        : "bg-gray-50 text-gray-600"
+                    )}
+                  >
+                    {qrConfirmMessage}
+                  </div>
+                )}
+
+                {qrConfirmStatus === "ready" && (
+                  <div className="grid grid-cols-2 gap-3">
+                    <button
+                      type="button"
+                      onClick={handleCancelQrLogin}
+                      className="rounded-lg border border-gray-300 py-2.5 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50"
+                    >
+                      取消
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleConfirmQrLogin}
+                      className="rounded-lg bg-blue-600 py-2.5 text-sm font-medium text-white transition-colors hover:bg-blue-700"
+                    >
+                      确认登录
+                    </button>
+                  </div>
+                )}
+
+                {qrConfirmStatus === "confirming" && (
+                  <button
+                    type="button"
+                    disabled
+                    className="flex w-full items-center justify-center gap-2 rounded-lg bg-blue-600 py-2.5 text-sm font-medium text-white opacity-80"
+                  >
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    确认中
+                  </button>
+                )}
+
+                {qrConfirmStatus === "login_required" && (
+                  <button
+                    type="button"
+                    onClick={() => navigate("/login", { replace: true })}
+                    className="w-full rounded-lg bg-blue-600 py-2.5 text-sm font-medium text-white transition-colors hover:bg-blue-700"
+                  >
+                    返回登录
+                  </button>
+                )}
+
+                {(qrConfirmStatus === "confirmed" ||
+                  qrConfirmStatus === "error" ||
+                  qrConfirmStatus === "expired") && (
+                  <button
+                    type="button"
+                    onClick={() => navigate("/", { replace: true })}
+                    className="w-full rounded-lg border border-gray-300 py-2.5 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50"
+                  >
+                    返回首页
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-screen">
       {/* 左侧品牌区域 */}
@@ -906,6 +1241,18 @@ export default function Login() {
               >
                 <Phone className="h-4 w-4" />
                 手机号登录
+              </button>
+              <button
+                onClick={() => switchTab("qr")}
+                className={clsx(
+                  "flex flex-1 items-center justify-center gap-2 rounded-md py-2 text-sm font-medium transition-colors",
+                  tab === "qr"
+                    ? "bg-white text-gray-900 shadow-sm"
+                    : "text-gray-500 hover:text-gray-700"
+                )}
+              >
+                <QrCode className="h-4 w-4" />
+                扫码登录
               </button>
             </div>
           )}
@@ -1072,6 +1419,75 @@ export default function Login() {
                 {loading ? "登录中..." : "登录"}
               </button>
             </form>
+          )}
+
+          {/* 扫码登录 */}
+          {mode === "login" && tab === "qr" && (
+            <div className="space-y-4">
+              <div className="flex justify-center">
+                <div className="flex h-64 w-64 items-center justify-center rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
+                  {qrImageUrl && qrStatus !== "loading" ? (
+                    <img
+                      src={qrImageUrl}
+                      alt="扫码登录二维码"
+                      className="h-56 w-56"
+                      draggable={false}
+                    />
+                  ) : (
+                    <Loader2 className="h-8 w-8 animate-spin text-blue-600" />
+                  )}
+                </div>
+              </div>
+
+              <div className="rounded-lg bg-gray-50 px-4 py-3 text-center">
+                <div
+                  className={clsx(
+                    "text-sm font-medium",
+                    qrStatus === "scanned" || qrStatus === "authorized"
+                      ? "text-blue-700"
+                      : qrStatus === "expired" ||
+                        qrStatus === "canceled" ||
+                        qrStatus === "failed"
+                      ? "text-red-600"
+                      : "text-gray-700"
+                  )}
+                >
+                  {qrStatus === "loading" && "正在生成二维码"}
+                  {qrStatus === "waiting" && "等待扫码"}
+                  {qrStatus === "scanned" && "已扫码，等待确认"}
+                  {qrStatus === "authorized" && "已确认，正在进入"}
+                  {qrStatus === "expired" && "二维码已过期"}
+                  {qrStatus === "canceled" && "已取消本次扫码登录"}
+                  {qrStatus === "failed" && (qrError || "扫码登录失败")}
+                  {qrStatus === "idle" && "准备扫码登录"}
+                </div>
+                {qrExpiresIn > 0 && ["waiting", "scanned"].includes(qrStatus) && (
+                  <div className="mt-1 text-xs text-gray-500">
+                    {qrExpiresIn}s 后过期
+                  </div>
+                )}
+                {qrLoginUrl && (
+                  <a
+                    href={qrLoginUrl}
+                    className="mt-2 inline-block text-xs text-blue-600 hover:text-blue-700 hover:underline"
+                  >
+                    打开扫码确认页
+                  </a>
+                )}
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setQrRefreshSeed((v) => v + 1)}
+                disabled={qrStatus === "loading"}
+                className="flex w-full items-center justify-center gap-2 rounded-lg border border-gray-300 py-2.5 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <RefreshCw
+                  className={clsx("h-4 w-4", qrStatus === "loading" && "animate-spin")}
+                />
+                刷新二维码
+              </button>
+            </div>
           )}
 
           {/* 注册表单 */}

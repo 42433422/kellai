@@ -1,4 +1,5 @@
 import api, { request } from './client';
+import { sendMessage } from './messages';
 import type {
   CustomerListResponse,
   CustomerProfileInput,
@@ -17,7 +18,11 @@ export const getCustomerCrm = (customerId: number) =>
 
 /** 获取客户消息列表 */
 export const getCustomerMessages = async (customerId: number, limit = 50) => {
-  await api.post('/api/kellai/channels/sync-inbox', { limit }, { skipErrorToast: true }).catch(() => undefined);
+  await api.post(
+    '/api/kellai/channels/sync-inbox',
+    { limit },
+    { skipErrorToast: true, skipLoading: true },
+  ).catch(() => undefined);
   return api.get(`/api/kellai/messages`, { params: { customer_id: customerId, limit }, skipErrorToast: true });
 };
 
@@ -123,9 +128,8 @@ export const executeCustomerOutboundCall = (
     ...body,
   });
 
-/** 发送消息 */
-export const sendMessage = (customerId: number, channelType: string, contactId: string, content: string) =>
-  api.post('/api/kellai/messages/send', { customer_id: customerId, channel_type: channelType, contact_id: contactId, content });
+/** 发送消息（与消息中心共用真实渠道发送及错误处理） */
+export { sendMessage };
 
 /** AI 推荐回复 */
 export const suggestReply = (customerId: number, message: string, intent = '', stage = '') =>

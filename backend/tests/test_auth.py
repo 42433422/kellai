@@ -71,6 +71,19 @@ def test_sms_code_uses_secrets():
     assert "random.randint" not in src  # 旧实现
 
 
+def test_development_jwt_secret_persists_across_restarts(tmp_path, monkeypatch):
+    """桌面后端重启后必须继续接受已登录会话。"""
+    from app.services import auth
+
+    monkeypatch.setenv("KELLAI_DATA_DIR", str(tmp_path))
+    first = auth._load_or_create_development_jwt_secret()
+    second = auth._load_or_create_development_jwt_secret()
+
+    assert first == second
+    assert len(first) >= 32
+    assert (tmp_path / ".jwt-secret").read_text(encoding="utf-8") == first
+
+
 def test_production_requires_jwt_secret(monkeypatch):
     """P0-2: 生产环境必须显式设置 JWT_SECRET。"""
     monkeypatch.setenv("KELLAI_APP_ENV", "production")
@@ -105,6 +118,109 @@ def test_register_and_login_success(tmp_db):
     login = auth.login_by_email("alice@test.com", "Secret123")
     assert login["success"] is True
     assert login["access_token"]
+
+
+def test_create_login_session_for_existing_user(tmp_db):
+    """扫码登录确认后能为已认证用户创建新的桌面会话。"""
+    from app.services import auth
+
+    reg = auth.register_user(
+        email="qr-owner@test.com",
+        password="Secret123",
+        display_name="QR Owner",
+    )
+    assert reg["success"] is True
+
+    session = auth.create_login_session_for_user(int(reg["user"]["id"]))
+    assert session["success"] is True
+    assert session["access_token"]
+    assert session["refresh_token"]
+    assert session["user"]["email"] == "qr-owner@test.com"
+    assert auth.verify_token(session["access_token"]) is not None
+
+
+def test_qr_login_state_machine(tmp_db):
+    """扫码登录：start -> scan -> confirm -> status 返回登录凭证。"""
+    from starlette.requests import Request
+
+    from app.api import routes
+    from app.services import auth
+
+    routes._qr_login_sessions.clear()
+    reg = auth.register_user(
+        email="qr-flow@test.com",
+        password="Secret123",
+        display_name="QR Flow",
+    )
+    assert reg["success"] is True
+
+    req = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/api/kellai/auth/qr/start",
+            "headers": [(b"origin", b"http://127.0.0.1:5173")],
+            "server": ("127.0.0.1", 8793),
+            "client": ("127.0.0.1", 51234),
+        }
+    )
+    started = routes.auth_qr_start(req)["data"]
+    assert started["login_url"].startswith("http://127.0.0.1:5173/login?")
+    assert started["session_id"]
+    assert started["secret"]
+
+    body = routes.QrLoginBody(
+        session_id=started["session_id"],
+        secret=started["secret"],
+    )
+    status1 = routes.auth_qr_status(started["session_id"])["data"]
+    assert status1["status"] == "waiting"
+
+    scanned = routes.auth_qr_scan(body)
+    assert scanned["success"] is True
+    status2 = routes.auth_qr_status(started["session_id"])["data"]
+    assert status2["status"] == "scanned"
+    assert status2["scanned"] is True
+
+    confirmed = routes.auth_qr_confirm(body, {"id": reg["user"]["id"]})
+    assert confirmed["success"] is True
+
+    status3 = routes.auth_qr_status(started["session_id"])["data"]
+    assert status3["status"] == "authorized"
+    assert status3["authorized"] is True
+    assert status3["login"]["access_token"]
+    assert status3["user"]["email"] == "qr-flow@test.com"
+    assert auth.verify_token(status3["login"]["access_token"]) is not None
+
+
+def test_qr_login_preserves_public_frontend_subpath(tmp_db, monkeypatch):
+    """公网部署在 /kellai 时，扫码确认页不能错误跳到网站根目录。"""
+    from starlette.requests import Request
+
+    from app.api import routes
+
+    monkeypatch.delenv("KELLAI_QR_LOGIN_FRONTEND_URL", raising=False)
+    monkeypatch.delenv("KELLAI_PUBLIC_FRONTEND_URL", raising=False)
+    routes._qr_login_sessions.clear()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "scheme": "https",
+            "path": "/api/kellai/auth/qr/start",
+            "headers": [
+                (b"origin", b"https://xiu-ci.com"),
+                (b"referer", b"https://xiu-ci.com/kellai/login"),
+            ],
+            "server": ("127.0.0.1", 8793),
+            "client": ("127.0.0.1", 51234),
+        }
+    )
+
+    started = routes.auth_qr_start(request)["data"]
+
+    assert started["login_url"].startswith("https://xiu-ci.com/kellai/login?")
 
 
 def test_register_duplicate_email_rejected(tmp_db):

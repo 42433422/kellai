@@ -395,6 +395,48 @@ def suggest_reply(
     return templates[:3]
 
 
+def format_suggestion_payload(
+    suggestions: list[dict[str, Any] | str],
+) -> dict[str, Any]:
+    """统一推荐回复的 API 格式，兼容文本展示和结构化明细。"""
+    texts: list[str] = []
+    details: list[dict[str, Any]] = []
+    for item in suggestions:
+        if isinstance(item, dict):
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            try:
+                confidence = float(item.get("confidence") or 0.7)
+            except (TypeError, ValueError):
+                confidence = 0.7
+            detail = {
+                "text": text,
+                "style": str(item.get("style") or "professional"),
+                "confidence": confidence,
+            }
+        else:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            detail = {
+                "text": text,
+                "style": "professional",
+                "confidence": 0.7,
+            }
+        texts.append(text)
+        details.append(detail)
+
+    return {
+        "suggestions": texts,
+        "replies": texts,
+        "reply": "\n".join(
+            f"{index}. {text}" for index, text in enumerate(texts, start=1)
+        ),
+        "suggestion_details": details,
+    }
+
+
 def generate_auto_reply(
     customer_id: int,
     *,

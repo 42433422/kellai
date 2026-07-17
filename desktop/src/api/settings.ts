@@ -1,4 +1,4 @@
-import api from './client';
+import api, { loopbackClient } from './client';
 
 /** 获取渠道列表 */
 export const getChannels = () =>
@@ -22,6 +22,10 @@ export const deleteChannel = (channelType: string) =>
 /** 同步指定渠道收件箱 */
 export const syncChannelInbox = (channelType: string, limit = 20) =>
   api.post('/api/kellai/channels/sync-inbox', { channel_type: channelType, limit });
+
+/** 获取企业微信客服客户入口（客来来中转链接） */
+export const getWeworkCustomerEntry = (source = 'settings') =>
+  api.get('/api/kellai/channels/wework/customer-entry', { params: { source, mode: 'json' } });
 
 /** 获取 LLM 状态 */
 export const getLlmStatus = () =>
@@ -71,10 +75,90 @@ export const getUserInfo = () =>
 export const updateUserInfo = (data: { display_name?: string; avatar_url?: string }) =>
   api.put('/api/kellai/auth/me', data);
 
-/** 发起企微 OAuth 授权（获取扫码 URL） */
+/** 发起企业微信服务商第三方应用安装（获取主入口二维码 URL） */
 export const initiateWeworkOAuth = () =>
-  api.post('/api/kellai/channels/wework/oauth/initiate');
+  api.post('/api/kellai/channels/wework/install');
 
-/** 查询企微 OAuth 授权状态 */
+/** 查询企业微信第三方应用安装状态 */
 export const checkWeworkOAuthStatus = (state: string) =>
-  api.get('/api/kellai/channels/wework/oauth/status', { params: { state } });
+  api.get('/api/kellai/channels/wework/install/status', { params: { state } });
+
+/** 授权成功后同步企业微信真实外部联系人 */
+export const syncWeworkCustomers = (limit = 500) =>
+  api.post('/api/kellai/channels/wework/customers/sync', null, { params: { limit } });
+
+/** 获取当前账号团队可用于获客链接的企业微信成员 */
+export const getWeworkAcquisitionMembers = () =>
+  api.get('/api/kellai/channels/wework/acquisition/members');
+
+/** 使用当前账号团队的企业微信授权创建获客链接 */
+export const createWeworkAcquisitionLink = (payload: {
+  link_name: string;
+  userids: string[];
+  skip_verify?: boolean;
+}) => api.post('/api/kellai/channels/wework/acquisition/links', payload);
+
+/** 发起微信开放平台 OAuth 授权（获取扫码 URL） */
+export const initiateWechatOAuth = () =>
+  api.post('/api/kellai/channels/wechat/oauth/initiate');
+
+/** 查询微信开放平台 OAuth 授权状态 */
+export const checkWechatOAuthStatus = (state: string) =>
+  api.get('/api/kellai/channels/wechat/oauth/status', { params: { state } });
+
+/** 发起抖音企业号 OAuth 授权（返回可扫码的官方授权 URL） */
+export const initiateDouyinOAuth = () =>
+  api.post('/api/kellai/channels/douyin/oauth/initiate');
+
+/** 查询抖音企业号 OAuth 授权状态 */
+export const checkDouyinOAuthStatus = (state: string) =>
+  api.get('/api/kellai/channels/douyin/oauth/status', { params: { state } });
+
+/** 抖音网站 Token 连接状态 */
+export const getDouyinWebPortalStatus = () =>
+  api.get('/api/kellai/channels/douyin/web-portal/status');
+
+/** 使用网站 token 建立连接 */
+export const connectDouyinWebPortal = (tokenOrUrl: string) =>
+  api.post('/api/kellai/channels/douyin/web-portal/connect', { token_or_url: tokenOrUrl });
+
+/** 同步第三方客服网页的账号、联系人和历史消息 */
+export const syncDouyinWebPortal = (maxConversations = 200, historyLimit = 20) =>
+  api.post('/api/kellai/channels/douyin/web-portal/sync', {
+    max_conversations: maxConversations,
+    history_limit: historyLimit,
+  });
+
+/** 开始/停止第三方客服网页实时私信监听 */
+export const startDouyinWebPortalMonitor = () =>
+  api.post('/api/kellai/channels/douyin/web-portal/monitor/start');
+
+export const stopDouyinWebPortalMonitor = () =>
+  api.post('/api/kellai/channels/douyin/web-portal/monitor/stop');
+
+/** 断开第三方客服网页 */
+export const disconnectDouyinWebPortal = () =>
+  api.delete('/api/kellai/channels/douyin/web-portal');
+
+/** XCMAX AI 本机绑定状态与授权动作。 */
+export const getXcmaxIntegrationStatus = () =>
+  loopbackClient.get('/api/kellai/integrations/xcmax/status');
+
+export const getXcmaxBindingPending = () =>
+  loopbackClient.get('/api/kellai/integrations/xcmax/pending');
+
+export const approveXcmaxBinding = (payload: {
+  request_id: string;
+  authorization_secret: string;
+  accepted_scopes: string[];
+}) =>
+  loopbackClient.post('/api/kellai/integrations/xcmax/approve', payload);
+
+export const cancelXcmaxBinding = (payload: {
+  request_id: string;
+  authorization_secret: string;
+}) =>
+  loopbackClient.post('/api/kellai/integrations/xcmax/cancel', payload);
+
+export const disconnectXcmaxBinding = () =>
+  loopbackClient.post('/api/kellai/integrations/xcmax/disconnect');

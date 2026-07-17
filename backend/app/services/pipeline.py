@@ -111,6 +111,7 @@ def _default_pipeline(customer_id: int, username: str = "") -> dict[str, Any]:
         "owner": "",
         "source": "",
         "tags": [],
+        "is_demo": False,
         "created_at": _now_iso(),
         "stage": "idle",
         "channel_sources": [],
@@ -181,6 +182,7 @@ def load_pipeline(customer_id: int, username: str = "") -> dict[str, Any]:
     doc.setdefault("ai_score", 0.0)
     doc.setdefault("ai_tags", [])
     doc.setdefault("timeline", [])
+    doc.setdefault("is_demo", False)
     return doc
 
 
@@ -306,11 +308,39 @@ def _iter_pipeline_docs() -> list[dict[str, Any]]:
     return docs
 
 
-def list_pipeline_client_summaries() -> list[dict[str, Any]]:
+def _is_demo_pipeline(doc: dict[str, Any], demo_customer_ids: set[int]) -> bool:
+    uid = _customer_id_from_doc(doc)
+    if bool(doc.get("is_demo")) or uid in demo_customer_ids:
+        return True
+    # Legacy local data created before is_demo was introduced.
+    if str(doc.get("username") or "").strip().lower() == "demo":
+        return True
+    for entry in doc.get("timeline") or []:
+        if not isinstance(entry, dict):
+            continue
+        source = str(entry.get("source") or "").strip().lower()
+        note = str(entry.get("note") or "").strip().lower()
+        if source == "test" or note.startswith("[tutorial]"):
+            return True
+    return False
+
+
+def list_pipeline_client_summaries(*, include_demo: bool = False) -> list[dict[str, Any]]:
+    demo_customer_ids: set[int] = set()
+    try:
+        from app.services.message_store import get_demo_customer_ids
+
+        demo_customer_ids = get_demo_customer_ids()
+    except Exception:
+        logger.warning("读取演示客户标记失败，将仅按档案标记过滤", exc_info=True)
+
     rows: list[dict[str, Any]] = []
     for doc in _iter_pipeline_docs():
         uid = _customer_id_from_doc(doc)
         if uid <= 0:
+            continue
+        is_demo = _is_demo_pipeline(doc, demo_customer_ids)
+        if is_demo and not include_demo:
             continue
         stage = normalize_stage_id(str(doc.get("stage") or "idle"))
         contact = _contact_from_doc(doc)
@@ -319,6 +349,7 @@ def list_pipeline_client_summaries() -> list[dict[str, Any]]:
                 "customer_id": uid,
                 "market_user_id": uid,
                 "username": str(doc.get("username") or ""),
+                "team_id": int(doc.get("team_id") or 0),
                 "stage": stage,
                 "stage_label": _STAGE_LABELS.get(stage, stage),
                 "display_name": _display_name_from_doc(doc),
@@ -338,16 +369,21 @@ def list_pipeline_client_summaries() -> list[dict[str, Any]]:
                 "note": contact["note"],
                 "source": contact["source"],
                 "tags": contact["tags"],
+                "is_demo": is_demo,
             }
         )
     rows.sort(key=lambda r: (r.get("updated_at") or "", r["customer_id"]), reverse=True)
     return rows
 
 
-def build_pipeline_funnel_summary(*, max_clients_per_stage: int = 8) -> dict[str, Any]:
+def build_pipeline_funnel_summary(
+    *,
+    max_clients_per_stage: int = 8,
+    include_demo: bool = False,
+) -> dict[str, Any]:
     counts = {s["id"]: 0 for s in PIPELINE_STAGES}
     clients_by_stage: dict[str, list[dict[str, Any]]] = {s["id"]: [] for s in PIPELINE_STAGES}
-    for row in list_pipeline_client_summaries():
+    for row in list_pipeline_client_summaries(include_demo=include_demo):
         st = normalize_stage_id(str(row.get("stage") or "idle"))
         if st not in counts:
             st = "idle"
@@ -478,6 +514,8 @@ def _apply_profile(doc: dict[str, Any], profile: dict[str, Any]) -> None:
         doc["tags"] = [str(t).strip() for t in (profile.get("tags") or []) if str(t).strip()]
     if profile.get("channel_sources") is not None:
         doc["channel_sources"] = [str(c).strip() for c in (profile.get("channel_sources") or []) if str(c).strip()]
+    if profile.get("is_demo") is not None:
+        doc["is_demo"] = bool(profile.get("is_demo"))
 
 
 def create_customer(profile: dict[str, Any], *, username: str = "") -> dict[str, Any]:

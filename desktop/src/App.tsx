@@ -12,6 +12,15 @@ import { useSalesStore } from "./stores/salesStore";
 import { useFinanceStore } from "./stores/financeStore";
 import { useOpenPlatformStore } from "./stores/openPlatformStore";
 import { Loader2 } from "lucide-react";
+import { sendWorkforceHeartbeat } from "./api/workforce";
+import {
+  claimAutoReplyJobs,
+  reportAutoReplyResult,
+  sendMessage,
+  syncInboxMessages,
+  type AutoReplyJob,
+} from "./api/messages";
+import { ROUTER_BASENAME } from "./utils/routing";
 
 /* 路由级代码分割：除登录页外的页面按需懒加载，显著减小首屏 bundle。
    每个 Page 包裹了 Suspense 兜底（见下方 Page 组件）。 */
@@ -132,6 +141,94 @@ function MessagePollingBridge() {
   return null;
 }
 
+function WorkforcePresenceBridge() {
+  const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    let disposed = false;
+    const report = async () => {
+      if (disposed) return;
+      await sendWorkforceHeartbeat(document.hidden ? "away" : "online").catch(() => undefined);
+    };
+    void report();
+    const timer = window.setInterval(() => void report(), 15_000);
+    const onVisibilityChange = () => void report();
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [isAuthenticated]);
+
+  return null;
+}
+
+function AutoReplyBridge() {
+  const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
+
+  useEffect(() => {
+    const isDesktop = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+    if (!isAuthenticated || !isDesktop) return;
+    let disposed = false;
+    let running = false;
+
+    const unwrapJobs = (response: any): AutoReplyJob[] => {
+      const payload = response?.data?.data ?? response?.data ?? response;
+      return Array.isArray(payload?.jobs) ? payload.jobs : [];
+    };
+
+    const processQueue = async () => {
+      if (disposed || running) return;
+      running = true;
+      try {
+        // 新消息先落库并创建幂等任务；另一个全局未读轮询可并行运行。
+        await syncInboxMessages("douyin", 50).catch(() => undefined);
+        const jobs = unwrapJobs(await claimAutoReplyJobs(3));
+        for (const job of jobs) {
+          if (disposed) break;
+          try {
+            const sent: any = await sendMessage(
+              job.customer_id,
+              job.channel_type,
+              job.contact_id,
+              job.reply_content,
+              job.contact_name,
+              { autoReplyInboundId: job.inbound_message_id },
+            );
+            await reportAutoReplyResult({
+              inbound_message_id: job.inbound_message_id,
+              success: true,
+              outbound_message_id: String(sent?.message_id || ""),
+            }).catch(() => undefined);
+          } catch (reason) {
+            const error = reason instanceof Error ? reason.message : String(reason || "自动回复发送失败");
+            await reportAutoReplyResult({
+              inbound_message_id: job.inbound_message_id,
+              success: false,
+              error,
+            }).catch(() => undefined);
+          }
+        }
+      } catch {
+        // 后台任务静默重试，避免干扰正在操作的坐席界面。
+      } finally {
+        running = false;
+      }
+    };
+
+    void processQueue();
+    const timer = window.setInterval(() => void processQueue(), 5_000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [isAuthenticated]);
+
+  return null;
+}
+
 function ThemeBootstrap({ children }: { children: React.ReactNode }) {
   const loadFromStorage = useThemeStore((s) => s.loadFromStorage);
   const initSystemListener = useThemeStore((s) => s.initSystemListener);
@@ -160,7 +257,9 @@ export default function App() {
     <ThemeBootstrap>
       <AuthBootstrap>
         <MessagePollingBridge />
-        <BrowserRouter>
+        <WorkforcePresenceBridge />
+        <AutoReplyBridge />
+        <BrowserRouter basename={ROUTER_BASENAME || undefined}>
           <Routes>
             <Route path="/login" element={<Login />} />
             <Route

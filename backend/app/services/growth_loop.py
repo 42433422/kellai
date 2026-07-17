@@ -38,8 +38,24 @@ def _channel_contacts(doc: dict[str, Any]) -> dict[str, str]:
     return {}
 
 
+def _demo_source_from_message(msg: UnifiedMessage) -> str:
+    metadata = msg.metadata if isinstance(msg.metadata, dict) else {}
+    simulated = metadata.get("simulated")
+    is_simulated = simulated is True or simulated == 1 or str(simulated).strip().lower() in {
+        "true",
+        "yes",
+    }
+    source = str(metadata.get("source") or "").strip().lower()
+    if source in {"closed_loop_audit", "llm_full_flow"}:
+        return source
+    return "simulation" if is_simulated else ""
+
+
 def resolve_customer_for_message(msg: UnifiedMessage) -> dict[str, Any]:
     """Find or create the customer pipeline touched by a channel message."""
+    demo_source = _demo_source_from_message(msg)
+    metadata = msg.metadata if isinstance(msg.metadata, dict) else {}
+    message_team_id = int(metadata.get("team_id") or 0)
     if int(msg.customer_id or 0) > 0:
         doc = load_pipeline(int(msg.customer_id))
     else:
@@ -47,6 +63,9 @@ def resolve_customer_for_message(msg: UnifiedMessage) -> dict[str, Any]:
         channel_type = str(msg.channel_type or "").strip()
         doc = {}
         for candidate in _iter_pipeline_docs():
+            candidate_team_id = int(candidate.get("team_id") or 0)
+            if message_team_id > 0 and candidate_team_id not in {0, message_team_id}:
+                continue
             contacts = _channel_contacts(candidate)
             if channel_type and contact_id and contacts.get(channel_type) == contact_id:
                 doc = candidate
@@ -63,16 +82,22 @@ def resolve_customer_for_message(msg: UnifiedMessage) -> dict[str, Any]:
                     "stage": "connected" if _normalize_direction(msg.direction) == "inbound" else "idle",
                     "channel_sources": [channel_type] if channel_type else [],
                     "tags": ["自动接入"],
+                    "is_demo": bool(demo_source),
                 },
                 username=display_name,
             )
 
+    if message_team_id > 0:
+        doc["team_id"] = message_team_id
     contacts = _channel_contacts(doc)
     if msg.channel_type and msg.contact_id:
         contacts[str(msg.channel_type)] = str(msg.contact_id)
         doc["channel_contacts"] = contacts
     if msg.contact_name and not doc.get("name"):
         doc["name"] = str(msg.contact_name).strip()
+    if demo_source:
+        doc["is_demo"] = True
+        doc["demo_source"] = demo_source
     return doc
 
 

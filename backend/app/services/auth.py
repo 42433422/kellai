@@ -24,6 +24,49 @@ logger = logging.getLogger(__name__)
 APP_ENV = os.environ.get("KELLAI_APP_ENV", "development").lower()
 IS_PRODUCTION = APP_ENV in ("production", "prod")
 
+
+def _development_jwt_secret_path() -> Path:
+    """返回本机开发环境的持久化 JWT 密钥路径。"""
+    configured = (os.environ.get("KELLAI_DATA_DIR") or "").strip()
+    data_dir = (
+        Path(configured).expanduser()
+        if configured
+        else Path(__file__).resolve().parents[3] / "data"
+    )
+    return data_dir / ".jwt-secret"
+
+
+def _load_or_create_development_jwt_secret() -> str:
+    """为本机桌面运行生成一次密钥，后续重启复用。"""
+    secret_path = _development_jwt_secret_path()
+    try:
+        secret_path.parent.mkdir(parents=True, exist_ok=True)
+        if secret_path.exists():
+            persisted = secret_path.read_text(encoding="utf-8").strip()
+            if len(persisted) >= 32:
+                return persisted
+
+        generated = secrets.token_urlsafe(48)
+        try:
+            fd = os.open(secret_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            persisted = secret_path.read_text(encoding="utf-8").strip()
+            if len(persisted) >= 32:
+                return persisted
+            secret_path.write_text(generated, encoding="utf-8")
+        else:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(generated)
+        try:
+            secret_path.chmod(0o600)
+        except OSError:
+            pass
+        return generated
+    except OSError as exc:
+        logger.warning("无法持久化开发 JWT_SECRET，将仅本次运行有效: %s", exc)
+        return secrets.token_urlsafe(48)
+
+
 # --- JWT 配置 ---
 JWT_SECRET = os.environ.get("KELLAI_JWT_SECRET", "")
 if not JWT_SECRET:
@@ -36,9 +79,8 @@ if not JWT_SECRET:
         JWT_SECRET = "kellai-dev-jwt"
         logger.info("使用开发模式固定 JWT_SECRET（KELLAI_DEV_FIXED_JWT=1）")
     else:
-        # 否则使用随机密钥，每次启动不同
-        JWT_SECRET = secrets.token_urlsafe(32)
-        logger.warning("使用开发模式随机 JWT_SECRET（每次启动不同，仅限 development 环境）")
+        JWT_SECRET = _load_or_create_development_jwt_secret()
+        logger.info("使用本机持久化开发 JWT_SECRET（仅限 development 环境）")
 JWT_ALGORITHM = "HS256"
 
 # --- 密码 hash 旧 salt ---
@@ -1058,6 +1100,45 @@ def login_by_phone(phone: str, code: str) -> dict[str, Any]:
 
     session = _create_session(user_id, user)
     logger.info("手机号登录成功: user_id=%s", user_id)
+    return {
+        "success": True,
+        "user": user,
+        "access_token": session["access_token"],
+        "refresh_token": session["refresh_token"],
+        "access_expires_at": session["access_expires_at"],
+        "refresh_expires_at": session["refresh_expires_at"],
+    }
+
+
+def create_login_session_for_user(user_id: int) -> dict[str, Any]:
+    """Create a fresh login session for an already-authenticated user id."""
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return {"success": False, "error": "无效用户"}
+    if uid <= 0:
+        return {"success": False, "error": "无效用户"}
+
+    try:
+        with _conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM kellai_users WHERE id = ? AND is_active = 1",
+                (uid,),
+            ).fetchone()
+            user = _row_to_dict(row)
+            if user:
+                user.pop("password_hash", None)
+    except sqlite3.Error as exc:
+        logger.error("创建用户登录会话异常 user_id=%s: %s", uid, exc)
+        return {"success": False, "error": "登录失败，请稍后重试"}
+
+    if not user:
+        return {"success": False, "error": "用户不存在或已停用"}
+
+    session = _create_session(uid, user)
+    if not session.get("access_token"):
+        return {"success": False, "error": "会话初始化失败，请稍后重试"}
+    logger.info("扫码登录会话创建成功: user_id=%s", uid)
     return {
         "success": True,
         "user": user,

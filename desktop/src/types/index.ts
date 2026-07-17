@@ -126,9 +126,11 @@ export interface CustomerMessage {
   customer_id: number;
   channel_type: string;
   contact_id: string;
+  contact_name?: string;
   direction: 'inbound' | 'outbound';
   content: string;
   intent?: string;
+  metadata?: Record<string, unknown>;
   created_at: string;
 }
 
@@ -222,6 +224,7 @@ export interface Channel {
   type:
     | "email"
     | "sms"
+    | "wechat"
     | "wework"
     | "phone"
     | "douyin"

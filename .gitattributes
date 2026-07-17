@@ -1,0 +1,5 @@
+*.docx binary
+*.pdf binary
+*.png binary
+docs/*.md whitespace=-trailing-space
+docs/**/*.md whitespace=-trailing-space

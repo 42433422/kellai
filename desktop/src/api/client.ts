@@ -1,23 +1,60 @@
-import axios, { AxiosError, type InternalAxiosRequestConfig } from "axios";
+import axios, {
+  AxiosError,
+  type AxiosAdapter,
+  type InternalAxiosRequestConfig,
+} from "axios";
 import type { ApiResponse } from "../types";
 import { toastStore } from "../stores/toast";
 import { shouldUseMock } from "../mocks";
-import { mockAdapter } from "../mocks/handlers";
+import { appPath } from "../utils/routing";
 
-/** axios 实例，baseURL 从环境变量读取，默认 http://127.0.0.1:8790
+/** axios 实例，baseURL 从环境变量读取，默认 http://127.0.0.1:8793
  *  如果开了 mock 模式（VITE_USE_MOCK=true 或 localStorage kellai:useMock=1），
  *  就把请求交给我们自己写的 mockAdapter 拦截，UI 用本地数据跑起来。 */
+const configuredApiBaseUrl = String(import.meta.env.VITE_API_BASE_URL || "").trim();
+const useDevelopmentProxy =
+  import.meta.env.DEV &&
+  typeof window !== "undefined" &&
+  (window.location.hostname === "127.0.0.1" ||
+    window.location.hostname === "localhost");
+
+/**
+ * 浏览器开发页统一走 Vite 同源代理，避免嵌入式浏览器把跨端口
+ * 127.0.0.1:1420 -> 127.0.0.1:8793 请求拦截为 Network Error。
+ * Tauri/生产包仍直接连接本机后端。
+ */
+export const API_BASE_URL = useDevelopmentProxy
+  ? ""
+  : configuredApiBaseUrl || "http://127.0.0.1:8793";
+const mockModeEnabled = import.meta.env.DEV && shouldUseMock();
+const developmentMockAdapter: AxiosAdapter | undefined = mockModeEnabled
+  ? async (config) => {
+      const { mockAdapter } = await import("../mocks/handlers");
+      return mockAdapter(config);
+    }
+  : undefined;
+
 const client = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8790",
+  baseURL: API_BASE_URL,
   timeout: 15000,
   headers: {
     "Content-Type": "application/json",
   },
-  adapter: shouldUseMock() ? mockAdapter : undefined,
+  adapter: developmentMockAdapter,
+});
+
+/**
+ * Desktop-to-desktop handoffs must always use the real loopback backend.  This
+ * keeps an optional product-data mock mode from intercepting authorization.
+ */
+export const loopbackClient = axios.create({
+  baseURL: API_BASE_URL,
+  timeout: 15000,
+  headers: { "Content-Type": "application/json" },
 });
 
 // 控制台提示一下，免得忘了关 mock
-if (shouldUseMock()) {
+if (mockModeEnabled) {
   // eslint-disable-next-line no-console
   console.info(
     "%c[客来来] Mock 数据模式已开启",
@@ -49,6 +86,23 @@ const USER_KEY = "auth_user";
 
 /** 防止多个 401 并发刷新：同一时刻只允许一个刷新请求 */
 let refreshingPromise: Promise<string | null> | null = null;
+type LoadingRequestConfig = InternalAxiosRequestConfig & {
+  __retried?: boolean;
+  __loadingId?: string;
+  __loadingTimer?: number;
+};
+
+function clearRequestLoading(config?: LoadingRequestConfig) {
+  if (!config) return;
+  if (config.__loadingTimer) {
+    window.clearTimeout(config.__loadingTimer);
+    config.__loadingTimer = undefined;
+  }
+  if (config.__loadingId) {
+    toastStore.dismiss(config.__loadingId);
+    config.__loadingId = undefined;
+  }
+}
 
 /**
  * 尝试用 refresh_token 换取新的 access_token
@@ -84,8 +138,9 @@ function redirectToLogin() {
   localStorage.removeItem(REFRESH_TOKEN_KEY);
   localStorage.removeItem(USER_KEY);
   // 避免在登录页重复跳转
-  if (window.location.pathname !== "/login") {
-    window.location.href = "/login";
+  const loginPath = appPath("/login");
+  if (window.location.pathname !== loginPath) {
+    window.location.href = loginPath;
   }
 }
 
@@ -107,15 +162,26 @@ client.interceptors.request.use(
     const method = (config.method || "get").toLowerCase();
     const isWriteOp = method !== "get" && method !== "head";
     if (isWriteOp && !config.skipLoading) {
-      const loadingId = toastStore.loading("处理中...");
-      // 将 loadingId 挂在 config 上，响应拦截器再关闭
-      (config as InternalAxiosRequestConfig & { __loadingId?: string }).__loadingId = loadingId;
+      // 快速请求不展示 loading，避免短请求反复闪烁；超过 300ms 才提示。
+      const loadingConfig = config as LoadingRequestConfig;
+      loadingConfig.__loadingTimer = window.setTimeout(() => {
+        loadingConfig.__loadingId = toastStore.loading("处理中...");
+        loadingConfig.__loadingTimer = undefined;
+      }, 300);
     }
 
     return config;
   },
   (error) => Promise.reject(error)
 );
+
+loopbackClient.interceptors.request.use((config: InternalAxiosRequestConfig) => {
+  const token = localStorage.getItem(TOKEN_KEY);
+  if (token && config.headers) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
 
 /**
  * 响应拦截器：
@@ -125,20 +191,14 @@ client.interceptors.request.use(
  */
 client.interceptors.response.use(
   (response) => {
-    const loadingId = (response.config as InternalAxiosRequestConfig & { __loadingId?: string })
-      .__loadingId;
-    if (loadingId) toastStore.dismiss(loadingId);
+    clearRequestLoading(response.config as LoadingRequestConfig);
     return response;
   },
   async (error: AxiosError<ApiResponse<unknown>>) => {
-    const originalConfig = error.config as
-      | (InternalAxiosRequestConfig & { __retried?: boolean; __loadingId?: string })
-      | undefined;
+    const originalConfig = error.config as LoadingRequestConfig | undefined;
 
     // 关闭 loading toast
-    if (originalConfig?.__loadingId) {
-      toastStore.dismiss(originalConfig.__loadingId);
-    }
+    clearRequestLoading(originalConfig);
 
     const status = error.response?.status;
 

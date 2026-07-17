@@ -493,11 +493,12 @@ def _run_customer_management_loop(audit_id: str) -> dict[str, Any]:
                 "stage": "connected",
                 "tags": ["待验收"],
                 "channel_sources": ["wework"],
+                "is_demo": True,
             },
             username="closed-loop-audit",
         )
         customer_id = int(created.get("customer_id") or 0)
-        listed_after_create = list_pipeline_client_summaries()
+        listed_after_create = list_pipeline_client_summaries(include_demo=True)
         found_created = next((row for row in listed_after_create if int(row.get("customer_id") or 0) == customer_id), {})
 
         updated = update_customer_profile(
@@ -521,10 +522,10 @@ def _run_customer_management_loop(audit_id: str) -> dict[str, Any]:
         final_doc = load_pipeline(customer_id)
         final_doc["note"] = "客户管理闭环验收完成"
         final_doc = save_pipeline(final_doc)
-        listed_before_delete = list_pipeline_client_summaries()
+        listed_before_delete = list_pipeline_client_summaries(include_demo=True)
         found_final = next((row for row in listed_before_delete if int(row.get("customer_id") or 0) == customer_id), {})
         deleted = delete_pipeline(customer_id)
-        listed_after_delete = list_pipeline_client_summaries()
+        listed_after_delete = list_pipeline_client_summaries(include_demo=True)
         still_exists = any(int(row.get("customer_id") or 0) == customer_id for row in listed_after_delete)
 
         final_tags = [str(t) for t in (final_doc.get("tags") or [])]
@@ -1450,8 +1451,8 @@ async def run_closed_loop_audit(
         )
     )
 
-    funnel = build_pipeline_funnel_summary(max_clients_per_stage=5)
-    clients = list_pipeline_client_summaries()
+    funnel = build_pipeline_funnel_summary(max_clients_per_stage=5, include_demo=True)
+    clients = list_pipeline_client_summaries(include_demo=True)
     checks.extend(
         [
             _item(

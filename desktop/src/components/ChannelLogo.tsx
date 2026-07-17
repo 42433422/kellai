@@ -14,6 +14,7 @@ interface ChannelLogoProps {
 
 /** 品牌色映射 */
 export const CHANNEL_BRAND_COLOR: Record<string, string> = {
+  wechat: '#07C160',
   wework: '#2B7CE9',
   phone: '#F5A623',
   douyin: '#000000',
@@ -29,6 +30,18 @@ export const CHANNEL_BRAND_COLOR: Record<string, string> = {
   telegram: '#26A5E4',
   line: '#00B900',
 };
+
+/** 微信 WeChat Logo — 简化气泡标识 */
+const WechatLogo: React.FC<{ size: number }> = ({ size }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <path d="M9.4 4.2c-4.1 0-7.4 2.8-7.4 6.2 0 1.9 1 3.6 2.7 4.8l-.5 1.7c-.1.3.2.5.5.4l2.1-1.1c.8.2 1.7.4 2.6.4 4.1 0 7.4-2.8 7.4-6.2S13.5 4.2 9.4 4.2Z" fill="#07C160"/>
+    <path d="M14.8 9.5c3.8.2 6.8 2.7 6.8 5.8 0 1.7-.9 3.3-2.4 4.3l.4 1.5c.1.3-.2.5-.5.4l-1.8-.9c-.8.2-1.6.3-2.5.3-3.7 0-6.7-2.4-6.9-5.5h.9c4.9 0 8.8-3.3 8.8-7.2v-.1c-.8.8-1.8 1.3-2.8 1.4Z" fill="#07C160" opacity="0.72"/>
+    <circle cx="7.2" cy="9.6" r="0.8" fill="white"/>
+    <circle cx="11.7" cy="9.6" r="0.8" fill="white"/>
+    <circle cx="13.1" cy="14.5" r="0.7" fill="white"/>
+    <circle cx="16.8" cy="14.5" r="0.7" fill="white"/>
+  </svg>
+);
 
 /** 企业微信 WeCom Logo — 来源: TDesign Icons (MIT) */
 const WeworkLogo: React.FC<{ size: number }> = ({ size }) => (
@@ -131,6 +144,7 @@ const WebLogo: React.FC<{ size: number }> = ({ size }) => (
 
 /** Logo 组件映射 */
 const LOGO_MAP: Record<string, React.FC<{ size: number }>> = {
+  wechat: WechatLogo,
   wework: WeworkLogo,
   douyin: DouyinLogo,
   miniprogram: MiniprogramLogo,
@@ -160,7 +174,7 @@ export default function ChannelLogo({ type, className, size = 20 }: ChannelLogoP
   // fallback: 用品牌色圆角方块 + 首字母
   const color = CHANNEL_BRAND_COLOR[type] ?? '#6B7280';
   const label = {
-    wework: '企', phone: '电', douyin: '抖', miniprogram: '微',
+    wechat: '微', wework: '企', phone: '电', douyin: '抖', miniprogram: '小',
     email: '邮', sms: '信', web: '网', pdd: '拼', taobao: '淘',
     jd: '京', alibaba: '1', whatsapp: 'W', telegram: 'T', line: 'L',
   }[type] ?? type[0]?.toUpperCase() ?? '?';

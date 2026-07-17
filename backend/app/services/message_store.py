@@ -127,6 +127,22 @@ def save_message(msg: UnifiedMessage) -> UnifiedMessage:
         apply_message_to_growth_loop(msg)
     except Exception:
         logger.warning("消息已保存但增长闭环更新失败: message_id=%s", msg.id, exc_info=True)
+    try:
+        from app.services.workforce_routing import auto_assign_customer, touch_assignment
+
+        metadata = msg.metadata if isinstance(msg.metadata, dict) else {}
+        team_id = int(metadata.get("team_id") or 0)
+        if int(msg.customer_id or 0) > 0 and team_id > 0:
+            if str(msg.direction or "").lower() == "inbound":
+                auto_assign_customer(
+                    customer_id=int(msg.customer_id),
+                    team_id=team_id,
+                    source=f"{msg.channel_type}_inbound",
+                )
+            else:
+                touch_assignment(int(msg.customer_id))
+    except Exception:
+        logger.warning("消息已保存但接待分配更新失败: message_id=%s", msg.id, exc_info=True)
     return msg
 
 
@@ -219,6 +235,13 @@ def get_messages_with_state(
             "pending_follow_up": False,
             "next_action": "",
         }
+    try:
+        from app.services.workforce_routing import assignment_for_customer
+
+        assignment = assignment_for_customer(int(customer_id)) or {}
+    except Exception:
+        logger.debug("获取客户接待分配失败: customer_id=%s", customer_id, exc_info=True)
+        assignment = {}
 
     result: list[dict[str, Any]] = []
     for row in rows:
@@ -248,9 +271,48 @@ def get_messages_with_state(
             "ai_intent": metadata.get("ai_intent") or ctx.get("ai_intent") or "",
             "pending_follow_up": bool(ctx.get("pending_follow_up")),
             "next_action": ctx.get("next_action") or "",
+            "assignee_user_id": int(assignment.get("assignee_user_id") or 0),
+            "assignee_name": str(assignment.get("assignee_name") or ""),
+            "assignment_status": str(assignment.get("status") or "unassigned"),
+            "assignment_source": str(assignment.get("source") or ""),
         }
         result.append(item)
     return result
+
+
+def get_demo_customer_ids() -> set[int]:
+    """Return customers created by built-in simulations or product audits.
+
+    Mock mode only controls the frontend adapter. Simulation endpoints persist
+    messages in the real SQLite store, so the business views need a durable way
+    to keep those customers separate from production data. Parsing in Python
+    also keeps this compatible with SQLite builds that do not include JSON1.
+    """
+    demo_sources = {"closed_loop_audit", "llm_full_flow"}
+    customer_ids: set[int] = set()
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT customer_id, metadata_json FROM kellai_messages WHERE metadata_json IS NOT NULL"
+        ).fetchall()
+    for row in rows:
+        raw = row["metadata_json"]
+        try:
+            metadata = json.loads(raw) if raw else {}
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(metadata, dict):
+            continue
+        simulated = metadata.get("simulated")
+        is_simulated = simulated is True or simulated == 1 or str(simulated).strip().lower() in {
+            "true",
+            "yes",
+        }
+        source = str(metadata.get("source") or "").strip().lower()
+        if is_simulated or source in demo_sources:
+            customer_id = int(row["customer_id"] or 0)
+            if customer_id > 0:
+                customer_ids.add(customer_id)
+    return customer_ids
 
 
 def get_unread_count(customer_id: int) -> int:

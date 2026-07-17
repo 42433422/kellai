@@ -1,0 +1,76 @@
+<view class="page">
+  <view class="hero">
+    <view class="brand-row">
+      <view class="brand-mark">客</view>
+      <view class="brand-copy">
+        <text class="brand-name">客来来</text>
+        <text class="brand-subtitle">企业智能客户服务</text>
+      </view>
+      <view class="online-pill">
+        <view class="online-dot"></view>
+        <text>客服在线</text>
+      </view>
+    </view>
+
+    <view class="hero-copy">
+      <text class="eyebrow">WELCOME</text>
+      <text class="hero-title">有问题，随时联系我们</text>
+      <text class="hero-description">
+        产品咨询、使用帮助和售后问题，都可以由在线客服为你处理。
+      </text>
+    </view>
+  </view>
+
+  <view class="service-card">
+    <view class="service-heading">
+      <view class="service-icon">聊</view>
+      <view class="service-copy">
+        <text class="service-title">在线人工客服</text>
+        <text class="service-description">点击后进入抖音客服会话</text>
+      </view>
+    </view>
+
+    <view class="benefit-list">
+      <view class="benefit-item">
+        <text class="benefit-check">✓</text>
+        <text>一对一沟通，快速定位问题</text>
+      </view>
+      <view class="benefit-item">
+        <text class="benefit-check">✓</text>
+        <text>会话记录保存在抖音消息中心</text>
+      </view>
+      <view class="benefit-item">
+        <text class="benefit-check">✓</text>
+        <text>支持文字、表情和图片咨询</text>
+      </view>
+    </view>
+
+    <button
+      class="contact-button"
+      open-type="im"
+      data-im-id="{{ imId }}"
+      bindim="imCallback"
+      binderror="onImError"
+      disabled="{{ !serviceReady }}"
+    >
+      <text class="button-icon">●</text>
+      <text>立即联系客服</text>
+    </button>
+
+    <text class="service-note">
+      客服忙碌时请稍候，历史会话可在抖音“第三方客服消息”中查看。
+    </text>
+  </view>
+
+  <view class="safe-card">
+    <view class="safe-icon">盾</view>
+    <view class="safe-copy">
+      <text class="safe-title">抖音官方会话服务</text>
+      <text class="safe-description">
+        点击客服按钮后，将由抖音官方客服会话能力提供沟通服务。
+      </text>
+    </view>
+  </view>
+
+  <text class="footer">客来来 · 让每一次客户沟通都有回应</text>
+</view>

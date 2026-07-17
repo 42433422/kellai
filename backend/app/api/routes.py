@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
+import secrets
 from typing import Annotated, Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.api.auth_middleware import CurrentUser
@@ -20,8 +24,38 @@ AUTH_WHITELIST: set[str] = {
     "/health",
     "/api/kellai/status",
     "/api/kellai/landing/sync",
+    "/api/kellai/auth/qr/start",
+    "/api/kellai/auth/qr/status",
+    "/api/kellai/auth/qr/scan",
+    "/api/kellai/auth/qr/cancel",
+    "/api/kellai/auth/xcmax-desktop",
+    "/api/kellai/webhook/douyin",
+    "/api/kellai/webhook/wechat",
     "/api/kellai/webhook/wework",
+    "/api/kellai/webhook/wework/suite",
+    "/api/kellai/channels/douyin/oauth/callback",
+    "/api/kellai/channels/wework/customer-entry",
+    "/api/kellai/channels/wechat/oauth/callback",
+    "/api/kellai/channels/wechat/oauth/qrcode",
     "/api/kellai/channels/wework/oauth/callback",
+    "/api/kellai/channels/wework/install/callback",
+    "/api/kellai/internal/wework/readiness",
+    "/api/kellai/internal/wework/install",
+    "/api/kellai/internal/wework/install/status",
+    "/api/kellai/internal/wework/customers/sync",
+    "/api/kellai/internal/wework/customers",
+    "/api/kellai/internal/wework/acquisition/members",
+    "/api/kellai/internal/wework/acquisition/links",
+    "/api/kellai/internal/douyin/readiness",
+    "/api/kellai/internal/douyin/config",
+    "/api/kellai/internal/douyin/oauth/initiate",
+    "/api/kellai/internal/douyin/oauth/status",
+    "/api/kellai/internal/douyin/connection",
+    "/api/kellai/internal/douyin/messages/send",
+    "/api/kellai/internal/douyin/inbox",
+    "/api/kellai/internal/douyin/inbox/ack",
+    "/api/kellai/integrations/xcmax/data-status",
+    "/api/kellai/integrations/xcmax/customers",
 }
 
 
@@ -144,6 +178,38 @@ class ChannelSendMessageBody(BaseModel):
     channel_type: str = Field(..., min_length=1, max_length=32)
     contact_id: str = Field(..., min_length=1, max_length=256)
     content: str = Field(..., min_length=1, max_length=8000)
+    desktop_result: Optional[dict[str, Any]] = None
+    auto_reply_inbound_id: str = Field(default="", max_length=512)
+
+
+class DouyinBridgeSendBody(BaseModel):
+    team_id: int = Field(..., gt=0)
+    contact_id: str = Field(..., min_length=1, max_length=256)
+    content: str = Field(..., min_length=1, max_length=8000)
+    persona_id: str = Field(default="", max_length=128)
+    customer_id: int = Field(default=0, ge=0)
+    reply_context: dict[str, Any] = Field(default_factory=dict)
+
+
+class DouyinBridgeConfigBody(BaseModel):
+    client_key: str = Field(default="", max_length=256)
+    client_secret: str = Field(default="", max_length=1024)
+    miniapp_app_id: str = Field(default="", max_length=256)
+    miniapp_secret: str = Field(default="", max_length=1024)
+
+
+class DouyinBridgeInboxAckBody(BaseModel):
+    team_id: int = Field(..., gt=0)
+    message_ids: list[str] = Field(default_factory=list, max_length=200)
+
+
+class DouyinWebPortalConnectBody(BaseModel):
+    token_or_url: str = Field(..., min_length=8, max_length=8192)
+
+
+class DouyinWebPortalSyncBody(BaseModel):
+    max_conversations: int = Field(default=200, ge=1, le=1000)
+    history_limit: int = Field(default=20, ge=1, le=100)
 
 
 class MarkReadBody(BaseModel):
@@ -263,6 +329,14 @@ class AgentAssistBody(BaseModel):
     actor: str = Field(default="desktop", max_length=80)
 
 
+class WorkforceHeartbeatBody(BaseModel):
+    state: str = Field(default="online", max_length=16)
+
+
+class WorkforceAssignBody(BaseModel):
+    assignee_user_id: int = Field(..., gt=0)
+
+
 # ---------------------------------------------------------------------------
 # 认证与团队 Body 模型
 # ---------------------------------------------------------------------------
@@ -287,6 +361,11 @@ class RefreshBody(BaseModel):
     refresh_token: str = Field(..., min_length=1, max_length=512)
 
 
+class QrLoginBody(BaseModel):
+    session_id: str = Field(..., min_length=16, max_length=128)
+    secret: str = Field(default="", max_length=128)
+
+
 class ResetPasswordBody(BaseModel):
     phone: str = Field(..., min_length=1, max_length=64)
     code: str = Field(..., min_length=4, max_length=6)
@@ -306,6 +385,17 @@ class InviteBody(BaseModel):
 
 class RoleBody(BaseModel):
     role: str = Field(..., max_length=32)
+
+
+class XcmaxAuthorizeBody(BaseModel):
+    request_id: str = Field(min_length=12, max_length=128)
+    authorization_secret: str = Field(min_length=24, max_length=256)
+    accepted_scopes: list[str] = Field(default_factory=list, max_length=10)
+
+
+class XcmaxCancelBody(BaseModel):
+    request_id: str = Field(min_length=12, max_length=128)
+    authorization_secret: str = Field(min_length=24, max_length=256)
 
 
 class JoinBody(BaseModel):
@@ -335,6 +425,17 @@ class AutoReplyBody(BaseModel):
     stage: str = Field(default="", max_length=32)
 
 
+class AutoReplyClaimBody(BaseModel):
+    limit: int = Field(default=3, ge=1, le=10)
+
+
+class AutoReplyResultBody(BaseModel):
+    inbound_message_id: str = Field(..., min_length=1, max_length=512)
+    success: bool
+    error: str = Field(default="", max_length=2000)
+    outbound_message_id: str = Field(default="", max_length=512)
+
+
 class ScoreBody(BaseModel):
     customer_id: Optional[int] = Field(default=None, gt=0)
     market_user_id: Optional[int] = Field(default=None, gt=0)
@@ -346,23 +447,47 @@ class ScoreBody(BaseModel):
 
 
 CHANNEL_ONBOARDING_GUIDES: dict[str, dict[str, Any]] = {
+    "wechat": {
+        "recommended_mode": "scan",
+        "auth_modes": ["scan", "form"],
+        "required_fields": ["app_id", "app_secret"],
+        "optional_fields": ["official_app_id", "official_app_secret", "token", "encoding_aes_key", "bot_webhook"],
+        "materials": ["微信开放平台网站应用", "已审核通过的 AppID / AppSecret", "微信开放平台授权回调域名", "公众号 AppID / Secret（如需客服消息）"],
+        "external_steps": ["在微信开放平台创建并审核网站应用", "把授权回调域名配置为当前客来来公网域名", "回填 AppID / AppSecret 后扫码授权", "如需接收公众号消息，在公众平台配置 /api/kellai/webhook/wechat"],
+        "success_criteria": ["扫码授权后能保存 openid/unionid", "微信回调消息能进入统一收件箱", "同步收件箱后客户自动进入漏斗"],
+    },
     "wework": {
         "recommended_mode": "scan",
         "auth_modes": ["scan", "form"],
-        "required_fields": ["corp_id", "secret", "agent_id"],
-        "optional_fields": ["bot_webhook", "kf_url", "open_kfid"],
-        "materials": ["企业微信管理员权限", "自建应用的 Corp ID / Agent ID / Secret", "企业微信客服链接或 open_kfid"],
-        "external_steps": ["在企业微信后台创建或选择自建应用", "配置可信域名和回调地址", "把 Corp ID、Agent ID、Secret 回填到客来来", "扫码授权并测试连接"],
-        "success_criteria": ["测试连接通过", "能同步一条企微客户消息", "客户自动进入漏斗并生成下一步动作"],
+        "required_fields": [],
+        "optional_fields": ["corp_id", "secret", "agent_id", "bot_webhook", "kf_url", "open_kfid"],
+        "materials": ["企业微信管理员权限", "客来来服务商第三方应用", "公网 HTTPS 指令回调与安装回调"],
+        "external_steps": ["客来来服务商后台创建 SaaS 第三方应用", "配置客户联系权限和公网回调", "管理员扫描客来来安装二维码并确认授权", "自动同步外部联系人"],
+        "success_criteria": ["企业安装授权成功", "真实外部联系人能同步到客来来客户列表", "客户自动进入漏斗并生成下一步动作"],
     },
     "douyin": {
         "recommended_mode": "scan",
         "auth_modes": ["scan", "form"],
-        "required_fields": ["app_id", "app_secret"],
+        "required_fields": ["app_id", "app_secret", "miniapp_app_id", "miniapp_secret"],
         "optional_fields": ["client_key", "client_secret"],
-        "materials": ["抖音开放平台应用", "App ID / App Secret", "商家账号或客服权限"],
-        "external_steps": ["在抖音开放平台创建应用", "开通客服消息或私信相关权限", "把应用凭据回填到客来来", "测试连接后同步收件箱"],
-        "success_criteria": ["测试连接通过", "抖音进线能入库", "客户阶段随消息自动推进"],
+        "materials": [
+            "抖音开放平台移动/网站应用 Client Key / Client Secret",
+            "抖音小程序 AppID",
+            "小程序“开发配置 → Webhooks”中的 Webhook AppSecret",
+            "已认证企业号或小程序品牌号/员工号",
+            "公网 HTTPS Webhook 地址",
+        ],
+        "external_steps": [
+            "移动/网站应用仅用于测试白名单和基础账号授权",
+            "在小程序“关联设置 → 抖音号管理”为经营号开通小程序发送私信能力",
+            "把客来来 Webhook 地址配置到小程序，并订阅 im_send_msg、im_receive_msg、im_enter_direct_msg",
+            "回填小程序 AppID 与 Webhook AppSecret；真实私信到达后即可在客来来回复",
+        ],
+        "success_criteria": [
+            "Webhook 验签通过且真实私信自动建立客户与会话",
+            "客来来使用 BusinessToken 调用 /im/send/msg/ 回复成功",
+            "发送回执不重复入库且消息驱动统一接待与漏斗",
+        ],
     },
     "miniprogram": {
         "recommended_mode": "scan",
@@ -486,6 +611,18 @@ def _channel_onboarding_profile(
     required_fields = [str(x) for x in guide.get("required_fields", [])]
     optional_fields = [str(x) for x in guide.get("optional_fields", [])]
     missing_required = [key for key in required_fields if not str(config.get(key) or "").strip()]
+    if channel_type == "douyin" and str(config.get("remote_credentials_configured") or "").lower() == "true":
+        missing_required = [
+            key
+            for key in missing_required
+            if key not in {"app_id", "app_secret", "client_key", "client_secret"}
+        ]
+    if channel_type == "douyin" and str(config.get("remote_miniapp_configured") or "").lower() == "true":
+        missing_required = [
+            key
+            for key in missing_required
+            if key not in {"miniapp_app_id", "miniapp_secret"}
+        ]
     saved_fields = [key for key, value in config.items() if str(value or "").strip()]
     required_complete = not missing_required
     if connected:
@@ -535,13 +672,16 @@ def _channel_onboarding_profile(
 
 
 @router.get("/channels")
-async def list_channels():
+async def list_channels(request: Request = None):
     """列出所有已注册渠道及状态（含已保存的配置）。"""
     from app.channels import ChannelRegistry
     from app.channels.config_store import get_all
+    from app.channels.config_store import save as save_config
 
     reg = ChannelRegistry()
     channels = reg.list_channels()
+    user = get_request_user(request) if request is not None else None
+    team_id = int((user or {}).get("team_id") or 0)
     result = []
     for ch in channels:
         cfg = get_all(ch["channel_type"])
@@ -549,6 +689,89 @@ async def list_channels():
         has_config = any(str(v).strip() for v in merged_config.values())
         enabled = bool(cfg.get("enabled", has_config))
         connected = enabled and bool(cfg.get("connected"))
+        connection_message = ""
+        if ch["channel_type"] == "douyin" and team_id > 0:
+            try:
+                from app.services.douyin_channel import (
+                    remote_bridge_enabled,
+                    remote_connection_status,
+                )
+
+                if remote_bridge_enabled():
+                    remote_status = await remote_connection_status(team_id)
+                    connected = bool(remote_status.get("connected"))
+                    connection_message = str(remote_status.get("message") or "")
+                    authorization = remote_status.get("authorization")
+                    if isinstance(authorization, dict) and authorization.get("open_id"):
+                        merged_config.update(
+                            {
+                                "oauth_authorized": "true",
+                                "oauth_scope": str(authorization.get("scope") or ""),
+                                "direct_message_enabled": str(
+                                    bool((remote_status.get("capabilities") or {}).get("direct_message"))
+                                ).lower(),
+                            }
+                        )
+                        has_config = True
+                        enabled = True
+                    miniapp = remote_status.get("miniapp")
+                    if isinstance(miniapp, dict) and miniapp.get("app_id_configured"):
+                        merged_config.update(
+                            {
+                                "miniapp_app_id": str(miniapp.get("app_id") or ""),
+                                "remote_miniapp_configured": str(
+                                    bool(miniapp.get("webhook_secret_configured"))
+                                ).lower(),
+                            }
+                        )
+                        has_config = True
+                        enabled = True
+                    if connected != bool(cfg.get("connected")):
+                        cfg = save_config(
+                            "douyin",
+                            {},
+                            enabled=enabled or connected,
+                            connected=connected,
+                        )
+                        enabled = bool(cfg.get("enabled"))
+            except Exception as exc:
+                logger.warning("刷新抖音远端授权状态失败: %s", exc)
+            try:
+                from app.services.douyin_web_portal import status as web_portal_status
+
+                web_state = web_portal_status(team_id)
+                if web_state.get("connected"):
+                    connected = True
+                    enabled = True
+                    has_config = True
+                    merged_config.update(
+                        {
+                            "web_portal_connected": "true",
+                            "web_portal_monitor_running": str(
+                                bool(web_state.get("monitor_running"))
+                            ).lower(),
+                            "web_portal_contact_count": str(
+                                int(web_state.get("contact_count") or 0)
+                            ),
+                        }
+                    )
+                    account_name = str(web_state.get("account_name") or "").strip()
+                    connection_message = (
+                        f"抖音网站数据已连接：{account_name}"
+                        if account_name
+                        else "抖音网站数据已连接"
+                    )
+                    if not bool(cfg.get("connected")) or not bool(cfg.get("enabled")):
+                        cfg = save_config(
+                            "douyin",
+                            {"web_portal_connected": "true"},
+                            enabled=True,
+                            connected=True,
+                        )
+                elif "web_portal_connected" in merged_config:
+                    merged_config["web_portal_connected"] = "false"
+            except Exception as exc:
+                logger.warning("刷新抖音网站数据连接状态失败: %s", exc)
         result.append({
             "id": f"ch_{ch['channel_type']}",
             "name": cfg.get("name") or ch["channel_type"],
@@ -556,7 +779,10 @@ async def list_channels():
             "adapter_class": ch["adapter_class"],
             "enabled": enabled,
             "connected": connected,
-            "message": "已连接" if connected else ("已保存配置，点击测试连接验证" if has_config else "未配置"),
+            "message": (
+                connection_message
+                or ("已连接" if connected else ("已保存配置，点击测试连接验证" if has_config else "未配置"))
+            ),
             "config": merged_config,
             "config_schema": ch.get("config_schema") or {},
             "onboarding": _channel_onboarding_profile(
@@ -571,7 +797,7 @@ async def list_channels():
 
 
 @router.post("/channels/{channel_type}/test")
-async def test_channel(channel_type: str):
+async def test_channel(channel_type: str, request: Request = None):
     """测试指定渠道连接。"""
     from app.channels import ChannelRegistry
     from app.channels.config_store import get as get_config
@@ -583,7 +809,27 @@ async def test_channel(channel_type: str):
     except KeyError:
         return {"success": False, "error": f"未注册的渠道类型: {channel_type}"}
     try:
-        result = await adapter.test_connection()
+        user = get_request_user(request) if request is not None else None
+        team_id = int((user or {}).get("team_id") or 0)
+        if channel_type == "douyin" and team_id > 0:
+            from app.services.douyin_web_portal import status as web_portal_status
+
+            web_state = web_portal_status(team_id)
+            if web_state.get("connected"):
+                account_name = str(web_state.get("account_name") or "").strip()
+                result = {
+                    "connected": True,
+                    "source": "douyin_web_portal",
+                    "message": (
+                        f"抖音网站数据已连接：{account_name}"
+                        if account_name
+                        else "抖音网站数据已连接"
+                    ),
+                }
+            else:
+                result = await adapter.test_connection(team_id=team_id)
+        else:
+            result = await adapter.test_connection(team_id=team_id)
     except Exception as exc:
         return {"success": False, "error": f"测试失败: {exc}"}
     connected = bool(result.get("connected"))
@@ -621,9 +867,88 @@ async def update_channel_config(channel_type: str, body: ChannelConfigUpdate):
     except KeyError:
         raise HTTPException(status_code=404, detail={"message": f"未注册的渠道类型: {channel_type}"})
 
+    config_to_save = dict(body.config)
+    if channel_type == "douyin":
+        from app.services.douyin_channel import (
+            DouyinChannelError,
+            remote_bridge_enabled,
+            remote_save_app_config,
+        )
+
+        next_client_key = str(
+            config_to_save.get("client_key")
+            or config_to_save.get("app_id")
+            or ""
+        ).strip()
+        next_client_secret = str(
+            config_to_save.get("client_secret")
+            or config_to_save.get("app_secret")
+            or ""
+        ).strip()
+        next_miniapp_app_id = str(
+            config_to_save.get("miniapp_app_id")
+            or config_to_save.get("miniapp_appid")
+            or ""
+        ).strip()
+        next_miniapp_secret = str(
+            config_to_save.get("miniapp_secret")
+            or config_to_save.get("miniapp_app_secret")
+            or ""
+        ).strip()
+        if remote_bridge_enabled():
+            try:
+                remote_state = await remote_save_app_config(
+                    next_client_key=next_client_key,
+                    next_client_secret=next_client_secret,
+                    next_miniapp_app_id=next_miniapp_app_id,
+                    next_miniapp_secret=next_miniapp_secret,
+                )
+            except DouyinChannelError as exc:
+                raise HTTPException(status_code=400, detail={"message": str(exc)}) from exc
+            config_to_save = {
+                "app_id": str(remote_state.get("client_key") or next_client_key),
+                "app_secret": "",
+                "client_key": str(remote_state.get("client_key") or next_client_key),
+                "client_secret": "",
+                "miniapp_app_id": str(
+                    remote_state.get("miniapp_app_id") or next_miniapp_app_id
+                ),
+                "miniapp_secret": "",
+                "remote_credentials_configured": "true",
+                "remote_miniapp_configured": (
+                    "true" if remote_state.get("miniapp_secret_configured") else "false"
+                ),
+            }
+        else:
+            try:
+                from app.services.douyin_channel import save_app_config_verified
+
+                local_state = await save_app_config_verified(
+                    next_client_key=next_client_key,
+                    next_client_secret=next_client_secret,
+                    next_miniapp_app_id=next_miniapp_app_id,
+                    next_miniapp_secret=next_miniapp_secret,
+                )
+            except DouyinChannelError as exc:
+                raise HTTPException(status_code=400, detail={"message": str(exc)}) from exc
+            config_to_save = {
+                "app_id": str(local_state.get("client_key") or next_client_key),
+                "app_secret": "",
+                "client_key": str(local_state.get("client_key") or next_client_key),
+                "client_secret": "",
+                "miniapp_app_id": str(
+                    local_state.get("miniapp_app_id") or next_miniapp_app_id
+                ),
+                "miniapp_secret": "",
+                "remote_credentials_configured": "true",
+                "remote_miniapp_configured": (
+                    "true" if local_state.get("miniapp_secret_configured") else "false"
+                ),
+            }
+
     saved = save_config(
         channel_type,
-        body.config,
+        config_to_save,
         name=body.name,
         enabled=body.enabled,
         connected=False,
@@ -665,7 +990,7 @@ async def delete_channel(channel_type: str):
 
 
 @router.post("/channels/sync-inbox")
-async def sync_channel_inbox(body: ChannelSyncInboxBody):
+async def sync_channel_inbox(body: ChannelSyncInboxBody, request: Request = None):
     """消费渠道收件箱，落库为客户消息，并驱动客户/漏斗/待办闭环。"""
     from app.channels import ChannelRegistry
     from app.services.message_store import mark_inbox_consumed, save_message
@@ -677,18 +1002,29 @@ async def sync_channel_inbox(body: ChannelSyncInboxBody):
         channel_types = [c["channel_type"] for c in reg.list_channels()]
 
     saved_messages: list[dict[str, Any]] = []
-    consumed_ids: list[str] = []
+    local_consumed_ids: list[str] = []
+    remote_douyin_ids: list[str] = []
+    auto_reply_queued = 0
     seen_ids: set[str] = set()
     errors: list[dict[str, str]] = []
+    user = get_request_user(request) if request is not None else None
+    team_id = int((user or {}).get("team_id") or 0)
 
     for channel_type in channel_types:
+        remote_douyin = False
         try:
             adapter = reg.get(channel_type)
         except KeyError as exc:
             errors.append({"channel_type": channel_type, "error": str(exc)})
             continue
         try:
-            messages = await adapter.receive_messages(limit=body.limit)
+            if channel_type == "douyin":
+                from app.services.douyin_channel import remote_bridge_enabled
+
+                remote_douyin = remote_bridge_enabled()
+                messages = await adapter.receive_messages(limit=body.limit, team_id=team_id)
+            else:
+                messages = await adapter.receive_messages(limit=body.limit)
         except Exception as exc:
             logger.warning("同步渠道收件箱失败: channel=%s", channel_type, exc_info=True)
             errors.append({"channel_type": channel_type, "error": str(exc)})
@@ -697,139 +1033,1353 @@ async def sync_channel_inbox(body: ChannelSyncInboxBody):
             if msg.id in seen_ids:
                 continue
             seen_ids.add(msg.id)
-            saved = save_message(msg)
-            consumed_ids.append(msg.id)
+            try:
+                saved = save_message(msg)
+            except Exception as exc:
+                logger.warning(
+                    "渠道消息落库失败: channel=%s message_id=%s",
+                    channel_type,
+                    msg.id,
+                    exc_info=True,
+                )
+                errors.append(
+                    {
+                        "channel_type": channel_type,
+                        "error": f"消息 {msg.id} 落库失败: {exc}",
+                    }
+                )
+                continue
+            if remote_douyin:
+                remote_douyin_ids.append(msg.id)
+            else:
+                local_consumed_ids.append(msg.id)
             saved_messages.append(saved.model_dump())
+            try:
+                from app.services.auto_reply_runtime import enqueue_message
 
-    consumed = mark_inbox_consumed(consumed_ids)
+                if enqueue_message(saved):
+                    auto_reply_queued += 1
+            except Exception:
+                logger.warning(
+                    "入站消息已保存但自动回复任务入队失败: message_id=%s",
+                    msg.id,
+                    exc_info=True,
+                )
+
+    consumed = mark_inbox_consumed(local_consumed_ids)
+    if remote_douyin_ids:
+        try:
+            from app.services.douyin_channel import remote_ack_inbox
+
+            consumed += await remote_ack_inbox(team_id, remote_douyin_ids)
+        except Exception as exc:
+            logger.warning("确认远端抖音收件箱消费状态失败", exc_info=True)
+            errors.append(
+                {
+                    "channel_type": "douyin",
+                    "error": f"消息已落库，但远端消费确认失败，将在下次同步时重试: {exc}",
+                }
+            )
     return {
         "success": True,
         "data": {
             "synced": len(saved_messages),
             "consumed": consumed,
             "messages": saved_messages,
+            "auto_reply_queued": auto_reply_queued,
             "errors": errors,
         },
     }
 
 
 # ---------------------------------------------------------------------------
-# 企微 OAuth 端点
+# 抖音企业号 OAuth 与 Webhook
 # ---------------------------------------------------------------------------
 
-_oauth_states: dict[str, float] = {}  # state → 过期时间戳
+
+def _douyin_web_team_id(current_user: dict) -> int:
+    team_id = int(current_user.get("team_id") or 0)
+    if team_id <= 0:
+        raise HTTPException(status_code=400, detail={"message": "当前账号尚未加入团队"})
+    return team_id
 
 
-@router.post("/channels/wework/oauth/initiate")
-async def wework_oauth_initiate(request: Request):
-    """发起企微 OAuth 授权，返回扫码授权 URL。"""
-    import os
-    import secrets
-    import time
+@router.get("/channels/douyin/web-portal/status")
+async def douyin_web_portal_status(current_user: CurrentUser):
+    """抖音网站 Token 连接、同步与实时监控状态。"""
+    from app.services.douyin_web_portal import status
 
-    from app.channels.config_store import get_field
+    return {"success": True, "data": status(_douyin_web_team_id(current_user))}
 
-    corp_id = get_field("wework", "corp_id") or os.environ.get("WW_CORP_ID", "")
-    agent_id = get_field("wework", "agent_id") or os.environ.get("WW_AGENT_ID", "")
 
-    if not corp_id or not agent_id:
-        return {"success": False, "error": "请先配置 Corp ID 和 Agent ID"}
+@router.post("/channels/douyin/web-portal/connect")
+async def douyin_web_portal_connect(
+    body: DouyinWebPortalConnectBody,
+    current_user: CurrentUser,
+):
+    """保存用户主动提供的网站 token，并验证数据连接。"""
+    from app.services.douyin_web_portal import DouyinWebPortalError, connect
 
-    state = secrets.token_urlsafe(32)
-    _oauth_states[state] = time.time() + 300  # 5 分钟过期
+    team_id = _douyin_web_team_id(current_user)
+    try:
+        data = await connect(team_id, body.token_or_url)
+    except DouyinWebPortalError as exc:
+        raise HTTPException(status_code=400, detail={"message": str(exc)}) from exc
+    return {"success": True, "data": data}
 
-    redirect_uri = str(request.base_url).rstrip("/") + "/api/kellai/channels/wework/oauth/callback"
-    from urllib.parse import quote_plus
-    encoded_redirect = quote_plus(redirect_uri)
 
-    url = (
-        f"https://open.work.weixin.qq.com/wwopen/sso/qrConnect"
-        f"?appid={corp_id}&agentid={agent_id}"
-        f"&redirect_uri={encoded_redirect}&state={state}"
+@router.delete("/channels/douyin/web-portal")
+async def douyin_web_portal_disconnect(current_user: CurrentUser):
+    """删除本团队保存的第三方客服网页令牌与联系人缓存。"""
+    from app.services.douyin_web_portal import disconnect, stop_monitor
+
+    team_id = _douyin_web_team_id(current_user)
+    await stop_monitor(team_id)
+    return {"success": True, "data": {"disconnected": disconnect(team_id)}}
+
+
+@router.post("/channels/douyin/web-portal/sync")
+async def douyin_web_portal_sync(
+    body: DouyinWebPortalSyncBody,
+    current_user: CurrentUser,
+):
+    """同步第三方客服网页中的抖音账号、客户会话和历史消息。"""
+    from app.services.douyin_web_portal import DouyinWebPortalError, sync_messages
+
+    team_id = _douyin_web_team_id(current_user)
+    try:
+        data = await sync_messages(
+            team_id,
+            max_conversations=body.max_conversations,
+            history_limit=body.history_limit,
+        )
+    except DouyinWebPortalError as exc:
+        raise HTTPException(status_code=400, detail={"message": str(exc)}) from exc
+    return {"success": True, "data": data}
+
+
+@router.post("/channels/douyin/web-portal/monitor/start")
+async def douyin_web_portal_monitor_start(current_user: CurrentUser):
+    """连接第三方工作台 WebSocket，实时把新私信写入客来来。"""
+    from app.services.douyin_web_portal import DouyinWebPortalError, start_monitor
+
+    try:
+        data = await start_monitor(_douyin_web_team_id(current_user))
+    except DouyinWebPortalError as exc:
+        raise HTTPException(status_code=400, detail={"message": str(exc)}) from exc
+    return {"success": True, "data": data}
+
+
+@router.post("/channels/douyin/web-portal/monitor/stop")
+async def douyin_web_portal_monitor_stop(current_user: CurrentUser):
+    """停止第三方工作台实时私信连接。"""
+    from app.services.douyin_web_portal import stop_monitor
+
+    return {
+        "success": True,
+        "data": await stop_monitor(_douyin_web_team_id(current_user)),
+    }
+
+
+@router.get("/channels/douyin/web-portal/contacts")
+async def douyin_web_portal_contacts(
+    current_user: CurrentUser,
+    limit: int = 500,
+):
+    """返回已同步的网站联系人及列表中的最新消息。"""
+    from app.services.douyin_web_portal import list_contacts
+
+    return {
+        "success": True,
+        "data": list_contacts(
+            _douyin_web_team_id(current_user),
+            max(1, min(int(limit), 1000)),
+        ),
+    }
+
+
+@router.get("/channels/douyin/web-portal/stream")
+async def douyin_web_portal_stream(current_user: CurrentUser):
+    """以 NDJSON 流式返回第三方网页连接与消息同步状态。"""
+    from app.services.douyin_web_portal import stream_status
+
+    return StreamingResponse(
+        stream_status(_douyin_web_team_id(current_user)),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
-    return {"success": True, "data": {"url": url, "state": state, "expires_in": 300}}
+
+@router.get("/channels/douyin/readiness")
+async def douyin_readiness(current_user: CurrentUser):
+    """返回抖音开放平台应用、OAuth 回调与 Webhook 的配置状态。"""
+    from app.services.douyin_channel import (
+        DouyinChannelError,
+        readiness,
+        remote_bridge_enabled,
+        remote_readiness,
+    )
+
+    _ = current_user
+    try:
+        data = await remote_readiness() if remote_bridge_enabled() else readiness()
+    except DouyinChannelError as exc:
+        return {"success": False, "error": str(exc)}
+    return {"success": True, "data": data}
 
 
-@router.get("/channels/wework/oauth/callback")
-async def wework_oauth_callback(code: str = "", state: str = ""):
-    """企微 OAuth 回调：用 code 换取用户信息并保存。"""
-    import os
+@router.post("/channels/douyin/oauth/initiate")
+async def douyin_oauth_initiate(current_user: CurrentUser):
+    """为当前客来来团队生成抖音企业号扫码授权地址。"""
+    from app.services.douyin_channel import (
+        DouyinChannelError,
+        create_oauth_url,
+        remote_bridge_enabled,
+        remote_create_oauth_url,
+        validate_app_credentials,
+    )
+
+    try:
+        args = {
+            "team_id": int(current_user.get("team_id") or 0),
+            "user_id": int(current_user.get("id") or 0),
+        }
+        if remote_bridge_enabled():
+            data = await remote_create_oauth_url(**args)
+        else:
+            await validate_app_credentials()
+            data = create_oauth_url(**args)
+    except DouyinChannelError as exc:
+        return {"success": False, "error": str(exc)}
+    return {"success": True, "data": data}
+
+
+@router.get("/channels/douyin/oauth/callback")
+async def douyin_oauth_callback(
+    state: str = "",
+    code: str = "",
+    error: str = "",
+    error_description: str = "",
+):
+    """抖音企业号扫码确认后的公网 OAuth 回调。"""
+    import html
+
+    from fastapi.responses import HTMLResponse
+
+    # 测试应用白名单授权需要让指定抖音号完成
+    # user_info + trial.whitelist 授权。该流程不落盘短期 code，也不要求
+    # 桌面端提前创建普通 OAuth session，避免白名单扫码完成后被误报 state 失效。
+    if state.startswith("trial-whitelist-"):
+        if error or not code:
+            message = error_description or error or "用户取消授权"
+            return HTMLResponse(
+                "<html><body style='font-family:sans-serif;padding:32px'>"
+                f"<h3>测试白名单授权未完成：{html.escape(message)}</h3>"
+                "<p>请返回授权二维码页面后重新扫码。</p>"
+                "</body></html>",
+                status_code=400,
+            )
+        return HTMLResponse(
+            "<html><body style='font-family:sans-serif;padding:32px'>"
+            "<h3>测试白名单授权已完成</h3>"
+            "<p>当前抖音号已同意授予 user_info 与 trial.whitelist 权限。"
+            "请关闭此页面并返回抖音开放平台查看白名单状态。</p>"
+            "</body></html>"
+        )
+
+    from app.services.douyin_channel import (
+        DouyinChannelError,
+        complete_oauth,
+        fail_oauth,
+    )
+
+    if not state:
+        return HTMLResponse("<h3>抖音授权失败：缺少 state</h3>", status_code=400)
+    if error or not code:
+        message = error_description or error or "用户取消授权"
+        fail_oauth(state, message)
+        return HTMLResponse(
+            f"<h3>抖音授权未完成：{html.escape(message)}</h3>",
+            status_code=400,
+        )
+    try:
+        result = await complete_oauth(state=state, code=code)
+    except DouyinChannelError as exc:
+        logger.warning("抖音 OAuth 回调失败: %s", exc)
+        return HTMLResponse(
+            f"<h3>抖音授权失败：{html.escape(str(exc))}</h3>",
+            status_code=400,
+        )
+    account = html.escape(str(result.get("nickname") or result.get("open_id") or "企业号"))
+    return HTMLResponse(
+        "<html><body>"
+        f"<h3>抖音企业号 {account} 已成功绑定客来来</h3>"
+        "<p>可以关闭此页面并返回客来来，真实私信将通过 Webhook 自动进入客户列表。</p>"
+        "<script>setTimeout(() => window.close(), 1200);</script>"
+        "</body></html>"
+    )
+
+
+@router.get("/channels/douyin/oauth/status")
+async def douyin_oauth_status(state: str, current_user: CurrentUser):
+    """桌面端轮询当前团队的抖音企业号授权状态。"""
+    from app.services.douyin_channel import (
+        DouyinChannelError,
+        get_oauth_status,
+        remote_bridge_enabled,
+        remote_oauth_status,
+    )
+
+    try:
+        args = {"state": state, "team_id": int(current_user.get("team_id") or 0)}
+        data = (
+            await remote_oauth_status(**args)
+            if remote_bridge_enabled()
+            else get_oauth_status(**args)
+        )
+    except DouyinChannelError as exc:
+        return {"success": False, "error": str(exc)}
+    return {"success": True, "data": data}
+
+
+def _verify_douyin_bridge(request: Request) -> None:
+    from app.services.douyin_channel import DouyinChannelError, verify_bridge_key
+
+    try:
+        verify_bridge_key(request.headers.get("X-Kellai-Douyin-Bridge-Key", ""))
+    except DouyinChannelError as exc:
+        raise HTTPException(status_code=401, detail={"message": str(exc)}) from exc
+
+
+@router.get("/internal/douyin/readiness")
+async def internal_douyin_readiness(request: Request):
+    from app.services.douyin_channel import readiness
+
+    _verify_douyin_bridge(request)
+    return {"success": True, "data": readiness()}
+
+
+@router.put("/internal/douyin/config")
+async def internal_douyin_config(request: Request, body: DouyinBridgeConfigBody):
+    from app.services.douyin_channel import DouyinChannelError, save_app_config_verified
+
+    _verify_douyin_bridge(request)
+    try:
+        data = await save_app_config_verified(
+            next_client_key=body.client_key,
+            next_client_secret=body.client_secret,
+            next_miniapp_app_id=body.miniapp_app_id,
+            next_miniapp_secret=body.miniapp_secret,
+        )
+    except DouyinChannelError as exc:
+        return {"success": False, "error": str(exc)}
+    return {"success": True, "data": data}
+
+
+@router.post("/internal/douyin/oauth/initiate")
+async def internal_douyin_oauth_initiate(request: Request, team_id: int, user_id: int):
+    from app.services.douyin_channel import (
+        DouyinChannelError,
+        create_oauth_url,
+        validate_app_credentials,
+    )
+
+    _verify_douyin_bridge(request)
+    try:
+        await validate_app_credentials()
+        data = create_oauth_url(team_id=int(team_id), user_id=int(user_id))
+    except DouyinChannelError as exc:
+        return {"success": False, "error": str(exc)}
+    return {"success": True, "data": data}
+
+
+@router.get("/internal/douyin/oauth/status")
+async def internal_douyin_oauth_status(request: Request, state: str, team_id: int):
+    from app.services.douyin_channel import DouyinChannelError, get_oauth_status
+
+    _verify_douyin_bridge(request)
+    try:
+        data = get_oauth_status(state=state, team_id=int(team_id))
+    except DouyinChannelError as exc:
+        return {"success": False, "error": str(exc)}
+    return {"success": True, "data": data}
+
+
+@router.get("/internal/douyin/connection")
+async def internal_douyin_connection(request: Request, team_id: int):
+    from app.services.douyin_channel import DouyinChannelError, connection_status
+
+    _verify_douyin_bridge(request)
+    try:
+        data = await connection_status(int(team_id))
+    except DouyinChannelError as exc:
+        return {"success": False, "error": str(exc)}
+    return {"success": True, "data": data}
+
+
+@router.post("/internal/douyin/messages/send")
+async def internal_douyin_send(request: Request, body: DouyinBridgeSendBody):
+    from app.channels.douyin import DouyinAdapter
+
+    _verify_douyin_bridge(request)
+    result = await DouyinAdapter().send_message(
+        body.contact_id,
+        body.content,
+        team_id=body.team_id,
+        persona_id=body.persona_id,
+        customer_id=body.customer_id,
+        reply_context=body.reply_context,
+    )
+    if not result.get("success"):
+        return {"success": False, "error": result.get("error") or "抖音消息发送失败"}
+    return {"success": True, "data": result}
+
+
+@router.get("/internal/douyin/inbox")
+async def internal_douyin_inbox(request: Request, team_id: int, limit: int = 50):
+    from app.services.douyin_channel import pull_team_inbox
+
+    _verify_douyin_bridge(request)
+    rows = pull_team_inbox(int(team_id), limit=max(1, min(int(limit), 200)))
+    return {"success": True, "data": {"messages": rows, "total": len(rows)}}
+
+
+@router.post("/internal/douyin/inbox/ack")
+async def internal_douyin_inbox_ack(request: Request, body: DouyinBridgeInboxAckBody):
+    from app.services.douyin_channel import ack_team_inbox
+
+    _verify_douyin_bridge(request)
+    consumed = ack_team_inbox(body.team_id, body.message_ids)
+    return {"success": True, "data": {"consumed": consumed}}
+
+
+def _douyin_pick_str(*values: Any) -> str:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, (dict, list, tuple, set)):
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _douyin_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value.strip().startswith("{"):
+        import json
+
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _douyin_nested_message(content: dict[str, Any]) -> dict[str, Any]:
+    for key in ("message", "msg", "msg_content", "message_content", "body", "data", "content"):
+        nested = _douyin_dict(content.get(key))
+        if nested:
+            return nested
+    return {}
+
+
+def _douyin_user_info_items(content: dict[str, Any]) -> list[dict[str, Any]]:
+    values = []
+    for key in ("user_infos", "user_info", "users", "members"):
+        value = content.get(key)
+        if isinstance(value, list):
+            values.extend(item for item in value if isinstance(item, dict))
+        elif isinstance(value, dict):
+            values.append(value)
+    for key in ("customer", "sender", "from_user"):
+        value = content.get(key)
+        if isinstance(value, dict):
+            values.append(value)
+    return values
+
+
+def _douyin_user_identity(item: dict[str, Any]) -> str:
+    return _douyin_pick_str(
+        item.get("open_id"),
+        item.get("openid"),
+        item.get("c_open_id"),
+        item.get("from_open_id"),
+        item.get("user_open_id"),
+        item.get("id"),
+    )
+
+
+def _douyin_contact_name(content: dict[str, Any], contact_id: str) -> str:
+    for item in _douyin_user_info_items(content):
+        if _douyin_user_identity(item) == contact_id:
+            return _douyin_pick_str(
+                item.get("nick_name"),
+                item.get("nickname"),
+                item.get("name"),
+                item.get("display_name"),
+            )
+    return _douyin_pick_str(content.get("nick_name"), content.get("nickname"))
+
+
+def _douyin_group_name(content: dict[str, Any], group_id: str) -> str:
+    group_info = content.get("group_info")
+    if isinstance(group_info, dict):
+        for key in ("group_name", "name", "title"):
+            value = str(group_info.get(key) or "").strip()
+            if value:
+                return value
+    suffix = group_id[-8:] if group_id else ""
+    return f"抖音粉丝群{('·' + suffix) if suffix else ''}"
+
+
+def _douyin_payload_app_id(payload: dict[str, Any], content: dict[str, Any]) -> str:
+    return _douyin_pick_str(
+        payload.get("app_id"),
+        payload.get("appid"),
+        payload.get("client_key"),
+        content.get("app_id"),
+        content.get("appid"),
+        content.get("client_key"),
+    )
+
+
+def _douyin_event_actor_ids(payload: dict[str, Any], content: dict[str, Any]) -> tuple[str, str]:
+    nested = _douyin_nested_message(content)
+    from_user_id = _douyin_pick_str(
+        payload.get("from_user_id"),
+        payload.get("from_open_id"),
+        payload.get("sender_open_id"),
+        payload.get("sender"),
+        content.get("from_user_id"),
+        content.get("from_open_id"),
+        content.get("sender_open_id"),
+        content.get("sender"),
+        nested.get("from_user_id"),
+        nested.get("from_open_id"),
+        nested.get("sender_open_id"),
+        content.get("c_open_id"),
+        content.get("open_id"),
+        nested.get("c_open_id"),
+        nested.get("open_id"),
+    )
+    to_user_id = _douyin_pick_str(
+        payload.get("to_user_id"),
+        payload.get("to_open_id"),
+        payload.get("receiver_open_id"),
+        payload.get("receiver"),
+        content.get("to_user_id"),
+        content.get("to_open_id"),
+        content.get("receiver_open_id"),
+        content.get("receiver"),
+        content.get("owner_open_id"),
+        content.get("account_open_id"),
+        nested.get("to_user_id"),
+        nested.get("to_open_id"),
+        nested.get("receiver_open_id"),
+        nested.get("owner_open_id"),
+    )
+    return from_user_id, to_user_id
+
+
+def _douyin_participant_ids(payload: dict[str, Any], content: dict[str, Any]) -> list[str]:
+    nested = _douyin_nested_message(content)
+    candidates = [
+        payload.get("open_id"),
+        payload.get("openid"),
+        payload.get("c_open_id"),
+        payload.get("from_user_id"),
+        payload.get("to_user_id"),
+        content.get("open_id"),
+        content.get("openid"),
+        content.get("c_open_id"),
+        content.get("from_user_id"),
+        content.get("to_user_id"),
+        nested.get("open_id"),
+        nested.get("openid"),
+        nested.get("c_open_id"),
+        nested.get("from_user_id"),
+        nested.get("to_user_id"),
+    ]
+    candidates.extend(_douyin_user_identity(item) for item in _douyin_user_info_items(content))
+    cleaned = [_douyin_pick_str(value) for value in candidates]
+    return list(dict.fromkeys(value for value in cleaned if value))
+
+
+def _douyin_message_id(payload: dict[str, Any], content: dict[str, Any], request: Request) -> str:
+    nested = _douyin_nested_message(content)
+    return _douyin_pick_str(
+        content.get("server_message_id"),
+        content.get("message_id"),
+        content.get("msg_id"),
+        nested.get("server_message_id"),
+        nested.get("message_id"),
+        nested.get("msg_id"),
+        payload.get("server_message_id"),
+        payload.get("message_id"),
+        payload.get("msg_id"),
+        request.headers.get("Msg-Id"),
+    )
+
+
+def _douyin_message_text(event: str, content: dict[str, Any]) -> tuple[str, str]:
+    nested = _douyin_nested_message(content)
+    message_type = _douyin_pick_str(
+        content.get("message_type"),
+        content.get("msg_type"),
+        nested.get("message_type"),
+        nested.get("msg_type"),
+        "text",
+    )
+    text = _douyin_pick_str(
+        content.get("text"),
+        content.get("message_text"),
+        content.get("msg_text"),
+        nested.get("text"),
+        nested.get("message_text"),
+        nested.get("msg_text"),
+        nested.get("content"),
+        content.get("content"),
+    )
+    if message_type == "text":
+        return text, "text"
+    if message_type == "retain_consult_card":
+        rows = content.get("card_data")
+        values: list[str] = []
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                label = str(row.get("label") or "").strip()
+                value = str(row.get("value") or "").strip()
+                if label and value:
+                    values.append(f"{label}：{value}")
+        summary = "；".join(values)
+        return (
+            f"[抖音留资卡已提交]{' ' + summary if summary else ''}",
+            "lead",
+        )
+    if event in {"im_enter_direct_msg", "enter_im", "authorize_private_message", "im_authorize"}:
+        return "[客户进入抖音私信会话]", "event"
+    if event == "group_fans_event":
+        return "[客户加入抖音粉丝群]", "event"
+    if text:
+        return text, message_type
+    return f"[抖音{message_type}消息]", message_type
+
+
+@router.post("/webhook/douyin")
+async def douyin_webhook_receive(request: Request, background_tasks: BackgroundTasks):
+    """接收抖音开放平台事件，验签、去重并自动进入客来来消息闭环。"""
+    import json
+
+    from fastapi.responses import PlainTextResponse
+
+    from app.services.douyin_channel import (
+        client_key,
+        bridge_server_enabled,
+        default_team_for_miniapp_event,
+        find_authorization_for_event,
+        miniapp_app_id,
+        parse_event_content,
+        revoke_authorization,
+        verify_webhook_signature,
+    )
+    from app.services.message_store import push_inbox
+
+    raw_body = await request.body()
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail={"message": "抖音 Webhook JSON 无效"}) from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail={"message": "抖音 Webhook 数据格式无效"})
+
+    event = str(payload.get("event") or "")
+    content = parse_event_content(payload.get("content"))
+    if event == "verify_webhook":
+        challenge = content.get("challenge")
+        return PlainTextResponse(
+            json.dumps({"challenge": challenge}, ensure_ascii=False, separators=(",", ":")),
+            media_type="application/json",
+        )
+
+    signature = request.headers.get("X-Douyin-Signature", "")
+    if not verify_webhook_signature(raw_body, signature):
+        logger.warning("抖音 Webhook 验签失败")
+        raise HTTPException(status_code=401, detail={"message": "抖音 Webhook 验签失败"})
+
+    event_app_id = _douyin_payload_app_id(payload, content)
+    configured_client_key = client_key()
+    configured_miniapp_app_id = miniapp_app_id()
+    looks_like_miniapp_app_id = event_app_id.startswith("tt")
+    if (
+        event_app_id
+        and event_app_id != configured_client_key
+        and event_app_id != configured_miniapp_app_id
+        and (configured_miniapp_app_id or not looks_like_miniapp_app_id)
+    ):
+        raise HTTPException(status_code=401, detail={"message": "抖音 Webhook Client Key 不匹配"})
+
+    from_user_id, to_user_id = _douyin_event_actor_ids(payload, content)
+    participant_ids = _douyin_participant_ids(payload, content)
+    auth = find_authorization_for_event(from_user_id, to_user_id, *participant_ids)
+    team_id = int(auth["team_id"]) if auth else default_team_for_miniapp_event(event_app_id)
+
+    if event in {"unauthorize", "contract_unauthorize"}:
+        revoked = revoke_authorization(
+            team_id=int(auth["team_id"]) if auth else None,
+            open_id=from_user_id if auth is None else "",
+        )
+        if revoked:
+            from app.channels.config_store import save as save_channel_config
+
+            save_channel_config("douyin", {}, connected=False)
+        return {"success": True, "data": {"event": event, "revoked": revoked}}
+
+    supported_events = {
+        "receive_msg",
+        "im_receive_msg",
+        "im_send_msg",
+        "enter_im",
+        "im_enter_direct_msg",
+        "im_group_receive_msg",
+        "im_group_send_msg",
+        "group_fans_event",
+        "customer_service_message",
+        "customer_service_receive_msg",
+        "ma_others_im_message",
+        "authorize_private_message",
+        "im_authorize",
+    }
+    if event not in supported_events:
+        return {"success": True, "data": {"event": event, "ignored": True}}
+    if team_id is None:
+        logger.warning(
+            "抖音 Webhook 未匹配到已授权团队: event=%s app_id=%s from=%s to=%s",
+            event,
+            event_app_id,
+            from_user_id,
+            to_user_id,
+        )
+        return {"success": True, "data": {"event": event, "ignored": True, "reason": "unknown_account"}}
+
+    own_open_id = str(auth["open_id"]) if auth else _douyin_pick_str(to_user_id, event_app_id)
+    direction = "outbound" if from_user_id == own_open_id else "inbound"
+    is_group = event in {"im_group_receive_msg", "im_group_send_msg", "group_fans_event"}
+    conversation_id = _douyin_pick_str(
+        content.get("conversation_short_id")
+        or content.get("conversation_id")
+        or content.get("session_id")
+        or content.get("im_group_id")
+        or payload.get("conversation_id")
+    )
+    if is_group and conversation_id:
+        contact_id = f"group:{conversation_id}"
+        contact_name = _douyin_group_name(content, conversation_id)
+    else:
+        contact_id = to_user_id if direction == "outbound" else from_user_id
+        if not contact_id:
+            contact_id = _douyin_pick_str(
+                from_user_id,
+                to_user_id,
+                content.get("c_open_id"),
+                content.get("open_id"),
+                conversation_id,
+            )
+        if not contact_id:
+            contact_id = f"anonymous:{_douyin_message_id(payload, content, request) or event_app_id or event}"
+        contact_name = _douyin_contact_name(content, contact_id)
+    source = str(content.get("source") or "")
+    if direction == "outbound" and source in {client_key(), miniapp_app_id()}:
+        # API 发出的消息已经由 /messages/send 落库，跳过平台确认事件避免重复。
+        return {"success": True, "data": {"event": event, "ignored": True, "reason": "api_echo"}}
+
+    message_text, content_type = _douyin_message_text(event, content)
+    server_message_id = _douyin_message_id(payload, content, request)
+    dedupe_id = f"douyin:{server_message_id}" if server_message_id else None
+    metadata = {
+        "source": "douyin_webhook",
+        "event": event,
+        "team_id": int(team_id),
+        "owner_open_id": own_open_id,
+        "miniapp_app_id": event_app_id,
+        "conversation_id": conversation_id,
+        "is_group": is_group,
+        "sender_open_id": from_user_id,
+        "sender_name": _douyin_contact_name(content, from_user_id),
+        "server_message_id": server_message_id,
+        "message_index": str(content.get("index") or ""),
+        "event_content": content,
+    }
+    inbox_id = push_inbox(
+        "douyin",
+        contact_id=contact_id,
+        contact_name=contact_name,
+        direction=direction,
+        content=message_text,
+        content_type=content_type,
+        metadata=metadata,
+        msg_id=dedupe_id,
+    )
+    if not bridge_server_enabled():
+        background_tasks.add_task(
+            sync_channel_inbox,
+            ChannelSyncInboxBody(channel_type="douyin", limit=50),
+        )
+    return {
+        "success": True,
+        "data": {
+            "event": event,
+            "message_id": inbox_id,
+            "direction": direction,
+            "queued": True,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# 微信开放平台 OAuth 端点
+# ---------------------------------------------------------------------------
+
+_wechat_oauth_states: dict[str, float] = {}
+_wechat_oauth_results: dict[str, dict[str, Any]] = {}
+_wechat_oauth_sessions: dict[str, dict[str, Any]] = {}
+
+
+def _wechat_cfg(field: str) -> str:
+    from app.channels.config_store import get_field
+
+    return get_field("wechat", field) or os.environ.get(f"KELLAI_WECHAT_{field.upper()}", "").strip()
+
+
+def _wechat_app_id() -> str:
+    return _wechat_cfg("app_id") or _wechat_cfg("appid")
+
+
+def _wechat_app_secret() -> str:
+    return _wechat_cfg("app_secret") or _wechat_cfg("secret") or _wechat_cfg("appsecret")
+
+
+def _build_wechat_oauth_url(request: Request, state: str) -> str:
+    from urllib.parse import quote_plus
+
+    redirect_uri = str(request.base_url).rstrip("/") + "/api/kellai/channels/wechat/oauth/callback"
+    return (
+        "https://open.weixin.qq.com/connect/qrconnect"
+        f"?appid={_wechat_app_id()}"
+        f"&redirect_uri={quote_plus(redirect_uri)}"
+        "&response_type=code"
+        "&scope=snsapi_login"
+        f"&state={state}"
+        "#wechat_redirect"
+    )
+
+
+def _extract_wechat_qr_payload(html_text: str) -> dict[str, str]:
+    """Extract QR uuid/image/poll endpoint from the WeChat qrconnect page."""
+    import re
+    from urllib.parse import urljoin
+
+    text = html_text or ""
+    qr_match = re.search(r"""src=["'](?P<src>[^"']*?/connect/qrcode/(?P<uuid>[^"'/<>\s?&#]+)[^"']*)["']""", text)
+    if not qr_match:
+        qr_match = re.search(r"""(?P<src>/connect/qrcode/(?P<uuid>[A-Za-z0-9_-]+))""", text)
+    uuid = ""
+    qr_image_url = ""
+    if qr_match:
+        src = qr_match.group("src")
+        uuid = qr_match.group("uuid")
+        qr_image_url = urljoin("https://open.weixin.qq.com", src)
+    if not uuid:
+        uuid_match = re.search(r"""uuid[=:]["']?(?P<uuid>[A-Za-z0-9_-]{8,})""", text)
+        if uuid_match:
+            uuid = uuid_match.group("uuid")
+            qr_image_url = f"https://open.weixin.qq.com/connect/qrcode/{uuid}"
+
+    poll_base = "https://lp.open.weixin.qq.com/connect/l/qrconnect"
+    poll_match = re.search(r"""https://(?:lp|long)\.open\.weixin\.qq\.com/connect/l/qrconnect""", text)
+    if poll_match:
+        poll_base = poll_match.group(0)
+
+    return {
+        "uuid": uuid,
+        "qr_image_url": qr_image_url,
+        "poll_base": poll_base,
+    }
+
+
+async def _scrape_wechat_qr(oauth_url: str) -> dict[str, str]:
+    import httpx
+
+    async with httpx.AsyncClient(
+        timeout=10.0,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+    ) as client:
+        resp = await client.get(oauth_url)
+    payload = _extract_wechat_qr_payload(resp.text)
+    if not payload.get("uuid"):
+        raise RuntimeError("未能从微信授权页解析二维码 uuid")
+    return payload
+
+
+async def _complete_wechat_oauth_code(code: str, state: str) -> dict[str, Any]:
+    import httpx
+
+    from app.channels.config_store import save
+
+    app_id = _wechat_app_id()
+    app_secret = _wechat_app_secret()
+    if not app_id or not app_secret:
+        raise RuntimeError("缺少 AppID/AppSecret")
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(
+            "https://api.weixin.qq.com/sns/oauth2/access_token",
+            params={
+                "appid": app_id,
+                "secret": app_secret,
+                "code": code,
+                "grant_type": "authorization_code",
+            },
+        )
+    try:
+        token_data = resp.json()
+    except Exception:
+        token_data = {"raw": resp.text}
+    if int(token_data.get("errcode", 0) or 0) != 0:
+        raise RuntimeError(f"errcode={token_data.get('errcode')} errmsg={token_data.get('errmsg')}")
+
+    openid = str(token_data.get("openid", ""))
+    unionid = str(token_data.get("unionid", ""))
+    refresh_token = str(token_data.get("refresh_token", ""))
+    scope = str(token_data.get("scope", ""))
+    if not openid:
+        raise RuntimeError("微信返回空 openid")
+
+    save(
+        "wechat",
+        {
+            "oauth_authorized": "true",
+            "oauth_openid": openid,
+            "oauth_unionid": unionid,
+            "oauth_scope": scope,
+            "oauth_refresh_token": refresh_token,
+        },
+        enabled=True,
+        connected=True,
+    )
+    result = {
+        "authorized": True,
+        "openid": openid,
+        "unionid": unionid,
+        "scope": scope,
+    }
+    _wechat_oauth_results[state] = result
+    _wechat_oauth_states.pop(state, None)
+    _wechat_oauth_sessions.pop(state, None)
+    return result
+
+
+async def _poll_wechat_qr_status(state: str, session: dict[str, Any]) -> dict[str, Any]:
+    import re
+    import time
+
+    import httpx
+
+    uuid = str(session.get("uuid") or "")
+    if not uuid:
+        return {"authorized": False, "expired": False}
+    params: dict[str, Any] = {"uuid": uuid, "_": int(time.time() * 1000)}
+    last = str(session.get("last_errcode") or "")
+    if last:
+        params["last"] = last
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(str(session.get("poll_base") or "https://lp.open.weixin.qq.com/connect/l/qrconnect"), params=params)
+    except Exception as exc:
+        return {"authorized": False, "expired": False, "poll_error": str(exc)}
+
+    text = resp.text or ""
+    err_match = re.search(r"window\.wx_errcode=(\d+)", text)
+    code_match = re.search(r"window\.wx_code='([^']*)'", text)
+    errcode = err_match.group(1) if err_match else ""
+    wx_code = code_match.group(1) if code_match else ""
+    if errcode:
+        session["last_errcode"] = errcode
+    if errcode == "405" and wx_code:
+        return await _complete_wechat_oauth_code(wx_code, state)
+    if errcode == "404":
+        return {"authorized": False, "scanned": True, "expired": False}
+    if errcode == "403":
+        return {"authorized": False, "scanned": False, "canceled": True, "expired": False}
+    if errcode in {"402", "500"}:
+        _wechat_oauth_states.pop(state, None)
+        _wechat_oauth_sessions.pop(state, None)
+        return {"authorized": False, "expired": True}
+    return {"authorized": False, "expired": False}
+
+
+@router.post("/channels/wechat/oauth/initiate")
+async def wechat_oauth_initiate(request: Request):
+    """发起微信开放平台网站应用 OAuth，返回扫码授权 URL。"""
+    import time
+
+    app_id = _wechat_app_id()
+    if not app_id:
+        return {"success": False, "error": "请先配置微信开放平台 AppID"}
+
+    state = secrets.token_urlsafe(32)
+    _wechat_oauth_states[state] = time.time() + 600
+    _wechat_oauth_results.pop(state, None)
+    _wechat_oauth_sessions.pop(state, None)
+
+    url = _build_wechat_oauth_url(request, state)
+    data: dict[str, Any] = {"url": url, "state": state, "expires_in": 600}
+    try:
+        qr = await _scrape_wechat_qr(url)
+        uuid = qr["uuid"]
+        _wechat_oauth_sessions[state] = {
+            "uuid": uuid,
+            "poll_base": qr.get("poll_base") or "https://lp.open.weixin.qq.com/connect/l/qrconnect",
+        }
+        data.update({
+            "uuid": uuid,
+            "qr_image_url": qr.get("qr_image_url") or f"https://open.weixin.qq.com/connect/qrcode/{uuid}",
+            "qr_proxy_url": f"{str(request.base_url).rstrip('/')}/api/kellai/channels/wechat/oauth/qrcode?uuid={uuid}",
+            "poll_supported": True,
+        })
+    except Exception as exc:
+        data["scrape_error"] = str(exc)
+        data["poll_supported"] = False
+    return {"success": True, "data": data}
+
+
+@router.get("/channels/wechat/oauth/qrcode")
+async def wechat_oauth_qrcode(uuid: str = ""):
+    """Proxy the WeChat QR image so the desktop app can render it without iframe embedding."""
+    import re
+
+    import httpx
+
+    clean_uuid = str(uuid or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{6,80}", clean_uuid):
+        raise HTTPException(status_code=400, detail={"message": "无效的二维码 uuid"})
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(f"https://open.weixin.qq.com/connect/qrcode/{clean_uuid}")
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail={"message": f"微信二维码拉取失败: HTTP {resp.status_code}"})
+    content_type = resp.headers.get("content-type") or "image/jpeg"
+    return Response(content=resp.content, media_type=content_type)
+
+
+@router.get("/channels/wechat/oauth/callback")
+async def wechat_oauth_callback(code: str = "", state: str = ""):
+    """微信开放平台 OAuth 回调：用 code 换取 openid/unionid 并保存。"""
+    import html
     import time
 
     from fastapi.responses import HTMLResponse
 
-    from app.channels.config_store import get_field, save
+    if not state or state not in _wechat_oauth_states:
+        if state in _wechat_oauth_results and _wechat_oauth_results[state].get("authorized"):
+            return HTMLResponse(
+                "<html><body>"
+                "<h3>微信授权成功，请返回客来来应用</h3>"
+                "<script>window.close();</script>"
+                "</body></html>"
+            )
+        _wechat_oauth_results[state] = {"authorized": False, "expired": True, "error": "无效的 state 参数"}
+        return HTMLResponse("<html><body><h3>授权失败：无效的 state 参数</h3></body></html>", status_code=400)
 
-    # 验证 state
-    if not state or state not in _oauth_states:
-        return HTMLResponse(
-            "<html><body><h3>授权失败：无效的 state 参数</h3></body></html>",
-            status_code=400,
-        )
-
-    expire_at = _oauth_states.pop(state)
+    expire_at = _wechat_oauth_states.pop(state)
     if time.time() > expire_at:
-        return HTMLResponse(
-            "<html><body><h3>授权失败：state 已过期，请重新发起授权</h3></body></html>",
-            status_code=400,
-        )
+        _wechat_oauth_results[state] = {"authorized": False, "expired": True, "error": "state 已过期"}
+        return HTMLResponse("<html><body><h3>授权失败：state 已过期，请重新发起授权</h3></body></html>", status_code=400)
 
     if not code:
-        return HTMLResponse(
-            "<html><body><h3>授权失败：未收到授权码</h3></body></html>",
-            status_code=400,
-        )
+        _wechat_oauth_results[state] = {"authorized": False, "error": "未收到授权码"}
+        return HTMLResponse("<html><body><h3>授权失败：未收到授权码</h3></body></html>", status_code=400)
 
-    # 用 code 换取 access_token / 用户信息
-    corp_id = get_field("wework", "corp_id") or os.environ.get("WW_CORP_ID", "")
-    corp_secret = (
-        get_field("wework", "secret")
-        or get_field("wework", "corp_secret")
-        or os.environ.get("WW_CORP_SECRET", "")
-    )
-
-    import httpx
-
-    user_info: dict = {}
     try:
-        # 1) 获取 access_token
-        token_url = (
-            f"https://qyapi.weixin.qq.com/cgi-bin/gettoken"
-            f"?corpid={corp_id}&corpsecret={corp_secret}"
-        )
-        async with httpx.AsyncClient(timeout=10) as client:
-            token_resp = await client.get(token_url)
-            token_data = token_resp.json()
-
-        access_token = token_data.get("access_token", "")
-        if not access_token:
-            logger.warning("企微 OAuth 获取 access_token 失败: %s", token_data)
-        else:
-            # 2) 用 code 换取用户身份
-            user_url = (
-                f"https://qyapi.weixin.qq.com/cgi-bin/auth/getuserinfo"
-                f"?access_token={access_token}&code={code}"
-            )
-            async with httpx.AsyncClient(timeout=10) as client:
-                user_resp = await client.get(user_url)
-                user_info = user_resp.json()
+        await _complete_wechat_oauth_code(code, state)
     except Exception as exc:
-        logger.warning("企微 OAuth 回调请求失败: %s", exc)
-
-    # 保存授权信息到 config_store
-    save("wework", {
-        "oauth_authorized": "true",
-        "oauth_user_id": user_info.get("userid", user_info.get("UserId", "")),
-        "oauth_user_ticket": user_info.get("user_ticket", ""),
-    })
-
+        error = str(exc)
+        _wechat_oauth_results[state] = {"authorized": False, "error": error}
+        logger.warning("微信 OAuth 回调失败: %s", exc)
+        return HTMLResponse(f"<html><body><h3>授权失败：{html.escape(error)}</h3></body></html>", status_code=400)
     return HTMLResponse(
         "<html><body>"
-        "<h3>授权成功，请返回客来来应用</h3>"
+        "<h3>微信授权成功，请返回客来来应用</h3>"
         "<script>window.close();</script>"
         "</body></html>"
     )
+
+
+@router.get("/channels/wechat/oauth/status")
+async def wechat_oauth_status(state: str = ""):
+    """查询微信开放平台 OAuth 授权状态（前端轮询）。"""
+    import time
+
+    if not state:
+        return {"success": True, "data": {"authorized": False, "expired": True}}
+    if state in _wechat_oauth_results:
+        return {"success": True, "data": _wechat_oauth_results[state]}
+    expire_at = _wechat_oauth_states.get(state)
+    if not expire_at:
+        return {"success": True, "data": {"authorized": False, "expired": True}}
+    if time.time() > expire_at:
+        _wechat_oauth_states.pop(state, None)
+        _wechat_oauth_sessions.pop(state, None)
+        return {"success": True, "data": {"authorized": False, "expired": True}}
+    session = _wechat_oauth_sessions.get(state)
+    if session:
+        return {"success": True, "data": await _poll_wechat_qr_status(state, session)}
+    return {"success": True, "data": {"authorized": False, "expired": False}}
+
+
+# ---------------------------------------------------------------------------
+# 企微 OAuth 端点
+# ---------------------------------------------------------------------------
+
+_wework_oauth_states: dict[str, float] = {}
+_wework_oauth_results: dict[str, dict[str, Any]] = {}
+_wework_oauth_return_urls: dict[str, str] = {}
+_WEWORK_LOGIN_SCRIPT_URL = "https://wwcdn.weixin.qq.com/node/wework/wwopen/js/wwLogin-1.2.7.js"
+
+
+def _wework_cfg(field: str) -> str:
+    from app.channels.config_store import get_field
+
+    return (
+        get_field("wework", field)
+        or os.environ.get(f"KELLAI_WECOM_{field.upper()}", "")
+        or os.environ.get(f"KELLAI_WEWORK_{field.upper()}", "")
+        or ""
+    ).strip()
+
+
+def _wework_corp_id() -> str:
+    return _wework_cfg("corp_id") or _wework_cfg("corpid") or os.environ.get("WW_CORP_ID", "").strip()
+
+
+def _wework_agent_id() -> str:
+    return _wework_cfg("agent_id") or _wework_cfg("agentid") or os.environ.get("WW_AGENT_ID", "").strip()
+
+
+def _wework_corp_secret() -> str:
+    return (
+        _wework_cfg("secret")
+        or _wework_cfg("corp_secret")
+        or _wework_cfg("corpsecret")
+        or os.environ.get("WW_CORP_SECRET", "").strip()
+    )
+
+
+def _wework_customer_service_url() -> str:
+    from urllib.parse import urlparse
+
+    raw = (_wework_cfg("kf_url") or "").strip()
+    open_kfid = (_wework_cfg("open_kfid") or "").strip()
+    if raw:
+        parsed = urlparse(raw)
+        if parsed.scheme == "https" and parsed.netloc == "work.weixin.qq.com" and parsed.path.startswith("/kfid/"):
+            return raw
+    if open_kfid.startswith("kfc"):
+        return f"https://work.weixin.qq.com/kfid/{open_kfid}"
+    return ""
+
+
+def _wework_redirect_uri(request: Request) -> str:
+    return str(request.base_url).rstrip("/") + "/api/kellai/channels/wework/oauth/callback"
+
+
+def _build_wework_oauth_url(request: Request, state: str) -> str:
+    from urllib.parse import quote_plus
+
+    encoded_redirect = quote_plus(_wework_redirect_uri(request))
+    return (
+        "https://open.work.weixin.qq.com/wwopen/sso/qrConnect"
+        f"?appid={_wework_corp_id()}&agentid={_wework_agent_id()}"
+        f"&redirect_uri={encoded_redirect}&state={state}"
+    )
+
+
+def _build_wework_login_payload(request: Request, state: str) -> dict[str, Any]:
+    from urllib.parse import quote_plus
+
+    return {
+        "script_url": _WEWORK_LOGIN_SCRIPT_URL,
+        "ww_login": {
+            "appid": _wework_corp_id(),
+            "agentid": _wework_agent_id(),
+            "redirect_uri": quote_plus(_wework_redirect_uri(request)),
+            "state": state,
+            "href": "",
+            "lang": "zh_CN",
+            "business_type": "sso",
+        },
+    }
+
+
+async def _complete_wework_oauth_code(code: str, state: str) -> dict[str, Any]:
+    import httpx
+
+    from app.channels.config_store import save
+
+    corp_id = _wework_corp_id()
+    corp_secret = _wework_corp_secret()
+    if not corp_id or not corp_secret:
+        raise RuntimeError("缺少 Corp ID/Secret")
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        token_resp = await client.get(
+            "https://qyapi.weixin.qq.com/cgi-bin/gettoken",
+            params={"corpid": corp_id, "corpsecret": corp_secret},
+        )
+        token_data = token_resp.json()
+        if int(token_data.get("errcode", 0) or 0) != 0:
+            raise RuntimeError(f"gettoken errcode={token_data.get('errcode')} errmsg={token_data.get('errmsg')}")
+        access_token = str(token_data.get("access_token", ""))
+        if not access_token:
+            raise RuntimeError("企微 gettoken 返回空 access_token")
+
+        user_resp = await client.get(
+            "https://qyapi.weixin.qq.com/cgi-bin/auth/getuserinfo",
+            params={"access_token": access_token, "code": code},
+        )
+        user_info = user_resp.json()
+    if int(user_info.get("errcode", 0) or 0) != 0:
+        raise RuntimeError(f"getuserinfo errcode={user_info.get('errcode')} errmsg={user_info.get('errmsg')}")
+
+    user_id = str(user_info.get("userid") or user_info.get("UserId") or "")
+    open_id = str(user_info.get("openid") or user_info.get("OpenId") or "")
+    user_ticket = str(user_info.get("user_ticket") or "")
+    identity = user_id or open_id
+    if not identity:
+        raise RuntimeError("企微未返回 userid/openid")
+
+    save(
+        "wework",
+        {
+            "oauth_authorized": "true",
+            "oauth_user_id": user_id,
+            "oauth_open_id": open_id,
+            "oauth_user_ticket": user_ticket,
+        },
+        enabled=True,
+        connected=True,
+    )
+    result = {
+        "authorized": True,
+        "user_id": user_id,
+        "open_id": open_id,
+    }
+    _wework_oauth_results[state] = result
+    _wework_oauth_states.pop(state, None)
+    return result
+
+
+def _wework_frontend_return_url(state: str) -> str:
+    return _wework_oauth_return_urls.pop(state, "")
+
+
+def _remember_wework_frontend_return_url(request: Request, state: str) -> None:
+    from urllib.parse import urlparse
+
+    raw = (request.headers.get("origin") or "").strip()
+    if not raw:
+        referer = (request.headers.get("referer") or "").strip()
+        if referer:
+            parsed = urlparse(referer)
+            if parsed.scheme and parsed.netloc:
+                raw = f"{parsed.scheme}://{parsed.netloc}"
+    if raw.startswith(("http://127.0.0.1", "http://localhost", "https://")):
+        _wework_oauth_return_urls[state] = raw.rstrip("/") + "/settings?tab=channels"
+
+
+def _wework_callback_html(title: str, status_code: int = 200, return_url: str = ""):
+    import html
+    import json
+
+    from fastapi.responses import HTMLResponse
+
+    escaped_title = html.escape(title)
+    target = json.dumps(return_url)
+    script = (
+        "<script>"
+        "const target = " + target + ";"
+        "if (window.opener && !window.opener.closed) { window.close(); }"
+        "else if (target) { setTimeout(() => window.location.replace(target), 600); }"
+        "</script>"
+    )
+    return HTMLResponse(f"<html><body><h3>{escaped_title}</h3>{script}</body></html>", status_code=status_code)
+
+
+@router.post("/channels/wework/oauth/initiate")
+async def wework_oauth_initiate(request: Request):
+    """发起企微 OAuth 授权，返回官方内嵌扫码组件参数。"""
+    import time
+
+    corp_id = _wework_corp_id()
+    agent_id = _wework_agent_id()
+    corp_secret = _wework_corp_secret()
+
+    if not corp_id or not agent_id or not corp_secret:
+        return {"success": False, "error": "请先配置企业微信 Corp ID、Agent ID 和 Secret"}
+
+    state = secrets.token_urlsafe(32)
+    _wework_oauth_states[state] = time.time() + 300
+    _wework_oauth_results.pop(state, None)
+    _remember_wework_frontend_return_url(request, state)
+
+    data = {
+        "url": _build_wework_oauth_url(request, state),
+        "state": state,
+        "expires_in": 300,
+        "embed_type": "ww_login",
+        **_build_wework_login_payload(request, state),
+    }
+    return {"success": True, "data": data}
+
+
+@router.get("/channels/wework/oauth/callback")
+async def wework_oauth_callback(request: Request, code: str = "", state: str = ""):
+    """企微 OAuth 回调：用 code 换取用户信息并保存。"""
+    import time
+
+    if not state or state not in _wework_oauth_states:
+        if state in _wework_oauth_results and _wework_oauth_results[state].get("authorized"):
+            return _wework_callback_html("企业微信授权成功，请返回客来来应用", return_url=_wework_frontend_return_url(state))
+        return _wework_callback_html("授权失败：无效的 state 参数", status_code=400)
+
+    expire_at = _wework_oauth_states.pop(state)
+    if time.time() > expire_at:
+        _wework_oauth_results[state] = {"authorized": False, "expired": True, "error": "state 已过期"}
+        return _wework_callback_html("授权失败：state 已过期，请重新发起授权", status_code=400, return_url=_wework_frontend_return_url(state))
+
+    if not code:
+        _wework_oauth_results[state] = {"authorized": False, "error": "未收到授权码"}
+        return _wework_callback_html("授权失败：未收到授权码", status_code=400, return_url=_wework_frontend_return_url(state))
+
+    try:
+        await _complete_wework_oauth_code(code, state)
+    except Exception as exc:
+        error = str(exc)
+        _wework_oauth_results[state] = {"authorized": False, "error": error}
+        logger.warning("企微 OAuth 回调失败: %s", exc)
+        return _wework_callback_html(f"授权失败：{error}", status_code=400, return_url=_wework_frontend_return_url(state))
+
+    return _wework_callback_html("企业微信授权成功，请返回客来来应用", return_url=_wework_frontend_return_url(state))
 
 
 @router.get("/channels/wework/oauth/status")
@@ -840,15 +2390,400 @@ async def wework_oauth_status(state: str = ""):
     if not state:
         return {"success": True, "data": {"authorized": False, "expired": True}}
 
-    if state not in _oauth_states:
-        # state 已被 callback 消费，说明授权成功
-        return {"success": True, "data": {"authorized": True}}
+    if state in _wework_oauth_results:
+        return {"success": True, "data": _wework_oauth_results[state]}
 
-    expire_at = _oauth_states[state]
+    expire_at = _wework_oauth_states.get(state)
+    if not expire_at:
+        return {"success": True, "data": {"authorized": False, "expired": True}}
     if time.time() > expire_at:
+        _wework_oauth_states.pop(state, None)
+        _wework_oauth_results[state] = {"authorized": False, "expired": True}
         return {"success": True, "data": {"authorized": False, "expired": True}}
 
     return {"success": True, "data": {"authorized": False}}
+
+
+@router.api_route("/webhook/wework/suite", methods=["GET", "POST"])
+async def wework_suite_callback(
+    request: Request,
+    msg_signature: str = "",
+    timestamp: str = "",
+    nonce: str = "",
+    echostr: str = "",
+):
+    """企业微信服务商指令回调：URL 校验、suite_ticket、授权变更/取消。"""
+    from fastapi.responses import PlainTextResponse
+
+    from app.services.wework_suite import (
+        WeWorkSuiteError,
+        decrypt_callback,
+        handle_suite_event,
+        parse_encrypted_xml,
+        parse_plain_event,
+        suite_config,
+        verify_signature,
+    )
+
+    try:
+        if request.method == "GET":
+            verify_signature(msg_signature, timestamp, nonce, echostr)
+            # 企业微信在后台校验指令回调 URL 时，AES 包尾部的 ReceiveId
+            # 可能是服务商企业 CorpID，而不是第三方应用 SuiteID。签名和 AES
+            # 已能证明请求来自持有同一 Token/EncodingAESKey 的平台；GET 校验只需
+            # 原样返回解密后的 echostr，不能据此拒绝合法的服务商校验请求。
+            return PlainTextResponse(decrypt_callback(echostr, validate_suite_id=False))
+
+        raw_body = await request.body()
+        encrypted = parse_encrypted_xml(raw_body)
+        verify_signature(msg_signature, timestamp, nonce, encrypted)
+        event = parse_plain_event(decrypt_callback(encrypted, validate_suite_id=False))
+        configured_suite_id = suite_config()["suite_id"]
+        if configured_suite_id and event.get("SuiteId") != configured_suite_id:
+            raise WeWorkSuiteError("企业微信回调 SuiteID 不匹配")
+        result = await handle_suite_event(event)
+        logger.info("企业微信服务商指令回调完成: info_type=%s", result.get("info_type"))
+        return PlainTextResponse("success")
+    except WeWorkSuiteError as exc:
+        logger.warning("企业微信服务商指令回调失败: %s", exc)
+        return PlainTextResponse(str(exc), status_code=400)
+
+
+class WeWorkAcquisitionLinkCreate(BaseModel):
+    link_name: str = Field(min_length=1, max_length=30)
+    userids: list[str] = Field(min_length=1, max_length=500)
+    skip_verify: bool = True
+
+
+@router.get("/channels/wework/suite/readiness")
+async def wework_suite_readiness(current_user: CurrentUser):
+    """返回服务商配置是否具备生成企业安装二维码的条件。"""
+    from app.services.wework_suite import (
+        WeWorkSuiteError,
+        remote_bridge_enabled,
+        remote_suite_readiness,
+        suite_readiness,
+    )
+
+    _ = current_user
+    try:
+        data = await remote_suite_readiness() if remote_bridge_enabled() else suite_readiness()
+    except WeWorkSuiteError as exc:
+        return {"success": False, "error": str(exc)}
+    return {"success": True, "data": data}
+
+
+@router.post("/channels/wework/install")
+async def wework_install(current_user: CurrentUser):
+    """为当前客来来团队生成第三方应用安装 URL，作为企业微信主绑定入口。"""
+    from app.services.wework_suite import (
+        WeWorkSuiteError,
+        create_install_url,
+        remote_bridge_enabled,
+        remote_create_install_url,
+    )
+
+    try:
+        args = {
+            "team_id": int(current_user.get("team_id") or 0),
+            "user_id": int(current_user.get("id") or 0),
+        }
+        data = (
+            await remote_create_install_url(**args)
+            if remote_bridge_enabled()
+            else await create_install_url(**args)
+        )
+    except WeWorkSuiteError as exc:
+        return {"success": False, "error": str(exc)}
+    return {"success": True, "data": data}
+
+
+@router.get("/channels/wework/install/callback")
+async def wework_install_callback(state: str = "", auth_code: str = ""):
+    """企业管理员确认安装后的公网回调。"""
+    import html
+
+    from fastapi.responses import HTMLResponse
+
+    from app.services.wework_suite import WeWorkSuiteError, complete_install
+
+    if not state or not auth_code:
+        return HTMLResponse("<h3>企业微信授权失败：缺少 state/auth_code</h3>", status_code=400)
+    try:
+        result = await complete_install(state=state, auth_code=auth_code)
+    except WeWorkSuiteError as exc:
+        logger.warning("企业微信第三方应用安装回调失败: %s", exc)
+        return HTMLResponse(f"<h3>企业微信授权失败：{html.escape(str(exc))}</h3>", status_code=400)
+    corp_name = html.escape(str(result.get("corp_name") or result.get("auth_corpid") or "企业"))
+    return HTMLResponse(
+        "<html><body>"
+        f"<h3>{corp_name} 已成功绑定客来来</h3>"
+        "<p>可以关闭此页面并返回客来来，客户列表将自动同步。</p>"
+        "<script>setTimeout(() => window.close(), 1200);</script>"
+        "</body></html>"
+    )
+
+
+@router.get("/channels/wework/install/status")
+async def wework_install_status(state: str, current_user: CurrentUser):
+    """桌面端轮询当前团队的第三方应用安装状态。"""
+    from app.services.wework_suite import (
+        WeWorkSuiteError,
+        get_install_status,
+        remote_bridge_enabled,
+        remote_get_install_status,
+    )
+
+    team_id = int(current_user.get("team_id") or 0)
+    try:
+        data = (
+            await remote_get_install_status(state=state, team_id=team_id)
+            if remote_bridge_enabled()
+            else get_install_status(state=state, team_id=team_id)
+        )
+    except WeWorkSuiteError as exc:
+        return {"success": False, "error": str(exc)}
+    return {"success": True, "data": data}
+
+
+@router.post("/channels/wework/customers/sync")
+async def wework_customers_sync(current_user: CurrentUser, limit: int = 500):
+    """使用当前团队的永久授权同步外部联系人，并写入客来来真实客户列表。"""
+    from app.services.wework_suite import (
+        WeWorkSuiteError,
+        remote_bridge_enabled,
+        remote_sync_external_customers,
+        sync_external_customers,
+    )
+
+    try:
+        team_id = int(current_user.get("team_id") or 0)
+        clean_limit = max(1, min(int(limit), 1000))
+        data = (
+            await remote_sync_external_customers(team_id, limit=clean_limit)
+            if remote_bridge_enabled()
+            else await sync_external_customers(team_id, limit=clean_limit)
+        )
+    except WeWorkSuiteError as exc:
+        return {"success": False, "error": str(exc)}
+    return {"success": True, "data": data}
+
+
+@router.get("/channels/wework/customers")
+async def wework_customers(current_user: CurrentUser, limit: int = 500):
+    """读取当前团队已经同步的企业微信外部联系人。"""
+    from app.services.wework_suite import (
+        WeWorkSuiteError,
+        list_customers,
+        remote_bridge_enabled,
+        remote_list_customers,
+    )
+
+    team_id = int(current_user.get("team_id") or 0)
+    clean_limit = max(1, min(int(limit), 1000))
+    try:
+        customers = (
+            await remote_list_customers(team_id, limit=clean_limit)
+            if remote_bridge_enabled()
+            else list_customers(team_id, limit=clean_limit)
+        )
+    except WeWorkSuiteError as exc:
+        return {"success": False, "error": str(exc)}
+    return {"success": True, "data": {"customers": customers, "total": len(customers)}}
+
+
+@router.get("/channels/wework/acquisition/members")
+async def wework_acquisition_members(current_user: CurrentUser):
+    """列出当前登录团队可用于获客链接的企业微信跟进成员。"""
+    from app.services.wework_suite import (
+        WeWorkSuiteError,
+        list_acquisition_members,
+        remote_bridge_enabled,
+        remote_list_acquisition_members,
+    )
+
+    team_id = int(current_user.get("team_id") or 0)
+    if team_id <= 0:
+        return {"success": False, "error": "当前账号没有有效团队"}
+    try:
+        data = (
+            await remote_list_acquisition_members(team_id)
+            if remote_bridge_enabled()
+            else await list_acquisition_members(team_id)
+        )
+    except WeWorkSuiteError as exc:
+        return {"success": False, "error": str(exc)}
+    return {"success": True, "data": data}
+
+
+@router.post("/channels/wework/acquisition/links")
+async def wework_acquisition_link_create(
+    payload: WeWorkAcquisitionLinkCreate,
+    current_user: CurrentUser,
+):
+    """只使用当前登录团队的企业微信授权创建获客链接。"""
+    from app.services.wework_suite import (
+        WeWorkSuiteError,
+        create_acquisition_link,
+        remote_bridge_enabled,
+        remote_create_acquisition_link,
+    )
+
+    team_id = int(current_user.get("team_id") or 0)
+    if team_id <= 0:
+        return {"success": False, "error": "当前账号没有有效团队"}
+    args = {
+        "team_id": team_id,
+        "link_name": payload.link_name,
+        "userids": payload.userids,
+        "skip_verify": payload.skip_verify,
+    }
+    try:
+        data = (
+            await remote_create_acquisition_link(**args)
+            if remote_bridge_enabled()
+            else await create_acquisition_link(**args)
+        )
+    except WeWorkSuiteError as exc:
+        return {"success": False, "error": str(exc)}
+    return {"success": True, "data": data}
+
+
+def _verify_wework_bridge(request: Request) -> None:
+    from app.services.wework_suite import WeWorkSuiteError, verify_bridge_key
+
+    try:
+        verify_bridge_key(request.headers.get("X-Kellai-WeWork-Bridge-Key", ""))
+    except WeWorkSuiteError as exc:
+        raise HTTPException(status_code=403, detail={"message": str(exc)}) from exc
+
+
+@router.get("/internal/wework/readiness")
+async def internal_wework_readiness(request: Request):
+    from app.services.wework_suite import suite_readiness
+
+    _verify_wework_bridge(request)
+    return {"success": True, "data": suite_readiness()}
+
+
+@router.post("/internal/wework/install")
+async def internal_wework_install(request: Request, team_id: int, user_id: int):
+    from app.services.wework_suite import WeWorkSuiteError, create_install_url
+
+    try:
+        _verify_wework_bridge(request)
+        data = await create_install_url(team_id=team_id, user_id=user_id)
+        return {"success": True, "data": data}
+    except WeWorkSuiteError as exc:
+        raise HTTPException(status_code=400, detail={"message": str(exc)}) from exc
+
+
+@router.get("/internal/wework/install/status")
+async def internal_wework_install_status(request: Request, state: str, team_id: int):
+    from app.services.wework_suite import WeWorkSuiteError, get_install_status
+
+    try:
+        _verify_wework_bridge(request)
+        data = get_install_status(state=state, team_id=team_id)
+        return {"success": True, "data": data}
+    except WeWorkSuiteError as exc:
+        raise HTTPException(status_code=400, detail={"message": str(exc)}) from exc
+
+
+@router.post("/internal/wework/customers/sync")
+async def internal_wework_customers_sync(request: Request, team_id: int, limit: int = 500):
+    from app.services.wework_suite import WeWorkSuiteError, sync_external_customers
+
+    try:
+        _verify_wework_bridge(request)
+        data = await sync_external_customers(team_id, limit=max(1, min(int(limit), 1000)))
+        return {"success": True, "data": data}
+    except WeWorkSuiteError as exc:
+        raise HTTPException(status_code=400, detail={"message": str(exc)}) from exc
+
+
+@router.get("/internal/wework/customers")
+async def internal_wework_customers(request: Request, team_id: int, limit: int = 500):
+    from app.services.wework_suite import WeWorkSuiteError, list_customers
+
+    try:
+        _verify_wework_bridge(request)
+        customers = list_customers(team_id, limit=max(1, min(int(limit), 1000)))
+        return {"success": True, "data": {"customers": customers, "total": len(customers)}}
+    except WeWorkSuiteError as exc:
+        raise HTTPException(status_code=400, detail={"message": str(exc)}) from exc
+
+
+@router.get("/internal/wework/acquisition/members")
+async def internal_wework_acquisition_members(request: Request, team_id: int):
+    from app.services.wework_suite import WeWorkSuiteError, list_acquisition_members
+
+    try:
+        _verify_wework_bridge(request)
+        if int(team_id) <= 0:
+            raise WeWorkSuiteError("当前账号没有有效团队")
+        data = await list_acquisition_members(int(team_id))
+        return {"success": True, "data": data}
+    except WeWorkSuiteError as exc:
+        raise HTTPException(status_code=400, detail={"message": str(exc)}) from exc
+
+
+@router.post("/internal/wework/acquisition/links")
+async def internal_wework_acquisition_link_create(
+    request: Request,
+    payload: WeWorkAcquisitionLinkCreate,
+    team_id: int,
+):
+    from app.services.wework_suite import WeWorkSuiteError, create_acquisition_link
+
+    try:
+        _verify_wework_bridge(request)
+        if int(team_id) <= 0:
+            raise WeWorkSuiteError("当前账号没有有效团队")
+        data = await create_acquisition_link(
+            int(team_id),
+            link_name=payload.link_name,
+            userids=payload.userids,
+            skip_verify=payload.skip_verify,
+        )
+        return {"success": True, "data": data}
+    except WeWorkSuiteError as exc:
+        raise HTTPException(status_code=400, detail={"message": str(exc)}) from exc
+
+
+@router.get("/channels/wework/customer-entry")
+def wework_customer_entry(request: Request, source: str = "settings", mode: str = ""):
+    """公开客户入口：记录来源并跳转到已配置的企业微信客服链接。"""
+    from urllib.parse import urlencode
+
+    from fastapi.responses import RedirectResponse
+
+    target_url = _wework_customer_service_url()
+    if not target_url:
+        if mode == "json":
+            return {"success": False, "error": "请先配置企业微信客服接待链接或 open_kfid"}
+        raise HTTPException(status_code=404, detail={"message": "企业微信客服入口未配置"})
+
+    clean_source = "".join(ch for ch in (source or "settings") if ch.isalnum() or ch in "-_:.")[:80] or "settings"
+    logger.info(
+        "企业微信客服入口访问: source=%s ip=%s target=open_kfid",
+        clean_source,
+        getattr(request.client, "host", "-") if request.client else "-",
+    )
+    entry_url = (
+        f"{str(request.base_url).rstrip('/')}/api/kellai/channels/wework/customer-entry?"
+        f"{urlencode({'source': clean_source})}"
+    )
+    if mode == "json":
+        return {
+            "success": True,
+            "data": {
+                "entry_url": entry_url,
+                "target_url": target_url,
+                "source": clean_source,
+            },
+        }
+    return RedirectResponse(target_url, status_code=307)
 
 
 @router.get("/messages")
@@ -874,10 +2809,13 @@ def get_messages(
         # 未指定 customer_id：获取当前用户团队的所有客户消息
         team_id = current_user.get("team_id")
         all_clients = list_pipeline_client_summaries()
-        # 如果没有 team_id，返回所有客户消息（兼容模式）
         if team_id:
-            # 只保留属于本团队的客户
-            team_customer_ids = {c["customer_id"] for c in all_clients}
+            # 新同步客户严格按团队隔离；team_id=0 的历史档案继续兼容可见。
+            team_customer_ids = {
+                c["customer_id"]
+                for c in all_clients
+                if int(c.get("team_id") or 0) in {0, int(team_id)}
+            }
         else:
             team_customer_ids = {c["customer_id"] for c in all_clients}
 
@@ -898,22 +2836,96 @@ def get_messages(
 
 
 @router.post("/messages/send")
-async def send_message(body: ChannelSendMessageBody):
+async def send_message(body: ChannelSendMessageBody, request: Request = None):
     """统一发送消息。"""
     import uuid
     from datetime import datetime, timezone
 
     from app.channels import ChannelRegistry
     from app.channels.base import UnifiedMessage
-    from app.services.message_store import save_message
+    from app.services.message_store import get_messages, save_message
 
     reg = ChannelRegistry()
     try:
         adapter = reg.get(body.channel_type)
     except KeyError:
         return {"success": False, "error": f"未注册的渠道类型: {body.channel_type}"}
-    result = await adapter.send_message(body.contact_id, body.content)
+    user = get_request_user(request) if request is not None else None
+    team_id = int((user or {}).get("team_id") or 0)
+    logger.info(
+        "渠道发送开始: team_id=%s customer_id=%s channel=%s contact_id=%s",
+        team_id,
+        body.customer_id,
+        body.channel_type,
+        body.contact_id,
+    )
+    contact_name = ""
+    try:
+        for stored_message in get_messages(
+            body.customer_id,
+            body.channel_type,
+            limit=100,
+        ):
+            if str(stored_message.contact_id or "") != str(body.contact_id or ""):
+                continue
+            contact_name = str(stored_message.contact_name or "").strip()
+            if contact_name:
+                break
+    except Exception:
+        logger.debug(
+            "发送前解析联系人名称失败: customer_id=%s channel=%s",
+            body.customer_id,
+            body.channel_type,
+            exc_info=True,
+        )
+    if body.desktop_result is not None:
+        client_host = str(getattr(getattr(request, "client", None), "host", "") or "")
+        desktop_header = str(request.headers.get("X-Kellai-Desktop-Delivery", ""))
+        supplied = dict(body.desktop_result)
+        valid_desktop_receipt = (
+            body.channel_type == "douyin"
+            and client_host in {"127.0.0.1", "::1", "localhost"}
+            and desktop_header == "1"
+            and supplied.get("success") is True
+            and supplied.get("message_sent") is True
+            and supplied.get("source") == "douyin_desktop_automation"
+            and str(supplied.get("contact_id") or "") == str(body.contact_id)
+        )
+        if not valid_desktop_receipt:
+            logger.warning(
+                "拒绝无效桌面发送回执: client=%s channel=%s customer_id=%s",
+                client_host,
+                body.channel_type,
+                body.customer_id,
+            )
+            return {"success": False, "error": "无效的客来来桌面发送回执"}
+        result = {
+            "success": True,
+            "message_id": str(supplied.get("message_id") or ""),
+            "error": "",
+            "source": "douyin_desktop_automation",
+            "message_sent": True,
+            "contact_name": str(supplied.get("contact_name") or contact_name),
+            "contact_id": str(body.contact_id),
+            "reused_conversation": bool(supplied.get("reused_conversation")),
+            "pending_portal_sync": bool(supplied.get("pending_portal_sync", True)),
+        }
+    else:
+        result = await adapter.send_message(
+            body.contact_id,
+            body.content,
+            team_id=team_id,
+            customer_id=body.customer_id,
+            contact_name=contact_name,
+        )
     if not result.get("success", False):
+        logger.warning(
+            "渠道发送失败: team_id=%s customer_id=%s channel=%s error=%s",
+            team_id,
+            body.customer_id,
+            body.channel_type,
+            result.get("error") or result.get("message") or "未知错误",
+        )
         return {
             "success": False,
             "error": result.get("error") or result.get("message") or "渠道发送失败",
@@ -926,11 +2938,16 @@ async def send_message(body: ChannelSendMessageBody):
         customer_id=body.customer_id,
         channel_type=body.channel_type,
         contact_id=body.contact_id,
-        contact_name="",
+        contact_name=contact_name,
         direction="outbound",
         content=body.content,
         content_type="text",
-        metadata=result,
+        metadata={
+            **result,
+            "team_id": team_id,
+            "agent_user_id": int((user or {}).get("id") or 0),
+            "auto_reply_inbound_id": str(body.auto_reply_inbound_id or ""),
+        },
         created_at=now,
     )
     try:
@@ -941,6 +2958,32 @@ async def send_message(body: ChannelSendMessageBody):
         logger.warning("发送成功但消息落库失败: %s", exc)
         persisted = False
         persist_error = str(exc)
+    if body.auto_reply_inbound_id:
+        try:
+            from app.services.auto_reply_runtime import complete_job
+
+            complete_job(
+                body.auto_reply_inbound_id,
+                success=True,
+                outbound_message_id=(
+                    msg.id if persisted else str(result.get("message_id") or "")
+                ),
+                team_id=team_id,
+            )
+        except Exception:
+            logger.warning(
+                "自动回复已发送但任务完成状态更新失败: inbound_message_id=%s",
+                body.auto_reply_inbound_id,
+                exc_info=True,
+            )
+    logger.info(
+        "渠道发送完成: team_id=%s customer_id=%s channel=%s source=%s persisted=%s",
+        team_id,
+        body.customer_id,
+        body.channel_type,
+        result.get("source") or "api",
+        persisted,
+    )
     return {
         "success": True,
         "data": {
@@ -980,7 +3023,15 @@ def get_unread_summary(
     # 团队隔离：先取团队可见的客户 ID 集合
     team_id = current_user.get("team_id")
     all_clients = list_pipeline_client_summaries()
-    visible_ids = {int(c["customer_id"]) for c in all_clients if c.get("customer_id")}
+    visible_ids = {
+        int(c["customer_id"])
+        for c in all_clients
+        if c.get("customer_id")
+        and (
+            not team_id
+            or int(c.get("team_id") or 0) in {0, int(team_id)}
+        )
+    }
 
     summary = _summary()
     if visible_ids:
@@ -1017,7 +3068,12 @@ def mark_messages_read(body: MarkReadBody, current_user: CurrentUser):
     team_id = current_user.get("team_id")
     visible_ids: set[int] | None = None
     if team_id:
-        visible_ids = {int(c["customer_id"]) for c in list_pipeline_client_summaries() if c.get("customer_id")}
+        visible_ids = {
+            int(c["customer_id"])
+            for c in list_pipeline_client_summaries()
+            if c.get("customer_id")
+            and int(c.get("team_id") or 0) in {0, int(team_id)}
+        }
 
     updated = 0
     if body.message_ids:
@@ -1054,6 +3110,149 @@ def mark_messages_read(body: MarkReadBody, current_user: CurrentUser):
     return {"success": True, "data": {"updated": updated}}
 
 
+# ---------------------------------------------------------------------------
+# 统一接待：在线状态、抢单锁、管理分配与负载均衡
+# ---------------------------------------------------------------------------
+
+
+def _workforce_team_id(current_user: dict) -> int:
+    team_id = int(current_user.get("team_id") or 0)
+    if team_id <= 0:
+        raise HTTPException(status_code=400, detail={"message": "当前账号尚未加入团队"})
+    return team_id
+
+
+def _ensure_customer_in_team(customer_id: int, team_id: int) -> None:
+    from app.services.pipeline import load_pipeline
+
+    doc = load_pipeline(int(customer_id))
+    doc_team_id = int(doc.get("team_id") or 0)
+    if doc_team_id not in {0, int(team_id)}:
+        raise HTTPException(status_code=404, detail={"message": "客户不在当前团队中"})
+
+
+@router.post("/workforce/presence/heartbeat")
+def workforce_presence_heartbeat(
+    body: WorkforceHeartbeatBody,
+    current_user: CurrentUser,
+):
+    from app.services.workforce_routing import heartbeat
+
+    team_id = _workforce_team_id(current_user)
+    data = heartbeat(
+        team_id=team_id,
+        user_id=int(current_user.get("id") or 0),
+        state=body.state,
+    )
+    return {"success": True, "data": data}
+
+
+@router.get("/workforce/overview")
+def workforce_overview(current_user: CurrentUser):
+    from app.services.workforce_routing import routing_overview
+
+    team_id = _workforce_team_id(current_user)
+    return {"success": True, "data": routing_overview(team_id)}
+
+
+@router.get("/workforce/customers/{customer_id}/assignment")
+def workforce_customer_assignment(customer_id: int, current_user: CurrentUser):
+    from app.services.workforce_routing import assignment_for_customer
+
+    team_id = _workforce_team_id(current_user)
+    _ensure_customer_in_team(customer_id, team_id)
+    assignment = assignment_for_customer(customer_id)
+    if assignment and int(assignment.get("team_id") or 0) != team_id:
+        assignment = None
+    return {"success": True, "data": {"assignment": assignment}}
+
+
+@router.post("/workforce/customers/{customer_id}/claim")
+def workforce_claim_customer(customer_id: int, current_user: CurrentUser):
+    from app.services.workforce_routing import AssignmentConflict, claim_customer
+
+    team_id = _workforce_team_id(current_user)
+    _ensure_customer_in_team(customer_id, team_id)
+    try:
+        assignment = claim_customer(
+            customer_id=customer_id,
+            team_id=team_id,
+            user_id=int(current_user.get("id") or 0),
+        )
+    except AssignmentConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": str(exc), "assignment": exc.assignment},
+        ) from exc
+    return {"success": True, "data": {"assignment": assignment}}
+
+
+@router.post("/workforce/customers/{customer_id}/assign")
+def workforce_assign_customer(
+    customer_id: int,
+    body: WorkforceAssignBody,
+    current_user: CurrentUser,
+):
+    from app.services.workforce_routing import assign_customer
+
+    if str(current_user.get("role") or "") not in {"owner", "admin"}:
+        raise HTTPException(status_code=403, detail={"message": "仅管理者可重新分配客户"})
+    team_id = _workforce_team_id(current_user)
+    _ensure_customer_in_team(customer_id, team_id)
+    try:
+        assignment = assign_customer(
+            customer_id=customer_id,
+            team_id=team_id,
+            assignee_user_id=body.assignee_user_id,
+            actor_user_id=int(current_user.get("id") or 0),
+            source="manager",
+            allow_override=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"message": str(exc)}) from exc
+    return {"success": True, "data": {"assignment": assignment}}
+
+
+@router.post("/workforce/customers/{customer_id}/auto-assign")
+def workforce_auto_assign_customer(customer_id: int, current_user: CurrentUser):
+    from app.services.workforce_routing import auto_assign_customer
+
+    if str(current_user.get("role") or "") not in {"owner", "admin"}:
+        raise HTTPException(status_code=403, detail={"message": "仅管理者可触发自动分配"})
+    team_id = _workforce_team_id(current_user)
+    _ensure_customer_in_team(customer_id, team_id)
+    assignment = auto_assign_customer(
+        customer_id=customer_id,
+        team_id=team_id,
+        source="manager_auto_route",
+    )
+    if assignment is None:
+        return {"success": False, "error": "当前团队没有可接待成员"}
+    return {"success": True, "data": {"assignment": assignment}}
+
+
+@router.post("/workforce/customers/{customer_id}/release")
+def workforce_release_customer(customer_id: int, current_user: CurrentUser):
+    from app.services.workforce_routing import assignment_for_customer, release_customer
+
+    team_id = _workforce_team_id(current_user)
+    _ensure_customer_in_team(customer_id, team_id)
+    assignment = assignment_for_customer(customer_id)
+    is_manager = str(current_user.get("role") or "") in {"owner", "admin"}
+    is_assignee = bool(
+        assignment
+        and int(assignment.get("assignee_user_id") or 0) == int(current_user.get("id") or 0)
+    )
+    if not (is_manager or is_assignee):
+        raise HTTPException(status_code=403, detail={"message": "仅负责人或管理者可释放客户"})
+    released = release_customer(
+        customer_id=customer_id,
+        team_id=team_id,
+        actor_user_id=int(current_user.get("id") or 0),
+    )
+    return {"success": True, "data": {"assignment": released}}
+
+
 @router.get("/customers")
 def get_customers(
     current_user: CurrentUser,
@@ -1068,6 +3267,10 @@ def get_customers(
     from app.services.pipeline import PIPELINE_STAGES, list_pipeline_client_summaries
 
     clients = list_pipeline_client_summaries()
+    team_id = int(current_user.get("team_id") or 0)
+    if team_id:
+        # 新同步的第三方客户严格按团队隔离；team_id=0 的历史档案继续兼容可见。
+        clients = [c for c in clients if int(c.get("team_id") or 0) in {0, team_id}]
 
     # 按阶段筛选
     if stage:
@@ -1210,6 +3413,148 @@ def status():
             "independent": True,
         },
     }
+
+
+def _require_xcmax_loopback(request: Request) -> str:
+    host = request.client.host if request.client else ""
+    if host not in {"127.0.0.1", "::1", "localhost"}:
+        raise HTTPException(status_code=403, detail="XCMAX 数据访问仅允许本机桌面端")
+    authorization = request.headers.get("Authorization", "")
+    return authorization[7:].strip() if authorization.startswith("Bearer ") else ""
+
+
+def _require_xcmax_desktop_handoff(request: Request) -> None:
+    host = request.client.host if request.client else ""
+    if host not in {"127.0.0.1", "::1", "localhost"}:
+        raise HTTPException(status_code=403, detail="XCMAX 桌面登录仅允许本机访问")
+    if request.headers.get("X-Kellai-Local-Pairing") != "1":
+        raise HTTPException(status_code=403, detail="缺少本机绑定校验")
+
+
+@router.post("/auth/xcmax-desktop")
+def auth_xcmax_desktop(request: Request):
+    """Enter 客来来 for an active local XCMAX authorization handoff."""
+    _require_xcmax_desktop_handoff(request)
+    from app.services.xcmax_integration import create_desktop_login_for_pending_pairing
+
+    try:
+        return create_desktop_login_for_pending_pairing()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/integrations/xcmax/status")
+def xcmax_integration_status(current_user: CurrentUser):
+    from app.services.xcmax_integration import public_status
+
+    _ = current_user
+    return {"success": True, "data": public_status()}
+
+
+@router.get("/integrations/xcmax/pending")
+def xcmax_integration_pending(current_user: CurrentUser):
+    from app.services.xcmax_integration import pending_authorization
+
+    _ = current_user
+    try:
+        pending = pending_authorization()
+    except RuntimeError as exc:
+        # XCMAX 未运行、版本较旧或没有绑定路由都属于“当前无待授权”，
+        # 不应让客来来桌面端收到 500/Network Error。
+        logger.debug("读取 XCMAX 待授权状态失败: %s", exc)
+        pending = None
+    return {"success": True, "data": pending}
+
+
+@router.post("/integrations/xcmax/approve")
+def xcmax_integration_approve(body: XcmaxAuthorizeBody, current_user: CurrentUser):
+    from app.services.xcmax_integration import approve_authorization
+
+    try:
+        connection = approve_authorization(
+            request_id=body.request_id,
+            authorization_secret=body.authorization_secret,
+            accepted_scopes=body.accepted_scopes,
+            current_user=current_user,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"success": True, "data": connection}
+
+
+@router.post("/integrations/xcmax/cancel")
+def xcmax_integration_cancel(body: XcmaxCancelBody, current_user: CurrentUser):
+    from app.services.xcmax_integration import cancel_authorization
+
+    _ = current_user
+    try:
+        cancel_authorization(
+            request_id=body.request_id,
+            authorization_secret=body.authorization_secret,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"success": True}
+
+
+@router.post("/integrations/xcmax/disconnect")
+def xcmax_integration_disconnect(current_user: CurrentUser):
+    from app.services.xcmax_integration import disconnect
+
+    _ = current_user
+    disconnect()
+    return {"success": True}
+
+
+@router.get("/integrations/xcmax/data-status")
+def xcmax_data_status(request: Request):
+    from app.services.message_store import get_unread_summary
+    from app.services.pipeline import list_pipeline_client_summaries
+    from app.services.xcmax_integration import authorize_access_token
+
+    authorize_access_token(_require_xcmax_loopback(request), "customer_profiles.read")
+    customers = list_pipeline_client_summaries(include_demo=False)
+    unread = get_unread_summary()
+    return {
+        "success": True,
+        "data": {
+            "customer_count": len(customers),
+            "unread_message_count": int(unread.get("total") or 0),
+            "latest_customer_at": str(customers[0].get("updated_at") or "") if customers else "",
+        },
+    }
+
+
+@router.get("/integrations/xcmax/customers")
+def xcmax_customers(request: Request, limit: int = 12):
+    from app.services.pipeline import list_pipeline_client_summaries
+    from app.services.xcmax_integration import authorize_access_token
+
+    authorize_access_token(_require_xcmax_loopback(request), "customer_profiles.read")
+    rows = list_pipeline_client_summaries(include_demo=False)[: max(1, min(int(limit), 50))]
+    customers = [
+        {
+            "customer_id": int(row.get("customer_id") or 0),
+            "display_name": str(row.get("display_name") or "未命名客户"),
+            "stage": str(row.get("stage") or ""),
+            "stage_label": str(row.get("stage_label") or ""),
+            "channel_sources": list(row.get("channel_sources") or []),
+            "last_message_preview": str(row.get("last_message_preview") or "")[:500],
+            "updated_at": str(row.get("updated_at") or ""),
+        }
+        for row in rows
+    ]
+    return {"success": True, "data": {"customers": customers, "total": len(rows)}}
+
+
+@router.get("/integrations/xcmax/customers/{customer_id}/conversations")
+def xcmax_customer_conversations(customer_id: int, request: Request, limit: int = 30):
+    from app.services.message_store import get_messages_with_state
+    from app.services.xcmax_integration import authorize_access_token
+
+    authorize_access_token(_require_xcmax_loopback(request), "customer_conversations.read")
+    messages = get_messages_with_state(int(customer_id), limit=max(1, min(int(limit), 100)))
+    return {"success": True, "data": {"customer_id": int(customer_id), "messages": messages}}
 
 
 @router.get("/tts/status")
@@ -1877,7 +4222,7 @@ async def ai_suggest_reply(
     _rl: None = Depends(enforce_llm_rate_limit),
 ):
     """推荐回复话术"""
-    from app.services.ai_copilot import suggest_reply
+    from app.services.ai_copilot import format_suggestion_payload, suggest_reply
     from app.services.pipeline import load_pipeline
 
     uid = int(body.customer_id or body.market_user_id or 0)
@@ -1891,15 +4236,20 @@ async def ai_suggest_reply(
         from app.services.message_store import get_messages
 
         msgs = get_messages(uid, limit=5)
-        history = [m.content for m in msgs]
-    suggestions = suggest_reply(
-        uid,
-        message=body.message,
-        intent=body.intent,
-        stage=stage,
-        history=history,
+        history = [
+            f"{'客服' if m.direction == 'outbound' else '客户'}：{m.content}"
+            for m in reversed(msgs)
+        ]
+    data = format_suggestion_payload(
+        suggest_reply(
+            uid,
+            message=body.message,
+            intent=body.intent,
+            stage=stage,
+            history=history,
+        )
     )
-    return {"success": True, "data": {"suggestions": suggestions}}
+    return {"success": True, "data": data}
 
 
 @router.post("/ai/auto-reply")
@@ -1922,7 +4272,10 @@ async def ai_auto_reply(
         from app.services.message_store import get_messages
 
         msgs = get_messages(uid, limit=5)
-        history = [m.content for m in msgs]
+        history = [
+            f"{'客服' if m.direction == 'outbound' else '客户'}：{m.content}"
+            for m in reversed(msgs)
+        ]
     result = generate_auto_reply(
         uid,
         message=body.message,
@@ -1931,6 +4284,44 @@ async def ai_auto_reply(
         history=history,
     )
     return {"success": True, "data": result}
+
+
+@router.post("/ai/auto-reply/jobs/claim")
+def ai_auto_reply_claim(body: AutoReplyClaimBody, current_user: CurrentUser):
+    """桌面端领取已去重、带租约的真实自动回复任务。"""
+    from app.services.auto_reply_runtime import claim_jobs
+
+    jobs = claim_jobs(
+        team_id=int(current_user.get("team_id") or 0),
+        limit=body.limit,
+    )
+    return {"success": True, "data": {"jobs": jobs}}
+
+
+@router.post("/ai/auto-reply/jobs/result")
+def ai_auto_reply_result(body: AutoReplyResultBody, current_user: CurrentUser):
+    """记录桌面端自动回复发送结果；失败任务按退避策略重试。"""
+    from app.services.auto_reply_runtime import complete_job
+
+    updated = complete_job(
+        body.inbound_message_id,
+        success=body.success,
+        error=body.error,
+        outbound_message_id=body.outbound_message_id,
+        team_id=int(current_user.get("team_id") or 0),
+    )
+    return {"success": True, "data": {"updated": updated}}
+
+
+@router.get("/ai/auto-reply/runtime-status")
+def ai_auto_reply_runtime_status(current_user: CurrentUser):
+    """自动回复真实运行状态与最近一次处理结果。"""
+    from app.services.auto_reply_runtime import runtime_status
+
+    return {
+        "success": True,
+        "data": runtime_status(team_id=int(current_user.get("team_id") or 0)),
+    }
 
 
 @router.get("/ai/profile/{customer_id}")
@@ -2246,6 +4637,171 @@ async def ai_update_score(
 # 认证与团队 API
 # ---------------------------------------------------------------------------
 
+_qr_login_sessions: dict[str, dict[str, Any]] = {}
+_QR_LOGIN_TTL_SECONDS = 180
+
+
+def _frontend_origin_from_request(request: Request) -> str:
+    from urllib.parse import urlparse
+
+    configured = (
+        os.getenv("KELLAI_QR_LOGIN_FRONTEND_URL")
+        or os.getenv("KELLAI_PUBLIC_FRONTEND_URL")
+        or ""
+    ).strip()
+    if configured.startswith(("http://", "https://")):
+        return configured.rstrip("/")
+
+    # 扫码登录从登录页发起。优先从 Referer 保留部署子路径，例如
+    # https://xiu-ci.com/kellai/login -> https://xiu-ci.com/kellai。
+    referer = (request.headers.get("referer") or "").strip()
+    if referer:
+        parsed = urlparse(referer)
+        if parsed.scheme and parsed.netloc:
+            path = (parsed.path or "").rstrip("/")
+            base_path = path[:-len("/login")] if path.endswith("/login") else ""
+            if base_path:
+                return f"{parsed.scheme}://{parsed.netloc}{base_path}"
+
+    origin = (request.headers.get("origin") or "").strip()
+    if not origin and referer:
+        parsed = urlparse(referer)
+        if parsed.scheme and parsed.netloc:
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+    if origin.startswith(("http://127.0.0.1", "http://localhost", "https://")):
+        return origin.rstrip("/")
+    return str(request.base_url).rstrip("/")
+
+
+def _cleanup_qr_login_sessions(now: float) -> None:
+    expired = [
+        sid for sid, session in _qr_login_sessions.items()
+        if float(session.get("expires_at") or 0) <= now
+    ]
+    for sid in expired:
+        _qr_login_sessions.pop(sid, None)
+
+
+@router.post("/auth/qr/start")
+def auth_qr_start(request: Request):
+    """桌面端发起扫码登录，返回二维码内容 URL 与轮询 session_id。"""
+    import time
+    from urllib.parse import urlencode
+
+    now = time.time()
+    _cleanup_qr_login_sessions(now)
+    session_id = secrets.token_urlsafe(32)
+    secret = secrets.token_urlsafe(24)
+    expires_at = now + _QR_LOGIN_TTL_SECONDS
+    _qr_login_sessions[session_id] = {
+        "secret": secret,
+        "status": "waiting",
+        "expires_at": expires_at,
+        "created_at": now,
+        "scanned_at": 0.0,
+        "authorized_at": 0.0,
+        "user": None,
+        "login": None,
+        "error": "",
+    }
+    frontend_origin = _frontend_origin_from_request(request)
+    login_url = f"{frontend_origin}/login?{urlencode({'qr_session': session_id, 'qr_secret': secret})}"
+    return {
+        "success": True,
+        "data": {
+            "session_id": session_id,
+            "secret": secret,
+            "login_url": login_url,
+            "expires_in": _QR_LOGIN_TTL_SECONDS,
+            "expires_at": expires_at,
+        },
+    }
+
+
+@router.get("/auth/qr/status")
+def auth_qr_status(session_id: str = ""):
+    """桌面端轮询扫码登录状态。authorized 时返回登录 token。"""
+    import time
+
+    now = time.time()
+    _cleanup_qr_login_sessions(now)
+    session = _qr_login_sessions.get((session_id or "").strip())
+    if not session:
+        return {"success": True, "data": {"status": "expired", "expired": True}}
+    if float(session.get("expires_at") or 0) <= now:
+        _qr_login_sessions.pop(session_id, None)
+        return {"success": True, "data": {"status": "expired", "expired": True}}
+    status = str(session.get("status") or "waiting")
+    data: dict[str, Any] = {
+        "status": status,
+        "scanned": status in {"scanned", "authorized"},
+        "authorized": status == "authorized",
+        "expired": False,
+        "expires_in": max(0, int(float(session.get("expires_at") or 0) - now)),
+    }
+    if status == "authorized":
+        data["login"] = session.get("login")
+        data["user"] = session.get("user")
+    if status in {"canceled", "failed"}:
+        data["error"] = str(session.get("error") or "")
+    return {"success": True, "data": data}
+
+
+@router.post("/auth/qr/scan")
+def auth_qr_scan(body: QrLoginBody):
+    """扫码设备打开二维码链接后标记已扫描。"""
+    import time
+
+    session = _qr_login_sessions.get(body.session_id)
+    if not session or float(session.get("expires_at") or 0) <= time.time():
+        return {"success": False, "error": "二维码已过期"}
+    if secrets.compare_digest(str(session.get("secret") or ""), body.secret):
+        if session.get("status") == "waiting":
+            session["status"] = "scanned"
+            session["scanned_at"] = time.time()
+        return {"success": True, "data": {"status": session.get("status")}}
+    return {"success": False, "error": "二维码无效"}
+
+
+@router.post("/auth/qr/confirm")
+def auth_qr_confirm(body: QrLoginBody, current_user: CurrentUser):
+    """扫码设备确认登录，把当前账号授权给发起扫码的桌面会话。"""
+    import time
+
+    from app.services.auth import create_login_session_for_user
+
+    session = _qr_login_sessions.get(body.session_id)
+    if not session or float(session.get("expires_at") or 0) <= time.time():
+        return {"success": False, "error": "二维码已过期"}
+    if not secrets.compare_digest(str(session.get("secret") or ""), body.secret):
+        return {"success": False, "error": "二维码无效"}
+    if session.get("status") in {"authorized", "canceled"}:
+        return {"success": False, "error": "该二维码已处理"}
+
+    login = create_login_session_for_user(int(current_user.get("id") or 0))
+    if not login.get("success"):
+        session["status"] = "failed"
+        session["error"] = str(login.get("error") or "授权失败")
+        return login
+    session["status"] = "authorized"
+    session["authorized_at"] = time.time()
+    session["user"] = login.get("user")
+    session["login"] = login
+    return {"success": True, "data": {"status": "authorized", "user": login.get("user")}}
+
+
+@router.post("/auth/qr/cancel")
+def auth_qr_cancel(body: QrLoginBody):
+    """扫码设备取消本次登录。"""
+    session = _qr_login_sessions.get(body.session_id)
+    if not session:
+        return {"success": True, "data": {"status": "expired"}}
+    if secrets.compare_digest(str(session.get("secret") or ""), body.secret):
+        session["status"] = "canceled"
+        session["error"] = "用户已取消"
+        return {"success": True, "data": {"status": "canceled"}}
+    return {"success": False, "error": "二维码无效"}
+
 
 @router.post("/auth/register")
 def auth_register(body: RegisterBody, request: Request):
@@ -2459,69 +5015,149 @@ def join_team(body: JoinBody, current_user: CurrentUser):
 
 
 # ---------------------------------------------------------------------------
+# 微信开放平台 / 公众号 Webhook 回调
+# ---------------------------------------------------------------------------
+
+
+def _wechat_webhook_token() -> str:
+    return _wechat_cfg("token") or _wechat_cfg("server_token") or _wechat_cfg("webhook_token")
+
+
+def _wechat_signature_ok(signature: str, timestamp: str, nonce: str, token: str) -> bool:
+    if not token:
+        return True
+    if not signature or not timestamp or not nonce:
+        return False
+    raw = "".join(sorted([token, timestamp, nonce]))
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    return secrets.compare_digest(digest, signature)
+
+
+@router.get("/webhook/wechat")
+async def wechat_webhook_verify(
+    signature: str = "",
+    timestamp: str = "",
+    nonce: str = "",
+    echostr: str = "",
+):
+    """微信服务器回调 URL 验证（GET）。"""
+    token = _wechat_webhook_token()
+    if token and not _wechat_signature_ok(signature, timestamp, nonce, token):
+        raise HTTPException(status_code=403, detail={"message": "微信回调签名校验失败"})
+    if echostr:
+        return Response(content=echostr, media_type="text/plain")
+    return {"success": True, "message": "wechat webhook endpoint active"}
+
+
+@router.post("/webhook/wechat")
+async def wechat_webhook_receive(
+    request: Request,
+    signature: str = "",
+    timestamp: str = "",
+    nonce: str = "",
+):
+    """接收微信/公众号推送消息，写入统一收件箱。"""
+    from app.services.message_store import push_inbox
+
+    token = _wechat_webhook_token()
+    if token and not _wechat_signature_ok(signature, timestamp, nonce, token):
+        logger.warning("微信 webhook 签名校验失败: signature=%s timestamp=%s nonce=%s", signature, timestamp, nonce)
+        raise HTTPException(status_code=403, detail={"message": "微信回调签名校验失败"})
+
+    content_type = request.headers.get("content-type", "")
+    try:
+        if "json" in content_type:
+            body = await request.json()
+        else:
+            raw = await request.body()
+            raw_text = raw.decode("utf-8", errors="replace")
+            body = _parse_wecom_xml(raw_text) if "<xml" in raw_text else {}
+    except Exception as exc:
+        logger.warning("微信 webhook 解析失败: %s", exc)
+        return Response(content="success", media_type="text/plain")
+
+    msg_type = str(body.get("MsgType", body.get("msgtype", "")))
+    from_user = str(body.get("FromUserName", body.get("from_user_name", body.get("openid", ""))))
+    to_user = str(body.get("ToUserName", body.get("to_user_name", "")))
+    msg_id = str(body.get("MsgId", body.get("msg_id", "")))
+    content = str(body.get("Content", body.get("content", "")))
+    content_kind = "text"
+
+    if not content:
+        if msg_type == "event":
+            event = str(body.get("Event", body.get("event", "")))
+            event_key = str(body.get("EventKey", body.get("event_key", "")))
+            content = f"[事件: {event}]" + (f" {event_key}" if event_key else "")
+        elif msg_type == "image":
+            content = str(body.get("PicUrl", body.get("MediaId", ""))) or "[图片消息]"
+            content_kind = "image"
+        elif msg_type == "voice":
+            content = str(body.get("Recognition", body.get("MediaId", ""))) or "[语音消息]"
+            content_kind = "audio"
+        elif msg_type == "video":
+            content = str(body.get("MediaId", "")) or "[视频消息]"
+            content_kind = "video"
+        elif msg_type:
+            content = f"[微信消息: {msg_type}]"
+
+    if content and from_user:
+        push_inbox(
+            "wechat",
+            contact_id=from_user,
+            contact_name=from_user,
+            direction="inbound",
+            content=content,
+            content_type=content_kind,
+            metadata={
+                "msg_type": msg_type,
+                "to_user": to_user,
+                "msg_id": msg_id,
+                "raw": body,
+            },
+            msg_id=f"wechat:{msg_id}" if msg_id else None,
+        )
+        logger.info("微信 webhook 收到消息: from=%s, type=%s, content=%.100s", from_user, msg_type, content)
+
+    return Response(content="success", media_type="text/plain")
+
+
+# ---------------------------------------------------------------------------
 # 企微 Webhook 回调
 # ---------------------------------------------------------------------------
 
 
-@router.get("/webhook/wework")
-async def wecom_webhook_verify(
+@router.api_route("/webhook/wework", methods=["GET", "POST"])
+async def wecom_webhook_receive(
+    request: Request,
     msg_signature: str = "",
     timestamp: str = "",
     nonce: str = "",
     echostr: str = "",
 ):
-    """企微回调 URL 验证（GET）。
-
-    企微后台配置回调 URL 时，会发 GET 请求验证。
-    简化版：直接返回 echostr（生产环境应做签名校验）。
-    """
-    if echostr:
-        return int(echostr)
-    return {"success": True, "message": "wework webhook endpoint active"}
-
-
-@router.post("/webhook/wework")
-async def wecom_webhook_receive(request: Request):
-    """企微回调消息接收（POST）。
-
-    接收企微推送的消息/事件，写入 inbox。
-    企微消息体格式（XML，加密或明文）：
-    - 明文模式：直接解析 XML
-    - 加密模式：需用 EncodingAESKey 解密（本版本暂只支持明文/兼容模式）
-
-    企微回调数据格式（JSON）：
-    {
-      "ToUserName": "CorpID",
-      "FromUserName": "UserID",
-      "Content": "消息内容",
-      "MsgType": "text",
-      "CreateTime": 1234567890,
-      "MsgId": 1234567890123456,
-      "AgentID": 1
-    }
-    """
-    import uuid
-    from datetime import datetime, timezone
+    """企业微信数据回调：验签、AES 解密并写入统一收件箱。"""
+    from fastapi.responses import PlainTextResponse
 
     from app.services.message_store import push_inbox
-
-    content_type = request.headers.get("content-type", "")
+    from app.services.wework_suite import (
+        WeWorkSuiteError,
+        decrypt_callback,
+        parse_encrypted_xml,
+        parse_plain_event,
+        verify_signature,
+    )
 
     try:
-        if "json" in content_type:
-            body = await request.json()
-        elif "xml" in content_type or "text" in content_type:
-            raw = await request.body()
-            raw_text = raw.decode("utf-8", errors="replace")
-            # 简易 XML 解析
-            body = _parse_wecom_xml(raw_text)
-        else:
-            raw = await request.body()
-            raw_text = raw.decode("utf-8", errors="replace")
-            body = _parse_wecom_xml(raw_text) if "<xml>" in raw_text else {}
-    except Exception as exc:
-        logger.warning("企微 webhook 解析失败: %s", exc)
-        return "success"
+        if request.method == "GET":
+            verify_signature(msg_signature, timestamp, nonce, echostr)
+            return PlainTextResponse(decrypt_callback(echostr, validate_suite_id=False))
+
+        raw = await request.body()
+        encrypted = parse_encrypted_xml(raw)
+        verify_signature(msg_signature, timestamp, nonce, encrypted)
+        body = parse_plain_event(decrypt_callback(encrypted, validate_suite_id=False))
+    except WeWorkSuiteError as exc:
+        logger.warning("企微数据回调验签/解密失败: %s", exc)
+        return PlainTextResponse(str(exc), status_code=400)
 
     msg_type = body.get("MsgType", body.get("msgtype", ""))
     from_user = str(body.get("FromUserName", body.get("from_user_name", "")))
@@ -2534,7 +5170,7 @@ async def wecom_webhook_receive(request: Request):
         content = f"[事件: {event}]"
 
     if not content:
-        return "success"
+        return PlainTextResponse("success")
 
     # 写入 inbox
     push_inbox(
@@ -2553,16 +5189,28 @@ async def wecom_webhook_receive(request: Request):
     logger.info("企微 webhook 收到消息: from=%s, type=%s, content=%.100s", from_user, msg_type, content)
 
     # 企微要求返回 "success" 字符串
-    return "success"
+    return PlainTextResponse("success")
 
 
 def _parse_wecom_xml(xml_text: str) -> dict:
-    """简易企微 XML 解析（不依赖 lxml）。"""
+    """简易微信/企微 XML 解析（不依赖 lxml）。"""
     import re
+    import xml.etree.ElementTree as ET
+
     result: dict[str, str] = {}
+    try:
+        root = ET.fromstring(xml_text.strip())
+        for child in list(root):
+            result[str(child.tag)] = (child.text or "").strip()
+        if result:
+            return result
+    except Exception:
+        pass
+
     # 匹配 <Tag>value</Tag> 或 <Tag><![CDATA[value]]></Tag>
     pattern = re.compile(r"<(\w+)>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</\1>", re.DOTALL)
     for match in pattern.finditer(xml_text):
         key, value = match.group(1), match.group(2).strip()
-        result[key] = value
+        if key != "xml":
+            result[key] = value
     return result

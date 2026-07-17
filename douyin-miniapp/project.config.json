@@ -1,0 +1,15 @@
+{
+  "appid": "tt7e7708cae012a78501",
+  "projectname": "客来来在线客服",
+  "douyinProjectType": "native",
+  "miniprogramRoot": "./",
+  "setting": {
+    "urlCheck": true,
+    "es6": true,
+    "postcss": true,
+    "minified": true,
+    "newFeature": true,
+    "autoCompile": true,
+    "compileHotReLoad": true
+  }
+}

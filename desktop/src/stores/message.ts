@@ -7,7 +7,7 @@
  * 3. 错误静默：未读汇总不是关键数据，失败用旧值兜底
  */
 import { create } from "zustand";
-import { getUnreadSummary, markMessagesRead } from "../api/messages";
+import { getUnreadSummary, markMessagesRead, syncInboxMessages } from "../api/messages";
 import { useAuthStore } from "./auth";
 
 interface MessageState {
@@ -51,6 +51,9 @@ export const useMessageStore = create<MessageState>((set, get) => ({
     if (get().loading) return;
     set({ loading: true });
     try {
+      // 抖音 Webhook 落在公网 SSOT；先拉取并落到本地客户/消息库，
+      // 再统计未读，确保用户不进入消息页也能看到新消息徽标。
+      await syncInboxMessages("douyin", 50).catch(() => undefined);
       const summary = await getUnreadSummary();
       set({
         unreadTotal: summary.total,

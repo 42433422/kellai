@@ -662,20 +662,33 @@ export default function CustomerDetail() {
   /** 发送消息 */
   const handleSendMessage = useCallback(async () => {
     if (!messageInput.trim() || sendingMessage) return;
+    const channelMessage = [...messages]
+      .reverse()
+      .find((message) => message.channel_type === selectedChannel && message.contact_id);
+    if (!channelMessage?.contact_id) {
+      showToast('当前渠道缺少联系人标识，请先在消息中心选择已收信的客户');
+      return;
+    }
     setSendingMessage(true);
     try {
-      await sendMessage(customerId, selectedChannel, '', messageInput.trim());
+      await sendMessage(
+        customerId,
+        selectedChannel,
+        channelMessage.contact_id,
+        messageInput.trim(),
+        channelMessage.contact_name ?? '',
+      );
       setMessageInput('');
       setSuggestedReplies([]);
       showToast('消息已发送');
       loadCustomerData();
     } catch (err) {
       console.error('Failed to send message:', err);
-      showToast('发送失败，请重试');
+      showToast(err instanceof Error && err.message ? err.message : '发送失败，请重试');
     } finally {
       setSendingMessage(false);
     }
-  }, [messageInput, customerId, selectedChannel, sendingMessage, loadCustomerData, showToast]);
+  }, [messageInput, customerId, selectedChannel, sendingMessage, messages, loadCustomerData, showToast]);
 
   /** 更新 Pipeline 阶段 */
   const handleUpdateStage = useCallback(

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import os
 import sys
 from pathlib import Path
@@ -364,6 +365,38 @@ class TestWeComAdapter:
         assert send["success"] is False
         assert "API 发信还需" in send["error"]
 
+    async def test_customer_entry_redirect_uses_saved_kf_url(self):
+        from starlette.requests import Request
+
+        from app.api import routes
+        from app.channels import config_store
+
+        config_store.save(
+            "wework",
+            {"kf_url": "https://work.weixin.qq.com/kfid/kfcfd8a26b4a56f24ee"},
+            enabled=True,
+        )
+        req = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "scheme": "http",
+                "path": "/api/kellai/channels/wework/customer-entry",
+                "headers": [],
+                "server": ("127.0.0.1", 8793),
+                "client": ("127.0.0.1", 51234),
+            }
+        )
+
+        payload = routes.wework_customer_entry(req, source="poster_001", mode="json")
+        assert payload["success"] is True
+        assert payload["data"]["entry_url"].endswith("source=poster_001")
+        assert payload["data"]["target_url"] == "https://work.weixin.qq.com/kfid/kfcfd8a26b4a56f24ee"
+
+        redirect = routes.wework_customer_entry(req, source="poster_001")
+        assert redirect.status_code == 307
+        assert redirect.headers["location"] == "https://work.weixin.qq.com/kfid/kfcfd8a26b4a56f24ee"
+
     async def test_bot_webhook_send(self, monkeypatch):
         from app.channels.wecom import WeComAdapter
 
@@ -409,7 +442,7 @@ class TestWeComAdapter:
 
 
 # ---------------------------------------------------------------------------
-# WeChatAdapter（委托企微）
+# WeChatAdapter（微信开放平台 / 公众号 / Webhook）
 # ---------------------------------------------------------------------------
 
 
@@ -439,6 +472,53 @@ class TestWeChatAdapter:
             out = await a.send_message("@chat", "ping")
         assert out["success"] is True
         assert out["message_id"] == "wm-1"
+
+    async def test_oauth_authorized_config_marks_connected(self):
+        from app.channels import config_store
+        from app.channels.wechat import WeChatAdapter
+
+        config_store.save(
+            "wechat",
+            {
+                "app_id": "wx_open_app",
+                "app_secret": "sec",
+                "oauth_authorized": "true",
+                "oauth_openid": "openid_123",
+                "oauth_unionid": "union_123",
+            },
+            enabled=True,
+            connected=True,
+        )
+
+        out = await WeChatAdapter().test_connection()
+        assert out["connected"] is True
+        assert "OAuth 已授权" in out["message"]
+
+    async def test_customer_service_message_send(self):
+        from app.channels import config_store
+        from app.channels.wechat import WeChatAdapter, _WeChatOfficialClient
+
+        config_store.save(
+            "wechat",
+            {
+                "official_app_id": "wx_mp",
+                "official_app_secret": "mp_sec",
+            },
+            enabled=True,
+        )
+
+        async def fake_post_with_token(self, path, payload):
+            assert path == "/cgi-bin/message/custom/send"
+            assert payload["touser"] == "openid_123"
+            assert payload["msgtype"] == "text"
+            assert payload["text"]["content"] == "你好"
+            return {"errcode": 0, "errmsg": "ok", "msgid": "wx-msg-1"}
+
+        with patch.object(_WeChatOfficialClient, "post_with_token", fake_post_with_token):
+            out = await WeChatAdapter().send_message("openid_123", "你好")
+
+        assert out["success"] is True
+        assert out["message_id"] == "wx-msg-1"
 
 
 # ---------------------------------------------------------------------------
@@ -503,11 +583,62 @@ class TestChannelConfigStore:
         assert result["success"] is True
         wework = next(ch for ch in result["data"] if ch["type"] == "wework")
         assert wework["onboarding"]["recommended_mode"] == "scan"
-        assert "corp_id" in wework["onboarding"]["required_fields"]
+        assert wework["onboarding"]["required_fields"] == []
+        assert "corp_id" in wework["onboarding"]["optional_fields"]
         assert "测试连接" in {step["label"] for step in wework["onboarding"]["stages"]}
         douyin = next(ch for ch in result["data"] if ch["type"] == "douyin")
         assert douyin["onboarding"]["next_action"]
         assert douyin["onboarding"]["status"] in {"not_started", "saved", "connected"}
+
+    async def test_wework_oauth_initiate_returns_official_embed_payload(self):
+        from starlette.requests import Request
+
+        from app.api.routes import (
+            _wework_oauth_return_urls,
+            _wework_oauth_states,
+            wework_oauth_initiate,
+        )
+        from app.channels import config_store
+
+        _wework_oauth_states.clear()
+        _wework_oauth_return_urls.clear()
+        config_store.save(
+            "wework",
+            {"corp_id": "wwcorp123", "secret": "sec", "agent_id": "1000002"},
+            enabled=True,
+        )
+        request = Request({
+            "type": "http",
+            "method": "POST",
+            "path": "/api/kellai/channels/wework/oauth/initiate",
+            "scheme": "http",
+            "server": ("127.0.0.1", 8793),
+            "client": ("127.0.0.1", 50000),
+            "headers": [(b"host", b"127.0.0.1:8793"), (b"origin", b"http://127.0.0.1:5173")],
+        })
+
+        result = await wework_oauth_initiate(request)
+        data = result["data"]
+
+        assert data["embed_type"] == "ww_login"
+        assert data["script_url"].endswith("wwLogin-1.2.7.js")
+        assert data["ww_login"]["appid"] == "wwcorp123"
+        assert data["ww_login"]["agentid"] == "1000002"
+        assert "127.0.0.1%3A8793" in data["ww_login"]["redirect_uri"]
+        assert data["state"] in _wework_oauth_states
+        assert _wework_oauth_return_urls[data["state"]] == "http://127.0.0.1:5173/settings?tab=channels"
+
+    async def test_wework_oauth_status_unknown_state_does_not_mark_authorized(self):
+        import time
+
+        from app.api.routes import _wework_oauth_states, wework_oauth_status
+
+        _wework_oauth_states.clear()
+        assert (await wework_oauth_status("missing"))["data"] == {"authorized": False, "expired": True}
+
+        _wework_oauth_states["pending"] = time.time() + 60
+        pending = (await wework_oauth_status("pending"))["data"]
+        assert pending == {"authorized": False}
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +647,56 @@ class TestChannelConfigStore:
 
 
 class TestDouyinAdapter:
+    async def test_web_portal_contact_uses_desktop_sender(self, tmp_db):
+        from app.channels.base import UnifiedMessage
+        from app.channels.douyin import DouyinAdapter
+        from app.services import douyin_desktop_automation, message_store
+
+        message_store.save_message(
+            UnifiedMessage(
+                id="web-inbound-1",
+                customer_id=88,
+                channel_type="douyin",
+                contact_id="customer-open-id",
+                contact_name="真实客户",
+                direction="inbound",
+                content="你好",
+                content_type="text",
+                metadata={"source": "douyin_web_portal", "team_id": 7},
+                created_at="2026-07-16T12:00:00+00:00",
+            )
+        )
+        desktop_send = MagicMock(
+            return_value={
+                "success": True,
+                "message_id": "",
+                "source": "douyin_desktop_automation",
+                "message_sent": True,
+            }
+        )
+        with patch.object(
+            douyin_desktop_automation,
+            "automation_enabled",
+            return_value=True,
+        ), patch.object(
+            douyin_desktop_automation,
+            "send_message",
+            desktop_send,
+        ):
+            result = await DouyinAdapter().send_message(
+                "customer-open-id",
+                "桌面回复",
+                team_id=7,
+                customer_id=88,
+            )
+
+        assert result["success"] is True
+        desktop_send.assert_called_once_with(
+            contact_name="真实客户",
+            contact_id="customer-open-id",
+            content="桌面回复",
+        )
+
     async def test_unconfigured(self):
         from app.channels.douyin import DouyinAdapter
 
@@ -526,61 +707,1079 @@ class TestDouyinAdapter:
         out = await a.test_connection()
         assert out["connected"] is False
 
-    async def test_token_then_send(self, monkeypatch):
+    async def test_authorized_enterprise_account_then_send(self, monkeypatch):
+        from app.channels import douyin as douyin_module
         from app.channels.douyin import DouyinAdapter
 
         monkeypatch.setenv("KELLAI_DOUYIN_CLIENT_KEY", "ck")
         monkeypatch.setenv("KELLAI_DOUYIN_CLIENT_SECRET", "cs")
         a = DouyinAdapter()
 
-        # token 由 CachedToken 内部调用 _fetch_token 拿（不发 HTTP），send 走 client.post
-        async def fake_token():
-            return ("DT-1", 7200)
+        async def fake_access_context(team_id):
+            assert team_id == 7
+            return {"access_token": "ACT-1", "open_id": "owner-open-id"}
 
         send_resp = MagicMock(status_code=200)
         send_resp.json.return_value = {
-            "errcode": 0,
-            "errmsg": "ok",
-            "data": {"message_id": "DM-1"},
+            "data": {"error_code": 0, "server_msg_id": "DM-1"},
+            "extra": {"error_code": 0},
         }
         fake_client = AsyncMock()
         fake_client.post = AsyncMock(return_value=send_resp)
 
-        with patch.object(a, "_fetch_token", fake_token), \
+        with patch.object(douyin_module, "access_context", fake_access_context), \
              patch.object(a, "_get_client", AsyncMock(return_value=fake_client)):
-            out = await a.send_message("open_x", "hi")
+            out = await a.send_message("open_x", "hi", team_id=7)
         assert out["success"] is True
         assert out["message_id"] == "DM-1"
         assert fake_client.post.await_count == 1
         send_call = fake_client.post.await_args
-        assert "im/message/send" in send_call.args[0]
+        assert send_call.args[0] == "/enterprise/im/message/send/"
+        assert send_call.kwargs["params"] == {
+            "access_token": "ACT-1",
+            "open_id": "owner-open-id",
+        }
+        assert send_call.kwargs["json"]["to_user_id"] == "open_x"
+        assert send_call.kwargs["json"]["message_type"] == "text"
+        assert json.loads(send_call.kwargs["json"]["content"]) == {"text": "hi"}
 
-    async def test_saved_frontend_config_then_send(self):
-        from app.channels import config_store
+    async def test_saved_frontend_config_then_send(self, monkeypatch):
+        from app.channels import config_store, douyin as douyin_module
         from app.channels.douyin import DouyinAdapter
 
         config_store.save("douyin", {"app_id": "ck", "app_secret": "cs"}, enabled=True)
         a = DouyinAdapter()
 
-        async def fake_token():
-            return ("DT-2", 7200)
+        async def fake_access_context(team_id):
+            assert team_id == 8
+            return {"access_token": "ACT-2", "open_id": "owner-2"}
 
         send_resp = MagicMock(status_code=200)
         send_resp.json.return_value = {
-            "errcode": 0,
-            "errmsg": "ok",
-            "data": {"message_id": "DM-2"},
+            "data": {"error_code": 0, "server_msg_id": "DM-2"},
+            "extra": {"error_code": 0},
         }
         fake_client = AsyncMock()
         fake_client.post = AsyncMock(return_value=send_resp)
 
-        with patch.object(a, "_fetch_token", fake_token), \
+        with patch.object(douyin_module, "access_context", fake_access_context), \
              patch.object(a, "_get_client", AsyncMock(return_value=fake_client)):
-            out = await a.send_message("open_x", "hi")
+            out = await a.send_message("open_x", "hi", team_id=8)
 
         assert out["success"] is True
         token_call = fake_client.post.await_args_list[0]
-        assert token_call.kwargs["params"]["access_token"] == "DT-2"
+        assert token_call.kwargs["params"]["access_token"] == "ACT-2"
+
+    async def test_miniapp_private_message_reply_uses_business_token(self, monkeypatch):
+        from app.channels import douyin as douyin_module
+        from app.channels.douyin import DouyinAdapter
+
+        monkeypatch.setenv("KELLAI_DOUYIN_MINIAPP_APP_ID", "tt-miniapp")
+        monkeypatch.setenv("KELLAI_DOUYIN_MINIAPP_SECRET", "webhook-secret")
+
+        async def fake_business_token_context(**kwargs):
+            assert kwargs == {
+                "team_id": 7,
+                "owner_open_id": "owner-open-id",
+                "scope": "im.direct_message",
+            }
+            return {"business_token": "bus-token"}
+
+        send_resp = MagicMock(status_code=200)
+        send_resp.json.return_value = {
+            "data": {"error_code": 0, "description": ""},
+            "extra": {"error_code": 0, "description": ""},
+            "msg_id": "miniapp-message-1",
+        }
+        fake_client = AsyncMock()
+        fake_client.post = AsyncMock(return_value=send_resp)
+        adapter = DouyinAdapter()
+        reply_context = {
+            "event": "im_receive_msg",
+            "team_id": 7,
+            "owner_open_id": "owner-open-id",
+            "miniapp_app_id": "tt-miniapp",
+            "conversation_id": "conversation-1",
+            "server_message_id": "inbound-message-1",
+        }
+
+        with patch.object(
+            douyin_module,
+            "business_token_context",
+            fake_business_token_context,
+        ), patch.object(
+            adapter,
+            "_get_client",
+            AsyncMock(return_value=fake_client),
+        ):
+            result = await adapter.send_message(
+                "customer-open-id",
+                "你好",
+                team_id=7,
+                customer_id=88,
+                reply_context=reply_context,
+            )
+
+        assert result["success"] is True
+        assert result["message_id"] == "miniapp-message-1"
+        call = fake_client.post.await_args
+        assert call.args[0] == "/im/send/msg/"
+        assert call.kwargs["params"] == {"open_id": "owner-open-id"}
+        assert call.kwargs["headers"]["access-token"] == "bus-token"
+        assert call.kwargs["json"] == {
+            "content": {"msg_type": 1, "text": {"text": "你好"}},
+            "to_user_id": "customer-open-id",
+            "msg_id": "inbound-message-1",
+            "conversation_id": "conversation-1",
+            "scene": "im_reply_msg",
+        }
+
+    async def test_remote_miniapp_reply_forwards_webhook_context(self, monkeypatch):
+        from app.channels import douyin as douyin_module
+        from app.channels.douyin import DouyinAdapter
+
+        reply_context = {
+            "event": "im_receive_msg",
+            "team_id": 7,
+            "owner_open_id": "owner-open-id",
+            "miniapp_app_id": "tt-miniapp",
+            "conversation_id": "conversation-1",
+            "server_message_id": "inbound-message-1",
+        }
+        remote_send = AsyncMock(
+            return_value={"success": True, "message_id": "remote-message-1", "error": ""}
+        )
+        with patch.object(douyin_module, "remote_bridge_enabled", return_value=True), \
+             patch.object(douyin_module, "remote_send_message", remote_send):
+            result = await DouyinAdapter().send_message(
+                "customer-open-id",
+                "远端回复",
+                team_id=7,
+                customer_id=88,
+                reply_context=reply_context,
+            )
+
+        assert result["success"] is True
+        remote_send.assert_awaited_once_with(
+            team_id=7,
+            contact_id="customer-open-id",
+            content="远端回复",
+            persona_id="",
+            customer_id=88,
+            reply_context=reply_context,
+        )
+
+    async def test_client_token_uses_official_grant_type(self, monkeypatch):
+        from app.channels.douyin import DouyinAdapter
+
+        monkeypatch.setenv("KELLAI_DOUYIN_CLIENT_KEY", "ck")
+        monkeypatch.setenv("KELLAI_DOUYIN_CLIENT_SECRET", "cs")
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "data": {
+                "access_token": "client-token",
+                "expires_in": 7200,
+                "error_code": 0,
+            }
+        }
+        fake_client = AsyncMock()
+        fake_client.post = AsyncMock(return_value=response)
+        adapter = DouyinAdapter()
+        with patch.object(adapter, "_get_client", AsyncMock(return_value=fake_client)):
+            token, ttl = await adapter._fetch_client_token()
+        assert (token, ttl) == ("client-token", 7200)
+        assert fake_client.post.await_args.kwargs["json"]["grant_type"] == "client_credential"
+
+    async def test_app_credentials_are_verified_before_authorization(self, tmp_db):
+        from app.services import douyin_channel
+
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "data": {
+                "access_token": "client-token",
+                "expires_in": 7200,
+                "error_code": 0,
+            }
+        }
+        fake_client = AsyncMock()
+        fake_client.__aenter__.return_value = fake_client
+        fake_client.__aexit__.return_value = False
+        fake_client.post = AsyncMock(return_value=response)
+
+        with patch.object(douyin_channel.httpx, "AsyncClient", return_value=fake_client):
+            result = await douyin_channel.validate_app_credentials(
+                next_client_key="real-client-key",
+                next_client_secret="real-client-secret",
+            )
+
+        assert result["credentials_valid"] is True
+        call = fake_client.post.await_args
+        assert call.args[0].endswith("/oauth/client_token/")
+        assert call.kwargs["json"] == {
+            "client_key": "real-client-key",
+            "client_secret": "real-client-secret",
+            "grant_type": "client_credential",
+        }
+
+    async def test_miniapp_business_token_is_encrypted_and_cached(
+        self,
+        tmp_db,
+        monkeypatch,
+    ):
+        from app.services import douyin_channel
+
+        monkeypatch.setenv("KELLAI_DOUYIN_MINIAPP_APP_ID", "tt-miniapp")
+        monkeypatch.setenv("KELLAI_DOUYIN_MINIAPP_SECRET", "webhook-secret")
+        monkeypatch.setenv("KELLAI_DOUYIN_STORAGE_KEY", "storage-key")
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "biz_token": "business-token",
+            "biz_expires_in": 2592000,
+            "biz_refresh_token": "business-refresh-token",
+            "biz_refresh_expires_in": 31536000,
+        }
+        fake_client = AsyncMock()
+        fake_client.__aenter__.return_value = fake_client
+        fake_client.__aexit__.return_value = False
+        fake_client.post = AsyncMock(return_value=response)
+
+        with patch.object(douyin_channel.httpx, "AsyncClient", return_value=fake_client):
+            first = await douyin_channel.business_token_context(
+                team_id=7,
+                owner_open_id="owner-open-id",
+            )
+            second = await douyin_channel.business_token_context(
+                team_id=7,
+                owner_open_id="owner-open-id",
+            )
+
+        assert first["business_token"] == "business-token"
+        assert second["business_token"] == "business-token"
+        assert fake_client.post.await_count == 1
+        call = fake_client.post.await_args
+        assert call.args[0].endswith("/oauth/business_token/")
+        assert call.kwargs["json"] == {
+            "client_key": "tt-miniapp",
+            "client_secret": "webhook-secret",
+            "open_id": "owner-open-id",
+            "scope": "im.direct_message",
+        }
+        with douyin_channel._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT token_enc, refresh_token_enc
+                FROM kellai_douyin_business_tokens
+                WHERE team_id = 7 AND open_id = 'owner-open-id'
+                """
+            ).fetchone()
+        assert row["token_enc"] != "business-token"
+        assert row["refresh_token_enc"] != "business-refresh-token"
+
+    async def test_oauth_tokens_are_encrypted_and_team_scoped(self, tmp_db, monkeypatch):
+        from app.services import douyin_channel
+
+        monkeypatch.setenv("KELLAI_DOUYIN_CLIENT_KEY", "ck")
+        monkeypatch.setenv("KELLAI_DOUYIN_CLIENT_SECRET", "cs")
+        monkeypatch.setenv("KELLAI_DOUYIN_STORAGE_KEY", "storage-key")
+        monkeypatch.setenv("KELLAI_PUBLIC_BASE_URL", "https://kellai.example")
+
+        initiated = douyin_channel.create_oauth_url(team_id=11, user_id=22)
+        assert initiated["url"].startswith("https://open.douyin.com/platform/oauth/connect/")
+        assert initiated["scopes"] == ["trial.whitelist", "user_info"]
+        assert initiated["callback_url"].endswith("/api/kellai/channels/douyin/oauth/callback")
+        assert initiated["webhook_url"].endswith("/api/kellai/webhook/douyin")
+
+        token_response = MagicMock(status_code=200)
+        token_response.json.return_value = {
+            "data": {
+                "error_code": 0,
+                "access_token": "user-access-token",
+                "refresh_token": "user-refresh-token",
+                "open_id": "owner-open-id",
+                "scope": "user_info,im.direct_message",
+                "expires_in": 1296000,
+                "refresh_expires_in": 2592000,
+            },
+            "message": "success",
+        }
+        user_response = MagicMock(status_code=200)
+        user_response.json.return_value = {
+            "data": {
+                "error_code": 0,
+                "open_id": "owner-open-id",
+                "nickname": "测试企业号",
+                "avatar": "https://example/avatar.png",
+            }
+        }
+
+        fake_client = AsyncMock()
+        fake_client.__aenter__.return_value = fake_client
+        fake_client.__aexit__.return_value = False
+        fake_client.post = AsyncMock(return_value=token_response)
+        fake_client.get = AsyncMock(return_value=user_response)
+
+        with patch.object(douyin_channel.httpx, "AsyncClient", return_value=fake_client):
+            completed = await douyin_channel.complete_oauth(
+                state=initiated["state"],
+                code="oauth-code",
+            )
+        assert completed["authorized"] is True
+        assert completed["team_id"] == 11
+        assert completed["nickname"] == "测试企业号"
+
+        auth = douyin_channel.get_authorization(11, include_tokens=True)
+        assert auth is not None
+        assert auth["access_token"] == "user-access-token"
+        assert auth["refresh_token"] == "user-refresh-token"
+        with douyin_channel._conn() as conn:
+            row = conn.execute(
+                "SELECT access_token_enc, refresh_token_enc FROM kellai_douyin_authorizations WHERE team_id = 11"
+            ).fetchone()
+        assert row["access_token_enc"] != "user-access-token"
+        assert row["refresh_token_enc"] != "user-refresh-token"
+        status = douyin_channel.get_oauth_status(state=initiated["state"], team_id=11)
+        assert status["authorized"] is True
+        assert status["nickname"] == "测试企业号"
+
+    async def test_remote_app_credentials_are_encrypted(self, tmp_db, monkeypatch):
+        from app.services import douyin_channel
+
+        for key in (
+            "KELLAI_DOUYIN_CLIENT_KEY",
+            "KELLAI_DOUYIN_CLIENT_SECRET",
+            "KELLAI_DOUYIN_APP_ID",
+            "KELLAI_DOUYIN_APP_SECRET",
+            "KELLAI_DOUYIN_STORAGE_KEY",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("KELLAI_WECOM_BRIDGE_KEY", "shared-public-bridge-key")
+        monkeypatch.setenv("KELLAI_PUBLIC_BASE_URL", "https://kellai.example")
+
+        result = douyin_channel.save_app_config(
+            next_client_key="remote-client-key",
+            next_client_secret="remote-client-secret",
+            next_miniapp_app_id="tt-miniapp",
+            next_miniapp_secret="miniapp-webhook-secret",
+        )
+        assert result["configured"] is True
+        assert douyin_channel.client_key() == "remote-client-key"
+        assert douyin_channel.client_secret() == "remote-client-secret"
+        assert douyin_channel.miniapp_app_id() == "tt-miniapp"
+        assert douyin_channel.miniapp_secret() == "miniapp-webhook-secret"
+        with douyin_channel._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT client_secret_enc, miniapp_secret_enc
+                FROM kellai_douyin_app_config
+                WHERE id = 1
+                """
+            ).fetchone()
+        assert row["client_secret_enc"] != "remote-client-secret"
+        assert row["miniapp_secret_enc"] != "miniapp-webhook-secret"
+
+    async def test_douyin_remote_config_is_not_persisted_in_plaintext(self, monkeypatch):
+        from app.api import routes
+        from app.channels import config_store
+
+        async def fake_remote_save(
+            *,
+            next_client_key,
+            next_client_secret,
+            next_miniapp_app_id="",
+            next_miniapp_secret="",
+        ):
+            assert next_client_key == "client-key"
+            assert next_client_secret == "client-secret"
+            assert next_miniapp_app_id == ""
+            assert next_miniapp_secret == ""
+            return {
+                "configured": True,
+                "client_key": "client-key",
+                "secret_configured": True,
+                "miniapp_app_id": "",
+                "miniapp_secret_configured": False,
+            }
+
+        with patch("app.services.douyin_channel.remote_bridge_enabled", return_value=True), \
+             patch("app.services.douyin_channel.remote_save_app_config", fake_remote_save):
+            result = await routes.update_channel_config(
+                "douyin",
+                routes.ChannelConfigUpdate(
+                    config={"app_id": "client-key", "app_secret": "client-secret"},
+                    enabled=True,
+                ),
+            )
+        assert result["success"] is True
+        saved = config_store.get("douyin")
+        assert saved["config"]["app_id"] == "client-key"
+        assert saved["config"]["app_secret"] == ""
+        assert saved["config"]["remote_credentials_configured"] == "true"
+        assert "client-secret" not in json.dumps(saved, ensure_ascii=False)
+
+    async def test_channel_list_refreshes_remote_douyin_authorization(self):
+        from starlette.requests import Request
+
+        from app.api import routes
+        from app.channels import config_store
+
+        config_store.save(
+            "douyin",
+            {
+                "app_id": "client-key",
+                "app_secret": "",
+                "remote_credentials_configured": "true",
+            },
+            enabled=True,
+            connected=False,
+        )
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/api/kellai/channels",
+                "headers": [],
+                "query_string": b"",
+                "state": {"user": {"id": 22, "team_id": 11}},
+            }
+        )
+
+        async def fake_remote_status(team_id):
+            assert team_id == 11
+            return {"connected": True, "message": "抖音企业号已授权：测试企业号"}
+
+        with patch("app.services.douyin_channel.remote_bridge_enabled", return_value=True), \
+             patch("app.services.douyin_channel.remote_connection_status", fake_remote_status):
+            result = await routes.list_channels(request)
+
+        douyin = next(row for row in result["data"] if row["type"] == "douyin")
+        assert douyin["connected"] is True
+        assert douyin["message"] == "抖音企业号已授权：测试企业号"
+        assert config_store.get("douyin")["connected"] is True
+
+    async def test_signed_webhook_queues_real_private_message(self, tmp_db, monkeypatch):
+        import hashlib
+        import json as json_module
+
+        from fastapi import BackgroundTasks
+        from starlette.requests import Request
+
+        from app.api import routes
+        from app.services import douyin_channel, message_store
+
+        monkeypatch.setenv("KELLAI_DOUYIN_CLIENT_KEY", "ck")
+        monkeypatch.setenv("KELLAI_DOUYIN_CLIENT_SECRET", "cs")
+        monkeypatch.setenv("KELLAI_DOUYIN_STORAGE_KEY", "storage-key")
+        with douyin_channel._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO kellai_douyin_authorizations
+                    (team_id, client_key, open_id, nickname, avatar, scope,
+                     access_token_enc, refresh_token_enc, access_token_expires_at,
+                     refresh_token_expires_at, updated_at)
+                VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    11,
+                    "ck",
+                    "owner-open-id",
+                    "测试企业号",
+                    "user_info,im.direct_message",
+                    douyin_channel._encrypt("access"),
+                    douyin_channel._encrypt("refresh"),
+                    4102444800,
+                    4102444800,
+                    "2026-07-16T00:00:00+00:00",
+                ),
+            )
+
+        payload = {
+            "event": "im_send_msg",
+            "client_key": "ck",
+            "from_user_id": "customer-open-id",
+            "to_user_id": "owner-open-id",
+            "content": json_module.dumps(
+                {
+                    "conversation_short_id": "conversation-1",
+                    "server_message_id": "server-message-1",
+                    "message_type": "text",
+                    "text": "我想了解套餐和价格",
+                    "user_infos": [
+                        {"open_id": "customer-open-id", "nick_name": "抖音客户"},
+                        {"open_id": "owner-open-id", "nick_name": "测试企业号"},
+                    ],
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        }
+        raw = json_module.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+        signature = hashlib.sha1(b"cs" + raw).hexdigest()
+        sent = False
+
+        async def receive():
+            nonlocal sent
+            if sent:
+                return {"type": "http.disconnect"}
+            sent = True
+            return {"type": "http.request", "body": raw, "more_body": False}
+
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/kellai/webhook/douyin",
+                "headers": [
+                    (b"x-douyin-signature", signature.encode()),
+                    (b"msg-id", b"delivery-1"),
+                ],
+                "query_string": b"",
+                "scheme": "https",
+                "server": ("kellai.example", 443),
+                "client": ("127.0.0.1", 10000),
+            },
+            receive,
+        )
+        background = BackgroundTasks()
+        sync_mock = AsyncMock(return_value={"success": True})
+        with patch.object(routes, "sync_channel_inbox", sync_mock):
+            result = await routes.douyin_webhook_receive(request, background)
+            await background()
+
+        assert result["success"] is True
+        assert result["data"]["direction"] == "inbound"
+        inbox = message_store.list_inbox("douyin", limit=10)
+        assert len(inbox) == 1
+        assert inbox[0]["contact_id"] == "customer-open-id"
+        assert inbox[0]["contact_name"] == "抖音客户"
+        assert inbox[0]["content"] == "我想了解套餐和价格"
+        assert inbox[0]["metadata"]["team_id"] == 11
+        sync_mock.assert_awaited_once()
+
+    async def test_miniapp_customer_service_webhook_routes_to_bound_team(self, tmp_db, monkeypatch):
+        import hashlib
+        import json as json_module
+
+        from fastapi import BackgroundTasks
+        from starlette.requests import Request
+
+        from app.api import routes
+        from app.services import douyin_channel, message_store
+
+        monkeypatch.setenv("KELLAI_DOUYIN_CLIENT_KEY", "website-client-key")
+        monkeypatch.setenv("KELLAI_DOUYIN_CLIENT_SECRET", "website-client-secret")
+        monkeypatch.setenv("KELLAI_DOUYIN_MINIAPP_APP_ID", "tt7e7708cae012a78501")
+        monkeypatch.setenv("KELLAI_DOUYIN_MINIAPP_SECRET", "miniapp-secret")
+        monkeypatch.setenv("KELLAI_DOUYIN_STORAGE_KEY", "storage-key")
+        with douyin_channel._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO kellai_douyin_authorizations
+                    (team_id, client_key, open_id, nickname, avatar, scope,
+                     access_token_enc, refresh_token_enc, access_token_expires_at,
+                     refresh_token_expires_at, updated_at)
+                VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    39,
+                    "website-client-key",
+                    "website-owner-open-id",
+                    "测试企业号",
+                    "trial.whitelist,user_info",
+                    douyin_channel._encrypt("access"),
+                    douyin_channel._encrypt("refresh"),
+                    4102444800,
+                    4102444800,
+                    "2026-07-16T00:00:00+00:00",
+                ),
+            )
+
+        payload = {
+            "event": "customer_service_message",
+            "app_id": "tt7e7708cae012a78501",
+            "content": json_module.dumps(
+                {
+                    "server_message_id": "miniapp-message-1",
+                    "c_open_id": "miniapp-customer-open-id",
+                    "msg_type": "text",
+                    "msg_content": {"text": "小程序里咨询客服"},
+                    "user_infos": [
+                        {"c_open_id": "miniapp-customer-open-id", "nick_name": "小程序客户"}
+                    ],
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        }
+        raw = json_module.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+        signature = hashlib.sha1(b"miniapp-secret" + raw).hexdigest()
+        sent = False
+
+        async def receive():
+            nonlocal sent
+            if sent:
+                return {"type": "http.disconnect"}
+            sent = True
+            return {"type": "http.request", "body": raw, "more_body": False}
+
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/kellai/webhook/douyin",
+                "headers": [(b"x-douyin-signature", signature.encode())],
+                "query_string": b"",
+                "scheme": "https",
+                "server": ("kellai.example", 443),
+                "client": ("127.0.0.1", 10000),
+            },
+            receive,
+        )
+        background = BackgroundTasks()
+        sync_mock = AsyncMock(return_value={"success": True})
+        with patch.object(routes, "sync_channel_inbox", sync_mock):
+            result = await routes.douyin_webhook_receive(request, background)
+            await background()
+
+        assert result["success"] is True
+        assert result["data"]["direction"] == "inbound"
+        inbox = message_store.list_inbox("douyin", limit=10)
+        assert len(inbox) == 1
+        assert inbox[0]["contact_id"] == "miniapp-customer-open-id"
+        assert inbox[0]["contact_name"] == "小程序客户"
+        assert inbox[0]["content"] == "小程序里咨询客服"
+        assert inbox[0]["metadata"]["team_id"] == 39
+        assert inbox[0]["metadata"]["miniapp_app_id"] == "tt7e7708cae012a78501"
+        sync_mock.assert_awaited_once()
+
+    async def test_remote_inbox_is_acknowledged_only_after_team_delivery(self, tmp_db):
+        from app.services import douyin_channel, message_store
+
+        team_11_id = message_store.push_inbox(
+            "douyin",
+            contact_id="customer-11",
+            contact_name="团队11客户",
+            direction="inbound",
+            content="团队11消息",
+            metadata={"team_id": 11},
+            msg_id="douyin:team-11-message",
+        )
+        team_12_id = message_store.push_inbox(
+            "douyin",
+            contact_id="customer-12",
+            contact_name="团队12客户",
+            direction="inbound",
+            content="团队12消息",
+            metadata={"team_id": 12},
+            msg_id="douyin:team-12-message",
+        )
+
+        pulled = douyin_channel.pull_team_inbox(11, limit=10)
+        assert [row["id"] for row in pulled] == [team_11_id]
+        assert {row["id"] for row in message_store.list_inbox("douyin", limit=10)} == {
+            team_11_id,
+            team_12_id,
+        }
+
+        assert douyin_channel.ack_team_inbox(12, [team_11_id]) == 0
+        assert douyin_channel.ack_team_inbox(11, [team_11_id]) == 1
+        assert [row["id"] for row in message_store.list_inbox("douyin", limit=10)] == [
+            team_12_id
+        ]
+
+    async def test_group_webhook_is_aggregated_by_conversation(self, tmp_db, monkeypatch):
+        import hashlib
+        import json as json_module
+
+        from fastapi import BackgroundTasks
+        from starlette.requests import Request
+
+        from app.api import routes
+        from app.services import douyin_channel, message_store
+
+        monkeypatch.setenv("KELLAI_DOUYIN_CLIENT_KEY", "ck")
+        monkeypatch.setenv("KELLAI_DOUYIN_CLIENT_SECRET", "cs")
+        monkeypatch.setenv("KELLAI_DOUYIN_STORAGE_KEY", "storage-key")
+        with douyin_channel._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO kellai_douyin_authorizations
+                    (team_id, client_key, open_id, nickname, avatar, scope,
+                     access_token_enc, refresh_token_enc, access_token_expires_at,
+                     refresh_token_expires_at, updated_at)
+                VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    11,
+                    "ck",
+                    "owner-open-id",
+                    "测试企业号",
+                    "user_info,im.direct_message,im.group_fans.create_list",
+                    douyin_channel._encrypt("access"),
+                    douyin_channel._encrypt("refresh"),
+                    4102444800,
+                    4102444800,
+                    "2026-07-16T00:00:00+00:00",
+                ),
+            )
+
+        group_id = "@group-conversation-1"
+        payload = {
+            "event": "im_group_receive_msg",
+            "client_key": "ck",
+            "from_user_id": "customer-open-id",
+            "to_user_id": "owner-open-id",
+            "content": json_module.dumps(
+                {
+                    "conversation_short_id": group_id,
+                    "server_message_id": "group-message-1",
+                    "conversation_type": 2,
+                    "message_type": "text",
+                    "text": "群里想了解套餐",
+                    "group_info": {"group_name": "华东客户交流群"},
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        }
+        raw = json_module.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+        signature = hashlib.sha1(b"cs" + raw).hexdigest()
+        sent = False
+
+        async def receive():
+            nonlocal sent
+            if sent:
+                return {"type": "http.disconnect"}
+            sent = True
+            return {"type": "http.request", "body": raw, "more_body": False}
+
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/kellai/webhook/douyin",
+                "headers": [(b"x-douyin-signature", signature.encode())],
+                "query_string": b"",
+                "scheme": "https",
+                "server": ("kellai.example", 443),
+                "client": ("127.0.0.1", 10000),
+            },
+            receive,
+        )
+        with patch.object(routes, "sync_channel_inbox", AsyncMock(return_value={"success": True})):
+            result = await routes.douyin_webhook_receive(request, BackgroundTasks())
+
+        assert result["data"]["direction"] == "inbound"
+        inbox = message_store.list_inbox("douyin", limit=10)
+        assert inbox[0]["contact_id"] == f"group:{group_id}"
+        assert inbox[0]["contact_name"] == "华东客户交流群"
+        assert inbox[0]["metadata"]["is_group"] is True
+        assert inbox[0]["content"] == "群里想了解套餐"
+
+
+class TestWorkforceRouting:
+    @staticmethod
+    def _seed_team_members():
+        from app.services import auth
+
+        auth.ensure_auth_schema()
+        now = "2026-07-16T00:00:00+00:00"
+        with auth._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO kellai_teams
+                    (id, name, owner_id, invite_code, settings_json, created_at, updated_at)
+                VALUES (1, '接待团队', 1, 'TEAM1', '{}', ?, ?)
+                """,
+                (now, now),
+            )
+            conn.executemany(
+                """
+                INSERT INTO kellai_users
+                    (id, email, phone, password_hash, display_name, avatar_url,
+                     team_id, role, is_active, token_version, created_at, updated_at)
+                VALUES (?, ?, '', '', ?, '', 1, ?, 1, 0, ?, ?)
+                """,
+                [
+                    (1, "owner@example.com", "主管", "owner", now, now),
+                    (2, "sales-a@example.com", "销售A", "sales", now, now),
+                    (3, "sales-b@example.com", "销售B", "sales", now, now),
+                ],
+            )
+
+    async def test_idle_online_member_is_preferred_and_claim_is_atomic(self, tmp_db):
+        from app.services import workforce_routing
+        from app.services.pipeline import create_customer
+
+        self._seed_team_members()
+        workforce_routing.heartbeat(team_id=1, user_id=2, state="online")
+        workforce_routing.heartbeat(team_id=1, user_id=3, state="online")
+
+        first = create_customer({"name": "客户A", "team_id": 1})
+        first["team_id"] = 1
+        from app.services.pipeline import save_pipeline
+        save_pipeline(first)
+        workforce_routing.assign_customer(
+            customer_id=int(first["customer_id"]),
+            team_id=1,
+            assignee_user_id=2,
+            actor_user_id=1,
+            source="manager",
+        )
+
+        second = create_customer({"name": "客户B"})
+        second["team_id"] = 1
+        save_pipeline(second)
+        assignment = workforce_routing.auto_assign_customer(
+            customer_id=int(second["customer_id"]),
+            team_id=1,
+        )
+        assert assignment is not None
+        assert assignment["assignee_user_id"] == 3
+        assert assignment["source"] == "auto_route"
+
+        with pytest.raises(workforce_routing.AssignmentConflict):
+            workforce_routing.claim_customer(
+                customer_id=int(second["customer_id"]),
+                team_id=1,
+                user_id=2,
+            )
+        assert workforce_routing.assignment_for_customer(
+            int(second["customer_id"])
+        )["assignee_user_id"] == 3
+
+    async def test_inbound_message_auto_assigns_and_syncs_owner(self, tmp_db):
+        from app.channels.base import UnifiedMessage
+        from app.services import message_store, workforce_routing
+        from app.services.pipeline import load_pipeline
+
+        self._seed_team_members()
+        workforce_routing.heartbeat(team_id=1, user_id=2, state="online")
+        saved = message_store.save_message(
+            UnifiedMessage(
+                id="workforce-inbound-1",
+                customer_id=0,
+                channel_type="douyin",
+                contact_id="customer-open-id",
+                contact_name="自动分配客户",
+                direction="inbound",
+                content="我想了解价格",
+                content_type="text",
+                metadata={"team_id": 1, "source": "douyin_webhook"},
+                created_at="2026-07-16T00:00:00+00:00",
+            )
+        )
+
+        assignment = workforce_routing.assignment_for_customer(saved.customer_id)
+        assert assignment is not None
+        assert assignment["assignee_user_id"] == 2
+        doc = load_pipeline(saved.customer_id)
+        assert doc["team_id"] == 1
+        assert doc["owner"] == "销售A"
+
+    async def test_douyin_unified_workspace_assignment_acceptance(
+        self,
+        tmp_db,
+        monkeypatch,
+    ):
+        """私聊/群消息、空闲优先、管理改派与抢单锁必须形成同一闭环。"""
+        import hashlib
+        import json as json_module
+
+        from fastapi import BackgroundTasks, HTTPException
+        from starlette.requests import Request
+
+        from app.api import routes
+        from app.services import douyin_channel, message_store, workforce_routing
+        from app.services.pipeline import create_customer, save_pipeline
+
+        self._seed_team_members()
+        monkeypatch.setenv("KELLAI_DOUYIN_CLIENT_KEY", "acceptance-client-key")
+        monkeypatch.setenv("KELLAI_DOUYIN_CLIENT_SECRET", "acceptance-client-secret")
+        monkeypatch.setenv("KELLAI_DOUYIN_STORAGE_KEY", "acceptance-storage-key")
+        monkeypatch.delenv("KELLAI_DOUYIN_REMOTE_BASE_URL", raising=False)
+        monkeypatch.delenv("KELLAI_DOUYIN_BRIDGE_SERVER", raising=False)
+
+        with douyin_channel._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO kellai_douyin_authorizations
+                    (team_id, client_key, open_id, nickname, avatar, scope,
+                     access_token_enc, refresh_token_enc, access_token_expires_at,
+                     refresh_token_expires_at, updated_at)
+                VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    1,
+                    "acceptance-client-key",
+                    "business-open-id",
+                    "验收企业号",
+                    "user_info,im.direct_message,im.group_fans.create_list",
+                    douyin_channel._encrypt("access-token"),
+                    douyin_channel._encrypt("refresh-token"),
+                    4102444800,
+                    4102444800,
+                    "2026-07-16T00:00:00+00:00",
+                ),
+            )
+
+        workforce_routing.heartbeat(team_id=1, user_id=2, state="online")
+        workforce_routing.heartbeat(team_id=1, user_id=3, state="online")
+
+        existing = create_customer({"name": "销售A现有客户", "team_id": 1})
+        existing["team_id"] = 1
+        save_pipeline(existing)
+        workforce_routing.assign_customer(
+            customer_id=int(existing["customer_id"]),
+            team_id=1,
+            assignee_user_id=2,
+            actor_user_id=1,
+            source="manager",
+        )
+
+        async def deliver(payload: dict[str, object]) -> None:
+            raw = json_module.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode()
+            signature = hashlib.sha1(b"acceptance-client-secret" + raw).hexdigest()
+            sent = False
+
+            async def receive():
+                nonlocal sent
+                if sent:
+                    return {"type": "http.disconnect"}
+                sent = True
+                return {"type": "http.request", "body": raw, "more_body": False}
+
+            request = Request(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/api/kellai/webhook/douyin",
+                    "headers": [(b"x-douyin-signature", signature.encode())],
+                    "query_string": b"",
+                    "scheme": "https",
+                    "server": ("kellai.example", 443),
+                    "client": ("127.0.0.1", 10000),
+                },
+                receive,
+            )
+            result = await routes.douyin_webhook_receive(request, BackgroundTasks())
+            assert result["success"] is True
+            assert result["data"]["direction"] == "inbound"
+
+        await deliver(
+            {
+                "event": "im_receive_msg",
+                "client_key": "acceptance-client-key",
+                "from_user_id": "private-customer-open-id",
+                "to_user_id": "business-open-id",
+                "content": json_module.dumps(
+                    {
+                        "server_message_id": "acceptance-private-1",
+                        "message_type": "text",
+                        "text": "私聊咨询企业套餐",
+                        "user_infos": [
+                            {
+                                "open_id": "private-customer-open-id",
+                                "nick_name": "私聊客户",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            }
+        )
+        await deliver(
+            {
+                "event": "im_group_receive_msg",
+                "client_key": "acceptance-client-key",
+                "from_user_id": "group-member-open-id",
+                "to_user_id": "business-open-id",
+                "content": json_module.dumps(
+                    {
+                        "conversation_short_id": "@acceptance-group",
+                        "server_message_id": "acceptance-group-1",
+                        "conversation_type": 2,
+                        "message_type": "text",
+                        "text": "群里咨询部署周期",
+                        "group_info": {"group_name": "抖音客户交流群"},
+                        "user_infos": [
+                            {
+                                "open_id": "group-member-open-id",
+                                "nick_name": "群成员",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            }
+        )
+
+        synced = await routes.sync_channel_inbox(
+            routes.ChannelSyncInboxBody(channel_type="douyin", limit=20)
+        )
+        assert synced["data"]["synced"] == 2
+        assert synced["data"]["consumed"] == 2
+        saved = synced["data"]["messages"]
+        private_message = next(
+            row for row in saved if not bool(row["metadata"].get("is_group"))
+        )
+        group_message = next(
+            row for row in saved if bool(row["metadata"].get("is_group"))
+        )
+
+        private_assignment = workforce_routing.assignment_for_customer(
+            int(private_message["customer_id"])
+        )
+        group_assignment = workforce_routing.assignment_for_customer(
+            int(group_message["customer_id"])
+        )
+        assert private_assignment is not None
+        assert private_assignment["source"] == "douyin_inbound"
+        assert group_assignment is not None
+        assert group_assignment["source"] == "douyin_inbound"
+        assert {
+            private_assignment["assignee_user_id"],
+            group_assignment["assignee_user_id"],
+        } == {2, 3}
+        assert group_message["contact_id"] == "group:@acceptance-group"
+        assert group_message["contact_name"] == "抖音客户交流群"
+
+        manager = {"id": 1, "team_id": 1, "role": "owner"}
+        reassigned = routes.workforce_assign_customer(
+            int(private_message["customer_id"]),
+            routes.WorkforceAssignBody(assignee_user_id=2),
+            manager,
+        )
+        assert reassigned["data"]["assignment"]["assignee_user_id"] == 2
+        assert reassigned["data"]["assignment"]["source"] == "manager"
+
+        with pytest.raises(HTTPException) as conflict:
+            routes.workforce_claim_customer(
+                int(private_message["customer_id"]),
+                {"id": 3, "team_id": 1, "role": "sales"},
+            )
+        assert conflict.value.status_code == 409
+
+        workspace_rows = message_store.get_messages_with_state(
+            int(private_message["customer_id"])
+        )
+        assert workspace_rows[0]["content"] == "私聊咨询企业套餐"
+        assert workspace_rows[0]["assignee_user_id"] == 2
+        assert workspace_rows[0]["assignee_name"] == "销售A"
+        assert workspace_rows[0]["assignment_status"] == "assigned"
+        assert message_store.get_unread_count(int(private_message["customer_id"])) == 1
+
+        overview = workforce_routing.routing_overview(1)
+        assert overview["online_count"] == 2
+        assert overview["assigned_count"] == 3
+        assert {row["availability"] for row in overview["presence"] if row["online"]} == {
+            "busy"
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -727,6 +1926,39 @@ class TestMiniAppAdapter:
 
 
 class TestInboxEndToEnd:
+    async def test_wechat_xml_parser_extracts_nested_cdata(self):
+        from app.api.routes import _parse_wecom_xml
+
+        body = _parse_wecom_xml(
+            """<xml>
+            <ToUserName><![CDATA[gh_test]]></ToUserName>
+            <FromUserName><![CDATA[openid_abc]]></FromUserName>
+            <MsgType><![CDATA[text]]></MsgType>
+            <Content><![CDATA[我想了解报价和演示]]></Content>
+            <MsgId>1234567890123456</MsgId>
+            </xml>"""
+        )
+
+        assert body["FromUserName"] == "openid_abc"
+        assert body["MsgType"] == "text"
+        assert body["Content"] == "我想了解报价和演示"
+
+    async def test_wechat_qr_payload_parser_extracts_uuid(self):
+        from app.api.routes import _extract_wechat_qr_payload
+
+        payload = _extract_wechat_qr_payload(
+            """
+            <html><body>
+            <img class="qrcode" src="/connect/qrcode/081aBcD_efg" />
+            <script src="https://lp.open.weixin.qq.com/connect/l/qrconnect"></script>
+            </body></html>
+            """
+        )
+
+        assert payload["uuid"] == "081aBcD_efg"
+        assert payload["qr_image_url"] == "https://open.weixin.qq.com/connect/qrcode/081aBcD_efg"
+        assert payload["poll_base"] == "https://lp.open.weixin.qq.com/connect/l/qrconnect"
+
     async def test_inbox_push_then_receive(self, tmp_db):
         from app.services import message_store
         from app.channels.wecom import WeComAdapter
@@ -809,8 +2041,66 @@ class TestInboxEndToEnd:
         reminder = next(r for r in reminders if r["customer_id"] == customer["customer_id"])
         assert reminder["pending_follow_up"] is True
 
+    async def test_remote_douyin_inbox_acks_after_local_persist(self, tmp_db):
+        from starlette.requests import Request
+
+        from app.api.routes import ChannelSyncInboxBody, sync_channel_inbox
+        from app.channels.base import UnifiedMessage
+        from app.services.pipeline import list_pipeline_client_summaries
+
+        adapter = AsyncMock()
+        adapter.receive_messages = AsyncMock(
+            return_value=[
+                UnifiedMessage(
+                    id="douyin:remote-message-1",
+                    customer_id=0,
+                    channel_type="douyin",
+                    contact_id="remote-customer",
+                    contact_name="远端抖音客户",
+                    direction="inbound",
+                    content="我要了解价格",
+                    content_type="text",
+                    metadata={"team_id": 11},
+                    created_at="2026-07-16T12:00:00+00:00",
+                )
+            ]
+        )
+        registry = MagicMock()
+        registry.get.return_value = adapter
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/kellai/channels/sync-inbox",
+                "headers": [],
+                "query_string": b"",
+                "state": {"user": {"id": 22, "team_id": 11}},
+            }
+        )
+        ack = AsyncMock(return_value=1)
+
+        with patch("app.channels.ChannelRegistry", return_value=registry), \
+             patch("app.services.douyin_channel.remote_bridge_enabled", return_value=True), \
+             patch("app.services.douyin_channel.remote_ack_inbox", ack):
+            out = await sync_channel_inbox(
+                ChannelSyncInboxBody(channel_type="douyin", limit=10),
+                request,
+            )
+
+        assert out["success"] is True
+        assert out["data"]["synced"] == 1
+        assert out["data"]["consumed"] == 1
+        ack.assert_awaited_once_with(11, ["douyin:remote-message-1"])
+        customer = next(
+            row
+            for row in list_pipeline_client_summaries()
+            if row["display_name"] == "远端抖音客户"
+        )
+        assert customer["team_id"] == 11
+
     async def test_simulate_customer_behavior_returns_scenario_assertions(self, tmp_db):
         from app.api.routes import SimulateCustomerBehaviorBody, simulate_customer_behavior
+        from app.services.pipeline import list_pipeline_client_summaries
 
         out = await simulate_customer_behavior(SimulateCustomerBehaviorBody(count=5))
 
@@ -823,6 +2113,14 @@ class TestInboxEndToEnd:
         assert data["passed"] is True
         assert all(item["customer_id"] > 0 for item in data["scenario_results"])
         assert all(item["next_action"] for item in data["scenario_results"])
+
+        simulated_ids = {int(item["customer_id"]) for item in data["scenario_results"]}
+        business_ids = {int(item["customer_id"]) for item in list_pipeline_client_summaries()}
+        all_rows = list_pipeline_client_summaries(include_demo=True)
+        demo_rows = [item for item in all_rows if int(item["customer_id"]) in simulated_ids]
+        assert simulated_ids.isdisjoint(business_ids)
+        assert len(demo_rows) == len(simulated_ids)
+        assert all(item["is_demo"] is True for item in demo_rows)
 
     async def test_llm_full_flow_simulation_uses_llm_and_reaches_signed(self, tmp_db, monkeypatch):
         from app.services import ai_copilot

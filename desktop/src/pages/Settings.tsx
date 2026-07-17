@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useSearchParams } from 'react-router-dom';
+import { invoke } from '@tauri-apps/api/core';
+import QRCodeLib from 'qrcode';
 import {
   MessageCircle,
   Users,
@@ -23,10 +25,16 @@ import {
   ShieldCheck,
 } from 'lucide-react';
 import { useOnboardingStore } from '../stores/onboarding';
+import { useMessageStore } from '../stores/message';
 import { ONBOARDING_WELCOME_CACHE_KEY, ONBOARDING_WELCOME_SPEECH_TEXT } from '../constants/onboardingTour';
 import { playPreparedTextToSpeech, preloadTextToSpeech, unlockTextToSpeechAudio } from '../hooks/useTextToSpeech';
 import { estimateSpeechHoldMs } from '../utils/onboardingSpeech';
 import ChannelLogo, { CHANNEL_BRAND_COLOR } from '../components/ChannelLogo';
+import { toastStore } from '../stores/toast';
+import {
+  getAutoReplyRuntimeStatus,
+  type AutoReplyRuntimeStatus,
+} from '../api/messages';
 import { clsx } from 'clsx';
 import type {
   Channel,
@@ -41,6 +49,7 @@ import {
   getChannels,
   testChannel,
   saveChannelConfig,
+  getWeworkCustomerEntry,
   syncChannelInbox,
   getLlmStatus,
   saveLlmConfig,
@@ -54,6 +63,24 @@ import {
   updateUserInfo,
   initiateWeworkOAuth,
   checkWeworkOAuthStatus,
+  syncWeworkCustomers,
+  getWeworkAcquisitionMembers,
+  createWeworkAcquisitionLink,
+  initiateWechatOAuth,
+  checkWechatOAuthStatus,
+  initiateDouyinOAuth,
+  checkDouyinOAuthStatus,
+  getDouyinWebPortalStatus,
+  connectDouyinWebPortal,
+  syncDouyinWebPortal,
+  startDouyinWebPortalMonitor,
+  stopDouyinWebPortalMonitor,
+  disconnectDouyinWebPortal,
+  getXcmaxIntegrationStatus,
+  getXcmaxBindingPending,
+  approveXcmaxBinding,
+  cancelXcmaxBinding,
+  disconnectXcmaxBinding,
 } from '../api/settings';
 
 type OnboardingSpeechWindow = Window & {
@@ -68,6 +95,7 @@ const TABS = [
   { key: 'ai', label: 'AI 助手', icon: Bot },
   { key: 'followup', label: '跟进规则', icon: Clock },
   { key: 'team', label: '团队管理', icon: Users },
+  { key: 'xcmax', label: 'XCMAX AI', icon: ShieldCheck },
   { key: 'profile', label: '个人设置', icon: User },
 ] as const;
 
@@ -75,6 +103,7 @@ type TabKey = (typeof TABS)[number]['key'];
 
 /** 渠道名称映射 */
 const channelNameMap: Record<string, string> = {
+  wechat: '微信开放平台',
   wework: '企业微信',
   phone: '电话',
   douyin: '抖音',
@@ -95,7 +124,7 @@ const channelNameMap: Record<string, string> = {
 
 /** 渠道分组（用于分区渲染） */
 const channelGroups: Array<{ key: string; title: string; types: string[] }> = [
-  { key: 'im', title: '即时通讯', types: ['wework', 'douyin', 'miniprogram'] },
+  { key: 'im', title: '即时通讯', types: ['wechat', 'wework', 'douyin', 'miniprogram'] },
   { key: 'ecom', title: '电商平台', types: ['pdd', 'taobao', 'jd', 'alibaba'] },
   { key: 'oversea', title: '海外渠道', types: ['whatsapp', 'telegram', 'line'] },
   { key: 'other', title: '其他方式', types: ['phone', 'email', 'sms', 'web'] },
@@ -107,8 +136,9 @@ type ChannelAuthMode = 'scan' | 'form' | 'select' | 'none' | 'both';
 /** 渠道认证方式映射：哪些渠道用扫码，哪些用凭据表单 */
 const channelAuthModeMap: Record<string, ChannelAuthMode> = {
   // 即时通讯 → 扫码授权（服务商代配置）
+  wechat: 'both',
   wework: 'both',
-  douyin: 'scan',
+  douyin: 'both',
   miniprogram: 'scan',
   // 电商平台 → 扫码授权（商家工作台扫码登录）
   pdd: 'scan',
@@ -128,8 +158,9 @@ const channelAuthModeMap: Record<string, ChannelAuthMode> = {
 
 /** 扫码授权提示语（按渠道定制） */
 const channelScanTips: Record<string, { app: string; description: string }> = {
-  wework: { app: '企业微信', description: '使用企业微信 App 扫描二维码，授权后即可接收客户消息' },
-  douyin: { app: '抖音', description: '使用抖音 App 扫描二维码，授权商家工作台' },
+  wechat: { app: '微信', description: '使用微信扫码完成开放平台网站应用授权，授权后可保存 openid/unionid 并接收公众号回调消息' },
+  wework: { app: '企业微信', description: '企业管理员扫码安装客来来第三方应用，一次授权后自动同步真实客户列表' },
+  douyin: { app: '抖音', description: '网站应用完成测试白名单，小程序私信能力负责把真实客户消息接入统一工作台并支持回复' },
   miniprogram: { app: '微信', description: '使用微信扫一扫，授权公众号/小程序接入' },
   pdd: { app: '拼多多商家版', description: '使用拼多多商家 App 扫码，授权客服工作台' },
   taobao: { app: '千牛', description: '使用千牛 App 扫码，授权客服工作台' },
@@ -139,6 +170,15 @@ const channelScanTips: Record<string, { app: string; description: string }> = {
 
 /** 渠道配置字段映射（仅 form 模式用） */
 const channelConfigFieldsMap: Record<string, { key: string; label: string; type: 'text' | 'password' | 'select'; placeholder?: string; options?: { label: string; value: string }[] }[]> = {
+  wechat: [
+    { key: 'app_id', label: '开放平台 AppID', type: 'text', placeholder: 'wx1234567890abcdef' },
+    { key: 'app_secret', label: '开放平台 AppSecret', type: 'password', placeholder: '请输入网站应用 AppSecret' },
+    { key: 'official_app_id', label: '公众号 AppID（可选）', type: 'text', placeholder: '用于客服消息发送' },
+    { key: 'official_app_secret', label: '公众号 AppSecret（可选）', type: 'password', placeholder: '用于拉取公众号 access_token' },
+    { key: 'token', label: '回调 Token（可选）', type: 'password', placeholder: '公众平台服务器配置 Token' },
+    { key: 'encoding_aes_key', label: 'EncodingAESKey（可选）', type: 'password', placeholder: '明文模式可留空' },
+    { key: 'bot_webhook', label: '兼容 Webhook（可选）', type: 'text', placeholder: 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...' },
+  ],
   wework: [
     { key: 'corp_id', label: 'Corp ID（企业 ID）', type: 'text', placeholder: 'ww1234567890' },
     { key: 'secret', label: 'Secret（应用密钥）', type: 'password', placeholder: '请输入应用 Secret' },
@@ -155,8 +195,10 @@ const channelConfigFieldsMap: Record<string, { key: string; label: string; type:
     ] },
   ],
   douyin: [
-    { key: 'app_id', label: 'App ID', type: 'text', placeholder: '请输入抖音 App ID' },
-    { key: 'app_secret', label: 'App Secret', type: 'password', placeholder: '请输入抖音 App Secret' },
+    { key: 'app_id', label: '网站应用 Client Key', type: 'text', placeholder: '用于测试白名单和基础账号授权' },
+    { key: 'app_secret', label: '网站应用 Client Secret', type: 'password', placeholder: '抖音开放平台移动/网站应用密钥' },
+    { key: 'miniapp_app_id', label: '抖音小程序 AppID', type: 'text', placeholder: 'tt 开头的小程序 AppID' },
+    { key: 'miniapp_secret', label: '小程序 Webhook AppSecret', type: 'password', placeholder: '开发配置 → Webhooks 中的 AppSecret（不是密钥管理 AppSecret）' },
   ],
   miniprogram: [
     { key: 'app_id', label: 'App ID', type: 'text', placeholder: '请输入公众号/小程序 App ID' },
@@ -193,8 +235,9 @@ const channelConfigFieldsMap: Record<string, { key: string; label: string; type:
 };
 
 const channelRequiredConfigFieldsMap: Record<string, string[]> = {
+  wechat: ['app_id', 'app_secret'],
   wework: ['corp_id', 'secret', 'agent_id'],
-  douyin: ['app_id', 'app_secret'],
+  douyin: ['app_id', 'app_secret', 'miniapp_app_id', 'miniapp_secret'],
   miniprogram: ['app_id', 'app_secret'],
   pdd: ['client_id', 'client_secret'],
   taobao: ['app_key', 'app_secret'],
@@ -352,7 +395,16 @@ function normalizeLlmProvider(value: string) {
 
 /** 自动回复适用阶段 */
 const AUTO_REPLY_STAGES = [
-  '已建联', '需求采集', '已提交', '已报价', '谈判中', '成交',
+  { value: 'idle', label: '未接触' },
+  { value: 'connected', label: '已建联' },
+  { value: 'intake', label: '需求采集' },
+  { value: 'intake_done', label: '已提交' },
+  { value: 'quoted', label: '已报价' },
+  { value: 'negotiating', label: '议价' },
+  { value: 'contract_pending', label: '待签' },
+  { value: 'signed', label: '已签' },
+  { value: 'delivering', label: '交付中' },
+  { value: 'delivered', label: '已交付' },
 ];
 
 /** 需确认场景 */
@@ -418,7 +470,7 @@ function MultiSelectTags({
   selected,
   onChange,
 }: {
-  options: string[];
+  options: Array<string | { value: string; label: string }>;
   selected: string[];
   onChange: (v: string[]) => void;
 }) {
@@ -432,21 +484,25 @@ function MultiSelectTags({
 
   return (
     <div className="flex flex-wrap gap-2">
-      {options.map((opt) => (
+      {options.map((opt) => {
+        const value = typeof opt === 'string' ? opt : opt.value;
+        const label = typeof opt === 'string' ? opt : opt.label;
+        return (
         <button
-          key={opt}
+          key={value}
           type="button"
-          onClick={() => toggle(opt)}
+          onClick={() => toggle(value)}
           className={clsx(
             'rounded-full px-3 py-1 text-xs font-medium transition-colors',
-            selected.includes(opt)
+            selected.includes(value)
               ? 'bg-blue-100 text-blue-700 ring-1 ring-blue-300'
               : 'bg-gray-100 text-gray-500 hover:bg-gray-200'
           )}
         >
-          {opt}
+          {label}
         </button>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -459,6 +515,9 @@ function ChannelTab() {
   const [error, setError] = useState('');
   const [configChannel, setConfigChannel] = useState<Channel | null>(null);
   const [scanChannel, setScanChannel] = useState<Channel | null>(null);
+  const [entryChannel, setEntryChannel] = useState<Channel | null>(null);
+  const [acquisitionChannel, setAcquisitionChannel] = useState<Channel | null>(null);
+  const [douyinWebPortalChannel, setDouyinWebPortalChannel] = useState<Channel | null>(null);
   const [onboardingChannel, setOnboardingChannel] = useState<Channel | null>(null);
   const [configValues, setConfigValues] = useState<Record<string, string>>({});
   const [testingChannel, setTestingChannel] = useState<string | null>(null);
@@ -525,12 +584,14 @@ function ChannelTab() {
           setOnboardingChannel((prev) => (prev ? markConnected(prev) : prev));
         }
       }
+      return ok;
     } catch (err) {
       const data = (err as any)?.response?.data;
       setTestResult((prev) => ({
         ...prev,
         [channelType]: { success: false, message: data?.message || data?.error || '连接失败，请检查配置' },
       }));
+      return false;
     } finally {
       setTestingChannel(null);
     }
@@ -540,11 +601,18 @@ function ChannelTab() {
   const handleSaveConfig = async (channelType: string, values: Record<string, string>) => {
     try {
       const res = (await saveChannelConfig(channelType, values, { enabled: true })) as any;
-      const data = res?.data?.data ?? res?.data ?? res;
+      const body = res?.data ?? res;
+      if (body?.success === false) {
+        throw new Error(body?.error || body?.message || '渠道配置校验失败');
+      }
+      const data = body?.data ?? body;
       setChannels((prev) =>
         prev.map((c) => {
           if (c.type !== channelType) return c;
-          const mergedConfig = { ...c.config, ...values };
+          const returnedConfig = data?.config && typeof data.config === 'object'
+            ? data.config as Record<string, string>
+            : values;
+          const mergedConfig = { ...c.config, ...returnedConfig };
           return {
             ...c,
             enabled: Boolean(data?.enabled ?? true),
@@ -557,7 +625,10 @@ function ChannelTab() {
       if (onboardingChannel?.type === channelType) {
         setOnboardingChannel((prev) => {
           if (!prev) return prev;
-          const mergedConfig = { ...prev.config, ...values };
+          const returnedConfig = data?.config && typeof data.config === 'object'
+            ? data.config as Record<string, string>
+            : values;
+          const mergedConfig = { ...prev.config, ...returnedConfig };
           return {
             ...prev,
             enabled: Boolean(data?.enabled ?? true),
@@ -663,6 +734,12 @@ function ChannelTab() {
                 const profile = onboardingOf(channel);
                 const missingCount = profile.missing_required_fields.length;
                 const doneSteps = profile.stages.filter((step) => step.status === 'done').length;
+                const hasCustomerEntry =
+                  channel.type === 'wework' &&
+                  Boolean(channel.config?.kf_url || channel.config?.open_kfid);
+                const hasBasicDouyinAuthorization =
+                  channel.type === 'douyin' &&
+                  String(channel.config?.oauth_authorized ?? '').toLowerCase() === 'true';
                 return (
                   <div
                     key={channel.id}
@@ -686,11 +763,13 @@ function ChannelTab() {
                       'rounded-full px-2 py-0.5 text-[11px] font-medium',
                       channel.connected
                         ? 'bg-green-50 text-green-700'
+                        : hasBasicDouyinAuthorization
+                          ? 'bg-blue-50 text-blue-700'
                         : profile.status === 'saved'
                           ? 'bg-blue-50 text-blue-700'
                           : 'bg-gray-100 text-gray-500'
                     )}>
-                      {channel.connected ? '已接入' : profile.status === 'saved' ? '待测试' : profile.status === 'ready' ? '可用' : '未接入'}
+                      {channel.connected ? '已接入' : hasBasicDouyinAuthorization ? '基础授权' : profile.status === 'saved' ? '待测试' : profile.status === 'ready' ? '可用' : '未接入'}
                     </span>
                   </div>
                   <div className="mt-0.5 flex items-center gap-1.5">
@@ -698,6 +777,11 @@ function ChannelTab() {
                       <>
                         <span className="h-2 w-2 rounded-full bg-green-500" />
                         <span className="text-xs text-green-600">已连接</span>
+                      </>
+                    ) : hasBasicDouyinAuthorization ? (
+                      <>
+                        <span className="h-2 w-2 rounded-full bg-blue-500" />
+                        <span className="text-xs text-blue-600">已授权，私信权限待开通</span>
                       </>
                     ) : (
                       <>
@@ -733,6 +817,9 @@ function ChannelTab() {
                   ))}
                 </div>
                 <p className="mt-2 line-clamp-2">{profile.next_action}</p>
+                {hasBasicDouyinAuthorization && channel.message && (
+                  <p className="mt-1 text-blue-700">{channel.message}</p>
+                )}
                 {missingCount > 0 && (
                   <p className="mt-1 text-amber-700">缺少 {missingCount} 项：{profile.missing_required_fields.map((key) => fieldLabelOf(channel.type, key)).join('、')}</p>
                 )}
@@ -764,6 +851,39 @@ function ChannelTab() {
                 >
                   {syncingChannel === channel.type ? '同步中...' : '同步收件箱'}
                 </button>
+                {hasCustomerEntry && (
+                  <button
+                    type="button"
+                    onClick={() => setEntryChannel(channel)}
+                    aria-label="企业微信客户入口二维码"
+                    className="inline-flex items-center gap-1 rounded-lg border border-blue-200 px-3 py-1.5 text-xs font-medium text-blue-700 transition hover:bg-blue-50"
+                  >
+                    <QrCode className="h-3.5 w-3.5" />
+                    客户入口二维码
+                  </button>
+                )}
+                {channel.type === 'wework' && (
+                  <button
+                    type="button"
+                    onClick={() => setAcquisitionChannel(channel)}
+                    aria-label="创建企业微信获客链接"
+                    className="inline-flex items-center gap-1 rounded-lg border border-emerald-200 px-3 py-1.5 text-xs font-medium text-emerald-700 transition hover:bg-emerald-50"
+                  >
+                    <QrCode className="h-3.5 w-3.5" />
+                    创建获客链接
+                  </button>
+                )}
+                {channel.type === 'douyin' && (
+                  <button
+                    type="button"
+                    onClick={() => setDouyinWebPortalChannel(channel)}
+                    aria-label="配置抖音网站 Token"
+                    className="inline-flex items-center gap-1 rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-800 transition hover:bg-slate-50"
+                  >
+                    <MessageCircle className="h-3.5 w-3.5" />
+                    网站 Token
+                  </button>
+                )}
               </div>
 
               {/* 测试结果 */}
@@ -829,7 +949,7 @@ function ChannelTab() {
         <ChannelScanModal
           channel={(scanChannel || configChannel)!}
           onClose={() => { setScanChannel(null); setConfigChannel(null); }}
-          onSuccess={() => {
+          onSuccess={async () => {
             const ch = (scanChannel || configChannel)!;
             setChannels((prev) =>
               prev.map((c) =>
@@ -840,11 +960,312 @@ function ChannelTab() {
               ...prev,
               [ch.type]: { success: true, message: '扫码授权成功' },
             }));
+            if (ch.type === 'douyin') {
+              const connected = await handleTest(ch.type);
+              if (connected) {
+                await handleSyncInbox(ch.type);
+                await useMessageStore.getState().fetchUnread();
+                setTestResult((prev) => ({
+                  ...prev,
+                  [ch.type]: {
+                    success: true,
+                    message: '扫码授权成功；新的抖音私信会在 15 秒内自动出现在消息中心',
+                  },
+                }));
+                toastStore.success('抖音授权成功，正在监听新私信');
+              }
+            }
             setScanChannel(null);
             setConfigChannel(null);
           }}
         />
       )}
+
+      {entryChannel && (
+        <WeworkCustomerEntryModal
+          channel={entryChannel}
+          onClose={() => setEntryChannel(null)}
+        />
+      )}
+
+      {acquisitionChannel && (
+        <WeworkAcquisitionLinkModal
+          channel={acquisitionChannel}
+          onClose={() => setAcquisitionChannel(null)}
+        />
+      )}
+
+      {douyinWebPortalChannel && (
+        <DouyinWebPortalModal
+          onClose={() => setDouyinWebPortalChannel(null)}
+          onConnected={() => {
+            setChannels((prev) =>
+              prev.map((channel) =>
+                channel.type === 'douyin'
+                  ? {
+                      ...channel,
+                      connected: true,
+                      enabled: true,
+                      message: '抖音网站数据已连接并监听实时私信',
+                      config: { ...channel.config, web_portal_connected: 'true' },
+                    }
+                  : channel
+              )
+            );
+            setTestResult((prev) => ({
+              ...prev,
+              douyin: { success: true, message: '网站数据已连接，联系人和消息正在同步' },
+            }));
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+type DouyinWebPortalState = {
+  connected: boolean;
+  status: string;
+  account_name?: string;
+  monitor_running?: boolean;
+  contact_count?: number;
+  last_sync_at?: string;
+  last_message_at?: string;
+  last_error?: string;
+};
+
+function DouyinWebPortalModal({
+  onClose,
+  onConnected,
+}: {
+  onClose: () => void;
+  onConnected: () => void;
+}) {
+  const [portalState, setPortalState] = useState<DouyinWebPortalState | null>(null);
+  const [tokenOrUrl, setTokenOrUrl] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [working, setWorking] = useState('');
+  const [error, setError] = useState('');
+  const [result, setResult] = useState('');
+
+  const unwrap = (res: any) => res?.data?.data ?? res?.data ?? res;
+
+  const refreshStatus = useCallback(async () => {
+    const res = await getDouyinWebPortalStatus();
+    setPortalState(unwrap(res));
+  }, []);
+
+  useEffect(() => {
+    refreshStatus()
+      .catch((err: any) => {
+        const body = err?.response?.data;
+        setError(body?.detail?.message || body?.message || '读取网站 Token 状态失败');
+      })
+      .finally(() => setLoading(false));
+  }, [refreshStatus]);
+
+  const connectAndSync = async () => {
+    if (!tokenOrUrl.trim()) {
+      setError('请输入网站 Token');
+      return;
+    }
+    setWorking('connect');
+    setError('');
+    setResult('');
+    try {
+      await connectDouyinWebPortal(tokenOrUrl.trim());
+      const syncRes = await syncDouyinWebPortal(300, 20);
+      const syncData = unwrap(syncRes);
+      await startDouyinWebPortalMonitor();
+      await useMessageStore.getState().fetchUnread();
+      await refreshStatus();
+      setTokenOrUrl('');
+      setResult(`已同步 ${Number(syncData?.contacts ?? 0)} 位联系人、${Number(syncData?.messages ?? 0)} 条消息，并开始实时监听`);
+      onConnected();
+      toastStore.success('抖音网站数据已接入客来来');
+    } catch (err: any) {
+      const body = err?.response?.data;
+      setError(body?.detail?.message || body?.message || body?.error || err?.message || '网站 Token 接入失败');
+    } finally {
+      setWorking('');
+    }
+  };
+
+  const syncNow = async () => {
+    setWorking('sync');
+    setError('');
+    try {
+      const res = await syncDouyinWebPortal(300, 20);
+      const data = unwrap(res);
+      await useMessageStore.getState().fetchUnread();
+      await refreshStatus();
+      setResult(`已同步 ${Number(data?.contacts ?? 0)} 位联系人、${Number(data?.messages ?? 0)} 条消息`);
+    } catch (err: any) {
+      const body = err?.response?.data;
+      setError(body?.detail?.message || body?.message || err?.message || '同步失败');
+    } finally {
+      setWorking('');
+    }
+  };
+
+  const toggleMonitor = async () => {
+    const running = Boolean(portalState?.monitor_running);
+    setWorking('monitor');
+    setError('');
+    try {
+      if (running) {
+        await stopDouyinWebPortalMonitor();
+        setResult('已停止实时监听');
+      } else {
+        await startDouyinWebPortalMonitor();
+        setResult('已开始实时监听新私信');
+      }
+      await refreshStatus();
+    } catch (err: any) {
+      const body = err?.response?.data;
+      setError(body?.detail?.message || body?.message || err?.message || '切换监听状态失败');
+    } finally {
+      setWorking('');
+    }
+  };
+
+  const disconnect = async () => {
+    setWorking('disconnect');
+    setError('');
+    try {
+      await disconnectDouyinWebPortal();
+      await refreshStatus();
+      setResult('已断开网站数据连接');
+    } catch (err: any) {
+      const body = err?.response?.data;
+      setError(body?.detail?.message || body?.message || err?.message || '断开失败');
+    } finally {
+      setWorking('');
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/45 p-4 backdrop-blur-sm" onClick={onClose}>
+      <div className="w-full max-w-xl overflow-hidden rounded-2xl bg-white shadow-2xl" onClick={(event) => event.stopPropagation()}>
+        <div className="flex items-start justify-between border-b border-slate-100 px-6 py-5">
+          <div>
+            <h3 className="text-base font-semibold text-slate-950">抖音网站 Token</h3>
+            <p className="mt-1 text-xs text-slate-500">输入 Token 后同步账号、客户、历史消息和实时新私信</p>
+          </div>
+          <button onClick={onClose} aria-label="关闭" className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700">
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        <div className="space-y-4 px-6 py-5">
+          {loading ? (
+            <div className="flex items-center justify-center py-12 text-sm text-slate-500">
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" /> 正在读取连接状态
+            </div>
+          ) : (
+            <>
+              <div className={clsx(
+                'rounded-xl border px-4 py-3',
+                portalState?.connected ? 'border-green-200 bg-green-50' : 'border-slate-200 bg-slate-50'
+              )}>
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2">
+                    <span className={clsx('h-2.5 w-2.5 rounded-full', portalState?.connected ? 'bg-green-500' : 'bg-slate-300')} />
+                    <span className="text-sm font-semibold text-slate-900">
+                      {portalState?.connected ? `已连接${portalState.account_name ? `：${portalState.account_name}` : ''}` : '尚未连接'}
+                    </span>
+                  </div>
+                  {portalState?.connected && (
+                    <span className={clsx(
+                      'rounded-full px-2.5 py-1 text-[11px] font-medium',
+                      portalState.monitor_running ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'
+                    )}>
+                      {portalState.monitor_running ? '实时监听中' : '监听已停止'}
+                    </span>
+                  )}
+                </div>
+                {portalState?.connected && (
+                  <div className="mt-2 grid grid-cols-2 gap-2 text-xs text-slate-600">
+                    <span>联系人：{Number(portalState.contact_count ?? 0)}</span>
+                    <span>状态：{portalState.status || 'connected'}</span>
+                  </div>
+                )}
+              </div>
+
+              {!portalState?.connected && (
+                <>
+                  <div>
+                    <label className="mb-1 block text-xs font-medium text-slate-700">网站 Token</label>
+                    <input
+                      type="password"
+                      value={tokenOrUrl}
+                      onChange={(event) => setTokenOrUrl(event.target.value)}
+                      placeholder="请输入网站 Token"
+                      autoComplete="off"
+                      className="w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    />
+                    <p className="mt-1 text-[11px] text-slate-500">Token 会在本机加密保存，不保存网站账号密码。</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={connectAndSync}
+                    disabled={working === 'connect'}
+                    className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-slate-950 px-4 py-2.5 text-sm font-semibold text-white hover:bg-slate-800 disabled:opacity-60"
+                  >
+                    {working === 'connect' && <Loader2 className="h-4 w-4 animate-spin" />}
+                    {working === 'connect' ? '连接并同步中...' : '连接、同步并开始监听'}
+                  </button>
+                </>
+              )}
+
+              {portalState?.connected && (
+                <div className="grid gap-2 sm:grid-cols-3">
+                  <button
+                    type="button"
+                    onClick={syncNow}
+                    disabled={Boolean(working)}
+                    className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-slate-200 px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-60"
+                  >
+                    {working === 'sync' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                    立即同步
+                  </button>
+                  <button
+                    type="button"
+                    onClick={toggleMonitor}
+                    disabled={Boolean(working)}
+                    className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-blue-200 px-3 py-2 text-xs font-medium text-blue-700 hover:bg-blue-50 disabled:opacity-60"
+                  >
+                    {working === 'monitor' && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                    {portalState.monitor_running ? '停止监听' : '开始监听'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={disconnect}
+                    disabled={Boolean(working)}
+                    className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-red-200 px-3 py-2 text-xs font-medium text-red-700 hover:bg-red-50 disabled:opacity-60"
+                  >
+                    {working === 'disconnect' && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                    断开连接
+                  </button>
+                </div>
+              )}
+
+              {result && (
+                <div className="flex items-start gap-2 rounded-lg bg-green-50 px-3 py-2 text-xs text-green-700">
+                  <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
+                  <span>{result}</span>
+                </div>
+              )}
+              {(error || portalState?.last_error) && (
+                <div className="flex items-start gap-2 rounded-lg bg-red-50 px-3 py-2 text-xs text-red-700">
+                  <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                  <span>{error || portalState?.last_error}</span>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
@@ -874,7 +1295,7 @@ function ChannelOnboardingModal({
   onChange: (v: Record<string, string>) => void;
   onClose: () => void;
   onSave: (channelType: string, values: Record<string, string>) => Promise<void>;
-  onTest: (channelType: string) => Promise<void>;
+  onTest: (channelType: string) => Promise<boolean | void>;
   onSync: (channelType: string) => Promise<void>;
   onScan: () => void;
   onOpenStandaloneConfig: () => void;
@@ -885,10 +1306,26 @@ function ChannelOnboardingModal({
   const channelLabel = channelNameMap[channel.type] ?? channel.name;
   const doneSteps = profile.stages.filter((step) => step.status === 'done').length;
   const progress = profile.stages.length ? Math.round((doneSteps / profile.stages.length) * 100) : 100;
+  const remoteCredentialsConfigured = (
+    channel.type === 'douyin'
+    && String(channel.config?.remote_credentials_configured ?? '').toLowerCase() === 'true'
+  );
+  const remoteMiniappConfigured = (
+    channel.type === 'douyin'
+    && String(channel.config?.remote_miniapp_configured ?? '').toLowerCase() === 'true'
+  );
   const liveMissingFields = profile.required_fields.filter((key) => {
+    if (remoteCredentialsConfigured && ['app_id', 'app_secret', 'client_key', 'client_secret'].includes(key)) {
+      return false;
+    }
+    if (remoteMiniappConfigured && ['miniapp_app_id', 'miniapp_secret'].includes(key)) {
+      return false;
+    }
     const currentValue = values[key] ?? (channel.config?.[key] as string | undefined) ?? '';
     return !String(currentValue).trim();
   });
+  const scanBlockedByMissingCredentials =
+    profile.can_scan && liveMissingFields.length > 0;
   const modeLabel: Record<string, string> = {
     scan: '推荐扫码授权',
     form: '回填平台凭据',
@@ -1028,10 +1465,13 @@ function ChannelOnboardingModal({
                   type="button"
                   data-tour="channel-onboarding-scan"
                   onClick={onScan}
-                  className="flex w-full items-center justify-center gap-2 rounded-xl bg-slate-950 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-800"
+                  disabled={scanBlockedByMissingCredentials}
+                  className="flex w-full items-center justify-center gap-2 rounded-xl bg-slate-950 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300"
                 >
                   <QrCode className="h-4 w-4" />
-                  扫码授权
+                  {scanBlockedByMissingCredentials
+                    ? `先保存${liveMissingFields.map((key) => fieldLabelOf(channel.type, key)).join('、')}`
+                    : '扫码授权'}
                 </button>
               )}
 
@@ -1248,10 +1688,409 @@ function ChannelConfigModal({
   );
 }
 
+type WeworkCustomerEntryPayload = {
+  entry_url: string;
+  target_url: string;
+  source: string;
+};
+
+function WeworkCustomerEntryModal({
+  channel,
+  onClose,
+}: {
+  channel: Channel;
+  onClose: () => void;
+}) {
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [entry, setEntry] = useState<WeworkCustomerEntryPayload | null>(null);
+  const [qrImageUrl, setQrImageUrl] = useState('');
+  const channelLabel = channelNameMap[channel.type] ?? channel.name;
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      setLoading(true);
+      setError('');
+      setQrImageUrl('');
+      try {
+        const res = (await getWeworkCustomerEntry('settings')) as any;
+        const body = res?.data ?? res;
+        const data = (body?.data ?? body) as WeworkCustomerEntryPayload;
+        if (body?.success === false || !data?.entry_url) {
+          throw new Error(body?.error || '企业微信客服入口未配置');
+        }
+        const image = await QRCodeLib.toDataURL(data.entry_url, {
+          width: 224,
+          margin: 1,
+          color: { dark: '#0f172a', light: '#ffffff' },
+        });
+        if (cancelled) return;
+        setEntry(data);
+        setQrImageUrl(image);
+      } catch (err) {
+        if (cancelled) return;
+        setError(err instanceof Error ? err.message : '生成客户入口二维码失败');
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, [channel.config?.kf_url, channel.config?.open_kfid]);
+
+  const copyEntryUrl = async () => {
+    if (!entry?.entry_url) return;
+    try {
+      await navigator.clipboard.writeText(entry.entry_url);
+      toastStore.success('客户入口链接已复制');
+    } catch {
+      toastStore.error('复制失败，请手动复制链接');
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4" onClick={onClose}>
+      <div className="w-full max-w-md rounded-xl bg-white p-6 shadow-xl" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-start justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-blue-50 text-blue-600">
+              <QrCode className="h-5 w-5" />
+            </div>
+            <div>
+              <h3 className="text-base font-semibold text-gray-900">客户入口二维码</h3>
+              <p className="mt-0.5 text-xs text-gray-500">{channelLabel}</p>
+            </div>
+          </div>
+          <button onClick={onClose} aria-label="关闭客户入口二维码" className="rounded-md p-1 text-gray-400 hover:text-gray-600">
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        <div className="mt-6 flex flex-col items-center">
+          <div className="flex h-64 w-64 items-center justify-center rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
+            {loading ? (
+              <Loader2 className="h-8 w-8 animate-spin text-blue-600" />
+            ) : qrImageUrl ? (
+              <img src={qrImageUrl} alt="企业微信客户入口二维码" className="h-56 w-56" draggable={false} />
+            ) : (
+              <div className="flex flex-col items-center text-center text-sm text-amber-700">
+                <AlertCircle className="h-8 w-8" />
+                <span className="mt-2">{error || '无法生成二维码'}</span>
+              </div>
+            )}
+          </div>
+
+          {entry && (
+            <div className="mt-4 w-full space-y-3">
+              <div className="rounded-lg bg-slate-50 px-3 py-2">
+                <div className="text-xs font-medium text-slate-500">客来来入口</div>
+                <div className="mt-1 break-all text-xs text-slate-700">{entry.entry_url}</div>
+              </div>
+              <div className="rounded-lg bg-blue-50 px-3 py-2">
+                <div className="text-xs font-medium text-blue-700">企业微信客服</div>
+                <div className="mt-1 break-all text-xs text-blue-700">{entry.target_url}</div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="mt-6 grid grid-cols-2 gap-3">
+          <button
+            type="button"
+            onClick={copyEntryUrl}
+            disabled={!entry}
+            className="inline-flex items-center justify-center gap-2 rounded-lg border border-gray-200 px-4 py-2 text-sm font-medium text-gray-700 transition hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <Copy className="h-4 w-4" />
+            复制链接
+          </button>
+          <button
+            type="button"
+            onClick={() => entry?.entry_url && window.open(entry.entry_url, '_blank', 'noopener,noreferrer')}
+            disabled={!entry}
+            className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            打开入口
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+type WeworkAcquisitionMember = {
+  userid: string;
+  name: string;
+};
+
+type WeworkAcquisitionLink = {
+  link_id: string;
+  link_name: string;
+  url: string;
+  create_time: number;
+};
+
+function WeworkAcquisitionLinkModal({
+  channel,
+  onClose,
+}: {
+  channel: Channel;
+  onClose: () => void;
+}) {
+  const [loading, setLoading] = useState(true);
+  const [creating, setCreating] = useState(false);
+  const [error, setError] = useState('');
+  const [members, setMembers] = useState<WeworkAcquisitionMember[]>([]);
+  const [selectedUserids, setSelectedUserids] = useState<string[]>([]);
+  const [linkName, setLinkName] = useState('客来来获客链接');
+  const [createdLink, setCreatedLink] = useState<WeworkAcquisitionLink | null>(null);
+  const [qrImageUrl, setQrImageUrl] = useState('');
+  const channelLabel = channelNameMap[channel.type] ?? channel.name;
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadMembers = async () => {
+      setLoading(true);
+      setError('');
+      try {
+        const res = (await getWeworkAcquisitionMembers()) as any;
+        const body = res?.data ?? res;
+        const data = body?.data ?? body;
+        if (body?.success === false) {
+          throw new Error(body?.error || '无法读取企业微信跟进员工');
+        }
+        const nextMembers = Array.isArray(data?.members)
+          ? data.members
+              .map((item: any) => ({
+                userid: String(item?.userid || ''),
+                name: String(item?.name || item?.userid || ''),
+              }))
+              .filter((item: WeworkAcquisitionMember) => item.userid)
+          : [];
+        if (!nextMembers.length) {
+          throw new Error('当前团队没有可用于获客链接的企业微信成员');
+        }
+        if (cancelled) return;
+        setMembers(nextMembers);
+        setSelectedUserids(nextMembers.map((item: WeworkAcquisitionMember) => item.userid));
+      } catch (err: any) {
+        if (cancelled) return;
+        const body = err?.response?.data;
+        setError(body?.error || body?.message || err?.message || '读取跟进员工失败');
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    void loadMembers();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const toggleMember = (userid: string) => {
+    setSelectedUserids((current) =>
+      current.includes(userid)
+        ? current.filter((value) => value !== userid)
+        : [...current, userid]
+    );
+  };
+
+  const createLink = async () => {
+    const cleanName = linkName.trim();
+    if (!cleanName) {
+      setError('请填写获客链接名称');
+      return;
+    }
+    if (!selectedUserids.length) {
+      setError('请至少选择一位跟进员工');
+      return;
+    }
+    setCreating(true);
+    setError('');
+    try {
+      const res = (await createWeworkAcquisitionLink({
+        link_name: cleanName,
+        userids: selectedUserids,
+        skip_verify: true,
+      })) as any;
+      const body = res?.data ?? res;
+      const data = body?.data ?? body;
+      if (body?.success === false || !data?.link?.url) {
+        throw new Error(body?.error || '企业微信未返回有效的获客链接');
+      }
+      const link = data.link as WeworkAcquisitionLink;
+      const image = await QRCodeLib.toDataURL(link.url, {
+        width: 224,
+        margin: 1,
+        color: { dark: '#0f172a', light: '#ffffff' },
+      });
+      setCreatedLink(link);
+      setQrImageUrl(image);
+      toastStore.success('企业微信获客链接已创建');
+    } catch (err: any) {
+      const body = err?.response?.data;
+      setError(body?.error || body?.message || err?.message || '创建获客链接失败');
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const copyLink = async () => {
+    if (!createdLink?.url) return;
+    try {
+      await navigator.clipboard.writeText(createdLink.url);
+      toastStore.success('获客链接已复制');
+    } catch {
+      toastStore.error('复制失败，请手动复制链接');
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4" onClick={onClose}>
+      <div className="max-h-[88vh] w-full max-w-lg overflow-y-auto rounded-xl bg-white p-6 shadow-xl" onClick={(event) => event.stopPropagation()}>
+        <div className="flex items-start justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-emerald-50 text-emerald-600">
+              <QrCode className="h-5 w-5" />
+            </div>
+            <div>
+              <h3 className="text-base font-semibold text-gray-900">创建获客链接</h3>
+              <p className="mt-0.5 text-xs text-gray-500">{channelLabel} · 当前登录团队</p>
+            </div>
+          </div>
+          <button onClick={onClose} aria-label="关闭创建获客链接" className="rounded-md p-1 text-gray-400 hover:text-gray-600">
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        {createdLink ? (
+          <div className="mt-6">
+            <div className="flex justify-center">
+              <div className="flex h-64 w-64 items-center justify-center rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
+                {qrImageUrl && <img src={qrImageUrl} alt="企业微信获客链接二维码" className="h-56 w-56" draggable={false} />}
+              </div>
+            </div>
+            <div className="mt-4 rounded-lg bg-emerald-50 px-3 py-3">
+              <div className="text-xs font-medium text-emerald-700">{createdLink.link_name}</div>
+              <div className="mt-1 break-all text-xs text-emerald-800">{createdLink.url}</div>
+            </div>
+            <div className="mt-4 grid grid-cols-2 gap-3">
+              <button type="button" onClick={copyLink} className="inline-flex items-center justify-center gap-2 rounded-lg border border-gray-200 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50">
+                <Copy className="h-4 w-4" />
+                复制链接
+              </button>
+              <button type="button" onClick={() => window.open(createdLink.url, '_blank', 'noopener,noreferrer')} className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700">
+                打开链接
+              </button>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setCreatedLink(null);
+                setQrImageUrl('');
+                setLinkName('客来来获客链接');
+              }}
+              className="mt-3 w-full rounded-lg px-4 py-2 text-sm font-medium text-emerald-700 hover:bg-emerald-50"
+            >
+              再创建一个
+            </button>
+          </div>
+        ) : (
+          <div className="mt-6 space-y-5">
+            <div>
+              <label className="text-sm font-medium text-gray-700">链接名称</label>
+              <input
+                value={linkName}
+                maxLength={30}
+                onChange={(event) => setLinkName(event.target.value)}
+                placeholder="例如：官网咨询入口"
+                className="mt-2 w-full rounded-lg border border-gray-200 px-3 py-2 text-sm outline-none transition focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100"
+              />
+              <div className="mt-1 text-right text-xs text-gray-400">{linkName.length}/30</div>
+            </div>
+
+            <div>
+              <div className="flex items-center justify-between">
+                <label className="text-sm font-medium text-gray-700">跟进员工</label>
+                <span className="text-xs text-gray-400">已选 {selectedUserids.length} 人</span>
+              </div>
+              <div className="mt-2 max-h-52 overflow-y-auto rounded-lg border border-gray-200">
+                {loading ? (
+                  <div className="flex items-center justify-center px-4 py-8 text-sm text-gray-500">
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />读取企业微信成员…
+                  </div>
+                ) : members.map((member) => (
+                  <label key={member.userid} className="flex cursor-pointer items-center gap-3 border-b border-gray-100 px-4 py-3 last:border-b-0 hover:bg-gray-50">
+                    <input
+                      type="checkbox"
+                      checked={selectedUserids.includes(member.userid)}
+                      onChange={() => toggleMember(member.userid)}
+                      className="h-4 w-4 rounded border-gray-300 text-emerald-600 focus:ring-emerald-500"
+                    />
+                    <div className="min-w-0">
+                      <div className="text-sm font-medium text-gray-800">{member.name}</div>
+                      <div className="truncate text-xs text-gray-400">{member.userid}</div>
+                    </div>
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-blue-100 bg-blue-50 px-3 py-2 text-xs leading-5 text-blue-700">
+              链接只使用当前登录团队的企业微信授权创建，不会读取或复用其他账号的成员与客户数据。客户点击后将直接添加所选员工，并标记为本应用带来的客户。
+            </div>
+
+            {error && (
+              <div className="flex items-start gap-2 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">
+                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                <span>{error}</span>
+              </div>
+            )}
+
+            <button
+              type="button"
+              onClick={createLink}
+              disabled={loading || creating || !selectedUserids.length || !linkName.trim()}
+              className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-emerald-600 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <QrCode className="h-4 w-4" />}
+              {creating ? '创建中…' : '创建链接并生成二维码'}
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /* ========== 扫码授权弹窗 ========== */
 
 /** 扫码状态机 */
 type ScanStatus = 'waiting' | 'scanned' | 'success' | 'expired';
+
+type WeWorkLoginOptions = {
+  scriptUrl: string;
+  appid: string;
+  agentid: string;
+  redirect_uri: string;
+  state: string;
+  href?: string;
+  lang?: string;
+  business_type?: string;
+};
+
+type WeWorkLoginInstance = {
+  destroyed?: () => void;
+};
+
+declare global {
+  interface Window {
+    WwLogin?: new (options: Record<string, string>) => WeWorkLoginInstance;
+  }
+}
 
 /** 渠道扫码授权弹窗 */
 function ChannelScanModal({
@@ -1261,10 +2100,11 @@ function ChannelScanModal({
 }: {
   channel: Channel;
   onClose: () => void;
-  onSuccess: () => void;
+  onSuccess: () => void | Promise<void>;
 }) {
   const tip = channelScanTips[channel.type] ?? { app: '对应 App', description: '使用对应 App 扫描二维码' };
   const accentByType: Record<string, string> = {
+    wechat: '#07C160',
     wework: '#2B7CE9',
     douyin: '#161823',
     miniprogram: '#07C160',
@@ -1278,23 +2118,66 @@ function ChannelScanModal({
   const [status, setStatus] = useState<ScanStatus>('waiting');
   const [oauthUrl, setOauthUrl] = useState<string>('');
   const [oauthState, setOauthState] = useState<string>('');
+  const [qrImageUrl, setQrImageUrl] = useState<string>('');
+  const [weworkLogin, setWeworkLogin] = useState<WeWorkLoginOptions | null>(null);
+  const [weworkContainerId] = useState(() => `kellai-wework-login-${Math.random().toString(36).slice(2)}`);
   const [countdown, setCountdown] = useState(300); // 5分钟过期
   const [initError, setInitError] = useState('');
+  const [refreshSeed, setRefreshSeed] = useState(0);
+
+  const oauthApi = channel.type === 'wechat'
+    ? { initiate: initiateWechatOAuth, check: checkWechatOAuthStatus }
+    : channel.type === 'wework'
+      ? { initiate: initiateWeworkOAuth, check: checkWeworkOAuthStatus }
+      : channel.type === 'douyin'
+        ? { initiate: initiateDouyinOAuth, check: checkDouyinOAuthStatus }
+        : null;
 
   // 发起 OAuth
   useEffect(() => {
     let cancelled = false;
     const initiate = async () => {
+      if (!oauthApi) {
+        setInitError(`${channelNameMap[channel.type] ?? channel.name} 暂未提供扫码授权接口，请使用凭据配置`);
+        return;
+      }
       try {
-        const res = (await initiateWeworkOAuth()) as any;
-        const data = res?.data ?? res;
+        setWeworkLogin(null);
+        const res = (await oauthApi.initiate()) as any;
+        const body = res?.data ?? res;
+        const data = body?.data ?? body;
         if (data?.url && data?.state) {
           if (!cancelled) {
             setOauthUrl(data.url);
             setOauthState(data.state);
+            let nextQrImageUrl = String(data.qr_proxy_url || data.qr_image_url || '');
+            const qrText = String(data.qr_text || '');
+            if (channel.type !== 'douyin' && !nextQrImageUrl && qrText) {
+              nextQrImageUrl = await QRCodeLib.toDataURL(qrText, {
+                width: 416,
+                margin: 1,
+                errorCorrectionLevel: 'M',
+                color: { dark: '#101828', light: '#ffffff' },
+              });
+            }
+            if (!cancelled) setQrImageUrl(nextQrImageUrl);
+            const wwLogin = data.ww_login;
+            if (data.embed_type === 'ww_login' && wwLogin) {
+              setWeworkLogin({
+                scriptUrl: String(data.script_url || 'https://wwcdn.weixin.qq.com/node/wework/wwopen/js/wwLogin-1.2.7.js'),
+                appid: String(wwLogin.appid || ''),
+                agentid: String(wwLogin.agentid || ''),
+                redirect_uri: String(wwLogin.redirect_uri || ''),
+                state: String(wwLogin.state || data.state),
+                href: String(wwLogin.href || ''),
+                lang: String(wwLogin.lang || 'zh_CN'),
+                business_type: String(wwLogin.business_type || 'sso'),
+              });
+            }
+            setCountdown(Number(data.expires_in || 300));
           }
         } else {
-          if (!cancelled) setInitError(data?.error || '获取授权链接失败');
+          if (!cancelled) setInitError(body?.error || data?.error || '获取授权链接失败');
         }
       } catch (err: any) {
         const data = err?.response?.data;
@@ -1303,19 +2186,96 @@ function ChannelScanModal({
     };
     initiate();
     return () => { cancelled = true; };
-  }, []);
+  }, [channel.type, refreshSeed]);
+
+  useEffect(() => {
+    if (channel.type !== 'wework' || !weworkLogin || initError || status !== 'waiting') return;
+    let cancelled = false;
+    let instance: WeWorkLoginInstance | null = null;
+
+    const loadScript = () =>
+      new Promise<void>((resolve, reject) => {
+        if (window.WwLogin) {
+          resolve();
+          return;
+        }
+        const existing = document.querySelector<HTMLScriptElement>('script[data-kellai-wework-login="1"]');
+        if (existing) {
+          existing.addEventListener('load', () => resolve(), { once: true });
+          existing.addEventListener('error', () => reject(new Error('企业微信登录组件加载失败')), { once: true });
+          return;
+        }
+        const script = document.createElement('script');
+        script.src = weworkLogin.scriptUrl;
+        script.async = true;
+        script.dataset.kellaiWeworkLogin = '1';
+        script.onload = () => resolve();
+        script.onerror = () => reject(new Error('企业微信登录组件加载失败'));
+        document.head.appendChild(script);
+      });
+
+    loadScript()
+      .then(() => {
+        if (cancelled) return;
+        const LoginCtor = window.WwLogin;
+        if (!LoginCtor) {
+          setInitError('企业微信登录组件加载失败');
+          return;
+        }
+        const container = document.getElementById(weworkContainerId);
+        if (!container) {
+          setInitError('企业微信扫码容器加载失败');
+          return;
+        }
+        instance = new LoginCtor({
+          id: weworkContainerId,
+          appid: weworkLogin.appid,
+          agentid: weworkLogin.agentid,
+          redirect_uri: weworkLogin.redirect_uri,
+          state: weworkLogin.state,
+          href: weworkLogin.href || '',
+          lang: weworkLogin.lang || 'zh_CN',
+          business_type: weworkLogin.business_type || 'sso',
+        });
+      })
+      .catch((err: Error) => {
+        if (!cancelled) setInitError(err.message || '企业微信登录组件加载失败');
+      });
+
+    return () => {
+      cancelled = true;
+      instance?.destroyed?.();
+      const container = document.getElementById(weworkContainerId);
+      if (container) container.replaceChildren();
+    };
+  }, [channel.type, initError, status, weworkContainerId, weworkLogin]);
 
   // 轮询授权状态
   useEffect(() => {
-    if (!oauthState || status !== 'waiting') return;
+    if (!oauthState || (status !== 'waiting' && status !== 'scanned')) return;
     const interval = setInterval(async () => {
       try {
-        const res = (await checkWeworkOAuthStatus(oauthState)) as any;
-        const data = res?.data ?? res;
+        if (!oauthApi) return;
+        const res = (await oauthApi.check(oauthState)) as any;
+        const body = res?.data ?? res;
+        const data = body?.data ?? body;
         if (data?.authorized) {
           setStatus('scanned');
-          setTimeout(() => setStatus('success'), 1500);
+          if (channel.type === 'wework') {
+            try {
+              await syncWeworkCustomers();
+            } catch (err: any) {
+              const errorBody = err?.response?.data;
+              setInitError(errorBody?.error || errorBody?.message || '企业微信已授权，但客户列表同步失败');
+              return;
+            }
+          }
+          setTimeout(() => setStatus('success'), 800);
+        } else if (data?.scanned) {
+          setStatus('scanned');
         } else if (data?.expired) {
+          setStatus('expired');
+        } else if (data?.canceled) {
           setStatus('expired');
         }
       } catch {
@@ -1323,23 +2283,26 @@ function ChannelScanModal({
       }
     }, 2000);
     return () => clearInterval(interval);
-  }, [oauthState, status]);
+  }, [channel.type, oauthState, status]);
 
   // 倒计时
   useEffect(() => {
-    if (status !== 'waiting') return;
+    if (initError) return;
+    if (status !== 'waiting' && status !== 'scanned') return;
     if (countdown <= 0) {
       setStatus('expired');
       return;
     }
     const t = window.setTimeout(() => setCountdown((c) => c - 1), 1000);
     return () => window.clearTimeout(t);
-  }, [countdown, status]);
+  }, [countdown, initError, status]);
 
   // 成功后回调
   useEffect(() => {
     if (status !== 'success') return;
-    const t = window.setTimeout(() => onSuccess(), 1200);
+    const t = window.setTimeout(() => {
+      void onSuccess();
+    }, 1200);
     return () => window.clearTimeout(t);
   }, [status, onSuccess]);
 
@@ -1347,8 +2310,11 @@ function ChannelScanModal({
     setStatus('waiting');
     setOauthUrl('');
     setOauthState('');
+    setQrImageUrl('');
+    setWeworkLogin(null);
     setCountdown(300);
     setInitError('');
+    setRefreshSeed((value) => value + 1);
   };
 
   const channelLabel = channelNameMap[channel.type] ?? channel.name;
@@ -1441,6 +2407,46 @@ function ChannelScanModal({
                       重试
                     </button>
                   </div>
+                ) : channel.type === 'douyin' && oauthUrl ? (
+                  <div className="flex h-[208px] w-[208px] flex-col items-center justify-center rounded-lg bg-gray-50 text-center">
+                    <ShieldCheck className="h-9 w-9 text-gray-500" />
+                    <p className="mt-2 px-3 text-xs leading-relaxed text-gray-600">
+                      抖音限制 App 内直接扫码 OAuth 链接。请打开官方授权页，扫页面内的抖音二维码完成绑定。
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => window.open(oauthUrl, '_blank', 'noopener,noreferrer')}
+                      className="mt-3 rounded-lg bg-slate-950 px-3 py-1.5 text-xs font-medium text-white hover:bg-slate-800"
+                    >
+                      打开官方授权页
+                    </button>
+                  </div>
+                ) : qrImageUrl ? (
+                  <img
+                    src={qrImageUrl}
+                    width="208"
+                    height="208"
+                    alt={`${channelLabel} 扫码授权二维码`}
+                    className="h-[208px] w-[208px] rounded-lg object-contain"
+                  />
+                ) : weworkLogin && channel.type === 'wework' ? (
+                  <div className="h-[400px] w-[300px] overflow-hidden rounded-lg bg-white">
+                    <div id={weworkContainerId} className="h-[400px] w-[300px]" />
+                  </div>
+                ) : oauthUrl && channel.type === 'wechat' ? (
+                  <div className="flex h-[208px] w-[208px] flex-col items-center justify-center rounded-lg bg-gray-50 text-center">
+                    <QrCode className="h-9 w-9 text-gray-400" />
+                    <p className="mt-2 px-3 text-xs leading-relaxed text-gray-600">
+                      未能直接解析二维码，请打开官方授权页完成扫码。
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => window.open(oauthUrl, '_blank', 'noopener,noreferrer')}
+                      className="mt-3 rounded-lg bg-slate-950 px-3 py-1.5 text-xs font-medium text-white hover:bg-slate-800"
+                    >
+                      打开授权页
+                    </button>
+                  </div>
                 ) : oauthUrl ? (
                   <iframe
                     src={oauthUrl}
@@ -1461,11 +2467,16 @@ function ChannelScanModal({
 
             {/* 倒计时 / 状态行 */}
             <div className="mt-4 flex items-center gap-2 text-xs text-gray-500">
-              {status === 'waiting' && (
+              {initError ? (
+                <>
+                  <AlertCircle className="h-3.5 w-3.5 text-amber-500" />
+                  <span className="text-amber-700">请先完成必填配置后再生成二维码</span>
+                </>
+              ) : status === 'waiting' && (
                 <>
                   <Loader2 className="h-3.5 w-3.5 animate-spin" style={{ color: accent }} />
                   <span>
-                    二维码 <b className="text-gray-700 tabular-nums">{formatCountdown(countdown)}</b> 后失效
+                    {channel.type === 'douyin' ? '授权链接' : '二维码'} <b className="text-gray-700 tabular-nums">{formatCountdown(countdown)}</b> 后失效
                   </span>
                 </>
               )}
@@ -1549,6 +2560,7 @@ function AIAssistantTab() {
   const [saveMessage, setSaveMessage] = useState('');
   const [saveMessageType, setSaveMessageType] = useState<'success' | 'error' | 'info'>('info');
   const [diagnostics, setDiagnostics] = useState<LlmDiagnostics | null>(null);
+  const [autoReplyRuntime, setAutoReplyRuntime] = useState<AutoReplyRuntimeStatus | null>(null);
 
   const refreshDiagnostics = useCallback(() => {
     getLlmDiagnostics()
@@ -1557,6 +2569,15 @@ function AIAssistantTab() {
         setDiagnostics(data && typeof data === 'object' ? data : null);
       })
       .catch(() => setDiagnostics(null));
+  }, []);
+
+  const refreshAutoReplyRuntime = useCallback(() => {
+    getAutoReplyRuntimeStatus()
+      .then((res) => {
+        const data = (res as any)?.data?.data ?? (res as any)?.data ?? res;
+        setAutoReplyRuntime(data && typeof data === 'object' ? data : null);
+      })
+      .catch(() => setAutoReplyRuntime(null));
   }, []);
 
   useEffect(() => {
@@ -1581,7 +2602,10 @@ function AIAssistantTab() {
       })
       .catch(() => {});
     refreshDiagnostics();
-  }, [refreshDiagnostics]);
+    refreshAutoReplyRuntime();
+    const timer = window.setInterval(refreshAutoReplyRuntime, 10_000);
+    return () => window.clearInterval(timer);
+  }, [refreshDiagnostics, refreshAutoReplyRuntime]);
 
   const handleSave = async () => {
     setSaving(true);
@@ -1615,6 +2639,7 @@ function AIAssistantTab() {
       setSaveMessageType(connected ? 'success' : 'error');
       setSaveMessage(data?.message || (connected ? '配置已保存并连通' : '配置已保存，但真实连通测试未通过'));
       refreshDiagnostics();
+      refreshAutoReplyRuntime();
     } catch (error) {
       setSaveMessageType('error');
       setSaveMessage('保存失败，请检查后端服务和 API Key');
@@ -1823,6 +2848,37 @@ function AIAssistantTab() {
               />
             </div>
 
+            <div className={clsx(
+              'rounded-lg border px-3 py-2.5 text-xs',
+              autoReplyRuntime?.enabled
+                ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                : 'border-gray-200 bg-gray-50 text-gray-500',
+            )}>
+              <div className="flex items-center justify-between gap-3">
+                <span className="font-medium">
+                  {autoReplyRuntime?.enabled ? '真实客户自动回复运行中' : '真实客户自动回复未开启'}
+                </span>
+                {autoReplyRuntime?.enabled && (
+                  <span className="h-2 w-2 rounded-full bg-emerald-500" aria-label="运行中" />
+                )}
+              </div>
+              <p className="mt-1 leading-relaxed">
+                保持客来来与对应渠道客户端登录；桌面端约每 5 秒检查一次新消息并自动发送。
+              </p>
+              {autoReplyRuntime?.counts && (
+                <p className="mt-1 text-[11px]">
+                  已发送 {Number(autoReplyRuntime.counts.sent || 0)} 条 ·
+                  待处理 {Number(autoReplyRuntime.counts.pending || 0) + Number(autoReplyRuntime.counts.processing || 0)} 条 ·
+                  失败重试 {Number(autoReplyRuntime.counts.failed || 0)} 条
+                </p>
+              )}
+              {autoReplyRuntime?.latest?.last_error && (
+                <p className="mt-1 break-words text-[11px] text-red-600">
+                  最近失败：{autoReplyRuntime.latest.last_error}
+                </p>
+              )}
+            </div>
+
             {/* 适用阶段 */}
             <div>
               <p className="mb-2 text-sm font-medium text-gray-700">适用阶段</p>
@@ -1833,10 +2889,10 @@ function AIAssistantTab() {
               />
             </div>
 
-            {/* 需确认场景 */}
+            {/* 安全兜底场景 */}
             <div>
-              <p className="mb-2 text-sm font-medium text-gray-700">需确认场景</p>
-              <p className="mb-2 text-xs text-gray-400">以下场景 AI 回复前需人工确认</p>
+              <p className="mb-2 text-sm font-medium text-gray-700">安全兜底场景</p>
+              <p className="mb-2 text-xs text-gray-400">价格、合同和交付等敏感问题会自动回复“已收到，核实后回复”，不直接承诺。</p>
               <MultiSelectTags
                 options={CONFIRM_SCENARIOS}
                 selected={config.confirmScenarios}
@@ -2297,6 +3353,7 @@ function ProfileTab() {
   const [mockReloading, setMockReloading] = useState(false);
   // Mock 数据开关
   const [mockOn, setMockOn] = useState<boolean>(() => {
+    if (!import.meta.env.DEV) return false;
     try {
       return localStorage.getItem('kellai:useMock') === '1';
     } catch {
@@ -2304,6 +3361,7 @@ function ProfileTab() {
     }
   });
   const toggleMock = (v: boolean) => {
+    if (!import.meta.env.DEV) return;
     setMockOn(v);
     setMockReloading(true);
     try {
@@ -2517,34 +3575,35 @@ function ProfileTab() {
           </div>
         </div>
 
-        {/* Mock 数据开关（仅 dev 提示） */}
-        <div className="rounded-xl border border-amber-200 bg-amber-50/50 p-5 shadow-sm">
-          <h3 className="text-sm font-semibold text-amber-800">🧪 Mock 测试数据</h3>
-          <p className="mt-1 text-xs text-amber-700">
-            后端没起 / 想测 UI 时打开。开启后所有 <code className="rounded bg-amber-100 px-1">/api/kellai/*</code> 会用本地 12 个测试客户响应。
-            切换后会自动刷新，让请求 adapter 立即生效。
-          </p>
-          <div className="mt-3 flex items-center gap-3">
-            <Toggle
-              checked={mockOn}
-              onChange={toggleMock}
-              ariaLabel="使用 Mock 数据"
-            />
-            <span className="text-xs text-amber-700">
-              {mockReloading
-                ? `正在切换到${mockOn ? ' Mock 模式' : '真实后端'}...`
-                : mockOn
-                ? '当前：Mock 模式已开启'
-                : '当前：Mock 模式关闭'}
-            </span>
-            <button
-              onClick={() => window.location.reload()}
-              className="ml-auto rounded-md border border-amber-300 bg-white px-3 py-1 text-xs text-amber-700 hover:bg-amber-100"
-            >
-              刷新页面生效
-            </button>
+        {import.meta.env.DEV && (
+          <div className="rounded-xl border border-amber-200 bg-amber-50/50 p-5 shadow-sm">
+            <h3 className="text-sm font-semibold text-amber-800">🧪 Mock 测试数据</h3>
+            <p className="mt-1 text-xs text-amber-700">
+              后端没起 / 想测 UI 时打开。开启后所有 <code className="rounded bg-amber-100 px-1">/api/kellai/*</code> 会用本地 12 个测试客户响应。
+              切换后会自动刷新，让请求 adapter 立即生效。
+            </p>
+            <div className="mt-3 flex items-center gap-3">
+              <Toggle
+                checked={mockOn}
+                onChange={toggleMock}
+                ariaLabel="使用 Mock 数据"
+              />
+              <span className="text-xs text-amber-700">
+                {mockReloading
+                  ? `正在切换到${mockOn ? ' Mock 模式' : '真实后端'}...`
+                  : mockOn
+                  ? '当前：Mock 模式已开启'
+                  : '当前：Mock 模式关闭'}
+              </span>
+              <button
+                onClick={() => window.location.reload()}
+                className="ml-auto rounded-md border border-amber-300 bg-white px-3 py-1 text-xs text-amber-700 hover:bg-amber-100"
+              >
+                刷新页面生效
+              </button>
+            </div>
           </div>
-        </div>
+        )}
 
         {/* 保存按钮 */}
         <div className="flex items-center gap-3">
@@ -2569,7 +3628,173 @@ function ProfileTab() {
 
 /* ========== 主组件：设置中心 ========== */
 
-const TAB_KEYS: TabKey[] = ['channels', 'ai', 'followup', 'team', 'profile'];
+type XcmaxScope = { id: string; label: string; description: string };
+type XcmaxPending = {
+  request_id: string;
+  authorization_secret: string;
+  requested_scopes: XcmaxScope[];
+  expires_at: string;
+};
+type XcmaxStatus = {
+  state: 'connected' | 'pending' | 'not_connected' | 'offline';
+  connected?: boolean;
+  connection?: {
+    authorized_scopes?: string[];
+    authorized_by?: { display_name?: string };
+    connected_at?: string;
+  } | null;
+  message?: string;
+};
+
+function apiData<T>(response: any): T {
+  return (response?.data?.data ?? response?.data ?? response) as T;
+}
+
+function XcmaxIntegrationTab() {
+  const [status, setStatus] = useState<XcmaxStatus>({ state: 'not_connected' });
+  const [pending, setPending] = useState<XcmaxPending | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [working, setWorking] = useState(false);
+  const [error, setError] = useState('');
+
+  const refresh = useCallback(async () => {
+    setError('');
+    try {
+      const next = apiData<XcmaxStatus>(await getXcmaxIntegrationStatus());
+      setStatus(next);
+      if (next.state === 'pending') {
+        setPending(apiData<XcmaxPending | null>(await getXcmaxBindingPending()));
+      } else {
+        setPending(null);
+      }
+    } catch (err: any) {
+      setError(err?.response?.data?.error || err?.message || '无法连接 XCMAX 桌面端');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 4000);
+    return () => window.clearInterval(timer);
+  }, [refresh]);
+
+  const openXcmax = async () => {
+    try {
+      await invoke('open_xcmax_desktop');
+    } catch {
+      window.open('xcmax://im?source=kellai', '_blank', 'noopener,noreferrer');
+    }
+  };
+
+  const approve = async () => {
+    if (!pending) return;
+    setWorking(true);
+    setError('');
+    try {
+      await approveXcmaxBinding({
+        request_id: pending.request_id,
+        authorization_secret: pending.authorization_secret,
+        accepted_scopes: pending.requested_scopes.map((scope) => scope.id),
+      });
+      setPending(null);
+      await refresh();
+      toastStore.success('已授权 XCMAX AI 读取客来来客户数据');
+      void openXcmax();
+    } catch (err: any) {
+      setError(err?.response?.data?.error || err?.response?.data?.message || err?.message || '授权失败');
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  const cancel = async () => {
+    if (!pending) return;
+    setWorking(true);
+    setError('');
+    try {
+      await cancelXcmaxBinding({
+        request_id: pending.request_id,
+        authorization_secret: pending.authorization_secret,
+      });
+      setPending(null);
+      await refresh();
+    } catch (err: any) {
+      setError(err?.response?.data?.error || err?.message || '取消授权失败');
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  const disconnect = async () => {
+    if (!window.confirm('解除后，XCMAX 将不能读取客来来中的客户档案和会话。')) return;
+    setWorking(true);
+    setError('');
+    try {
+      await disconnectXcmaxBinding();
+      await refresh();
+    } catch (err: any) {
+      setError(err?.response?.data?.error || err?.message || '解除绑定失败');
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  if (loading) {
+    return <div className="flex min-h-[260px] items-center justify-center text-sm text-gray-500"><Loader2 className="mr-2 h-5 w-5 animate-spin" />读取授权状态…</div>;
+  }
+
+  const connected = status.state === 'connected' && Boolean(status.connected);
+  return (
+    <div className="mx-auto max-w-2xl space-y-5">
+      <div>
+        <div className="text-sm font-medium text-blue-700">客户 IM 数据来源</div>
+        <h2 className="mt-1 text-xl font-semibold text-gray-900">连接 XCMAX AI</h2>
+        <p className="mt-2 text-sm leading-6 text-gray-600">XCMAX 的 AI 工作台可基于客来来客户会话生成建议；客户沟通仍在客来来内完成。</p>
+      </div>
+
+      {connected ? (
+        <div className="border border-emerald-200 bg-emerald-50 p-5">
+          <div className="flex items-center gap-2 text-sm font-semibold text-emerald-800"><CheckCircle2 className="h-5 w-5" />已连接</div>
+          <p className="mt-2 text-sm text-emerald-700">当前客来来登录账号已完成授权，XCMAX 会立即识别为已连接。</p>
+          <div className="mt-3 text-xs text-emerald-700">已允许：{status.connection?.authorized_scopes?.length || 0} 项只读权限</div>
+          <div className="mt-5 flex gap-3">
+            <button type="button" onClick={openXcmax} className="rounded-lg bg-emerald-700 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-800">打开 XCMAX AI</button>
+            <button type="button" disabled={working} onClick={disconnect} className="rounded-lg border border-emerald-300 bg-white px-4 py-2 text-sm font-medium text-emerald-800 hover:bg-emerald-100">解除绑定</button>
+          </div>
+        </div>
+      ) : pending ? (
+        <div className="border border-blue-200 bg-white p-5 shadow-sm">
+          <div className="flex items-center gap-2 text-sm font-semibold text-gray-900"><ShieldCheck className="h-5 w-5 text-blue-600" />授权 XCMAX AI</div>
+          <p className="mt-2 text-sm leading-6 text-gray-600">将以当前登录的客来来账号完成授权。XCMAX 不会获得发送客户消息的权限。</p>
+          <div className="mt-4 divide-y divide-gray-100 border-y border-gray-100">
+            {pending.requested_scopes.map((scope) => (
+              <div key={scope.id} className="flex items-start gap-3 py-3">
+                <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-blue-600" />
+                <div><div className="text-sm font-medium text-gray-900">{scope.label}</div><div className="mt-1 text-xs leading-5 text-gray-500">{scope.description}</div></div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-5 flex gap-3">
+            <button type="button" disabled={working} onClick={approve} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50">{working ? '授权中…' : '允许并进入 XCMAX AI'}</button>
+            <button type="button" disabled={working} onClick={cancel} className="rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50">取消</button>
+          </div>
+        </div>
+      ) : (
+        <div className="border border-gray-200 bg-white p-5">
+          <div className="flex items-center gap-2 text-sm font-semibold text-gray-900"><ShieldCheck className="h-5 w-5 text-gray-500" />等待 XCMAX 发起绑定</div>
+          <p className="mt-2 text-sm leading-6 text-gray-600">请在 XCMAX 的“信息”中打开“客户消息 · 客来来”并点击绑定；客来来会自动进入此授权页。</p>
+          <button type="button" onClick={openXcmax} className="mt-5 rounded-lg bg-gray-900 px-4 py-2 text-sm font-medium text-white hover:bg-gray-800">打开 XCMAX AI</button>
+        </div>
+      )}
+
+      {error && <div className="flex items-center gap-2 border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700"><AlertCircle className="h-4 w-4 shrink-0" />{error}</div>}
+    </div>
+  );
+}
+
+const TAB_KEYS: TabKey[] = ['channels', 'ai', 'followup', 'team', 'xcmax', 'profile'];
 
 export default function Settings() {
   // 支持通过 URL ?tab=xxx 跳到指定 tab（教程用）
@@ -2602,6 +3827,8 @@ export default function Settings() {
         return <FollowUpTab />;
       case 'team':
         return <TeamTab />;
+      case 'xcmax':
+        return <XcmaxIntegrationTab />;
       case 'profile':
         return <ProfileTab />;
     }

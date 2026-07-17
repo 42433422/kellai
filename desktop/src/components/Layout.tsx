@@ -54,6 +54,9 @@ import VirtualCursor from "./VirtualCursor";
 import { ONBOARDING_WELCOME_CACHE_KEY, ONBOARDING_WELCOME_SPEECH_TEXT } from "../constants/onboardingTour";
 import { playPreparedTextToSpeech, preloadTextToSpeech, unlockTextToSpeechAudio } from "../hooks/useTextToSpeech";
 import { estimateSpeechHoldMs } from "../utils/onboardingSpeech";
+import { getXcmaxBindingPending } from "../api/settings";
+import { loopbackClient } from "../api/client";
+import type { LoginResponse } from "../types";
 
 type OnboardingSpeechWindow = Window & {
   __kellaiOnboardingWelcomePreplayedUntil?: number;
@@ -123,7 +126,7 @@ export default function Layout() {
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const userMenuRef = useRef<HTMLDivElement>(null);
-  const { user, logout } = useAuthStore();
+  const { user, logout, acceptLoginResponse } = useAuthStore();
   const { applied, toggle } = useThemeStore();
   const unreadTotal = useMessageStore(selectUnreadTotal);
   const unreadByCustomer = useMessageStore((s) => s.unreadByCustomer);
@@ -217,6 +220,42 @@ export default function Layout() {
     startOnboarding();
     navigate(location.pathname || "/", { replace: true });
   }, [location.pathname, location.search, navigate, startOnboarding]);
+
+  useEffect(() => {
+    let disposed = false;
+    const routePendingAuthorization = async () => {
+      try {
+        const response: any = await getXcmaxBindingPending();
+        const pending = response?.data?.data ?? response?.data ?? response;
+        if (!pending?.request_id || disposed) return;
+        const params = new URLSearchParams(location.search);
+        if (location.pathname === '/settings' && params.get('tab') === 'xcmax') return;
+        navigate('/settings?tab=xcmax', { replace: true });
+      } catch {
+        // A stale mock-mode session cannot read the real pending request.  The
+        // handoff endpoint validates that a pairing exists before replacing it.
+        try {
+          const response = await loopbackClient.post<LoginResponse>(
+            '/api/kellai/auth/xcmax-desktop',
+            {},
+            { headers: { 'X-Kellai-Local-Pairing': '1' } },
+          );
+          const login = response.data;
+          if (!login?.success || !login.access_token || !login.user || disposed) return;
+          acceptLoginResponse(login);
+          navigate('/settings?tab=xcmax', { replace: true });
+        } catch {
+          // XCMAX is offline or did not initiate a pairing. Keep the current view.
+        }
+      }
+    };
+    void routePendingAuthorization();
+    const timer = window.setInterval(() => void routePendingAuthorization(), 2000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [acceptLoginResponse, location.pathname, location.search, navigate]);
 
   return (
     <div className="flex h-screen bg-gray-50 dark:bg-slate-900">

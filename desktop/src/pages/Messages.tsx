@@ -10,6 +10,8 @@ import {
   ChevronRight,
   Volume2,
   Square,
+  Users,
+  UserCheck,
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import ChannelLogo, { CHANNEL_BRAND_COLOR } from '../components/ChannelLogo';
@@ -18,12 +20,23 @@ import { updatePipelineStage } from '../api/funnel';
 import { getScriptHint } from '../api/sales';
 import { useApiQuery, useApiMutation, useQueryClient } from '../hooks/useApiQuery';
 import { useMessageStore } from '../stores/message';
+import { useAuthStore } from '../stores/auth';
 import { useSalesStore } from '../stores/salesStore';
 import { toastStore } from '../stores/toast';
 import ScriptHintToast from '../components/ScriptHintToast';
 import { useTextToSpeech } from '../hooks/useTextToSpeech';
 import { unwrapApiResponse } from '../utils/format';
 import type { SalesScriptHint } from '../types';
+import {
+  assignCustomer,
+  autoAssignCustomer,
+  claimCustomer,
+  getWorkforceOverview,
+  releaseCustomer,
+  type CustomerAssignment,
+  type WorkforceMember,
+  type WorkforceOverview,
+} from '../api/workforce';
 
 /** 消息项（API 返回） */
 interface MessageItem {
@@ -40,6 +53,11 @@ interface MessageItem {
   ai_score?: number;
   pending_follow_up?: boolean;
   next_action?: string;
+  metadata?: Record<string, unknown>;
+  assignee_user_id?: number;
+  assignee_name?: string;
+  assignment_status?: string;
+  assignment_source?: string;
   read: boolean;
   created_at: string;
 }
@@ -61,6 +79,11 @@ interface ContactGroup {
   pendingFollowUp: boolean;
   nextAction: string;
   unreadCount: number;
+  isGroup: boolean;
+  assigneeUserId: number;
+  assigneeName: string;
+  assignmentStatus: string;
+  assignmentSource: string;
   messages: MessageItem[];
 }
 
@@ -237,6 +260,13 @@ function groupMessagesByCustomer(messages: MessageItem[]): ContactGroup[] {
     if (existing) {
       existing.messages.push(msg);
       existing.channelTypes = [...new Set([...existing.channelTypes, msg.channel_type])];
+      existing.isGroup = existing.isGroup || Boolean(msg.metadata?.is_group);
+      if (msg.assignee_user_id) {
+        existing.assigneeUserId = Number(msg.assignee_user_id);
+        existing.assigneeName = msg.assignee_name || existing.assigneeName;
+        existing.assignmentStatus = msg.assignment_status || existing.assignmentStatus;
+        existing.assignmentSource = msg.assignment_source || existing.assignmentSource;
+      }
       // 更新最新消息（按时间比较）
       if (new Date(msg.created_at) > new Date(existing.lastTime)) {
         existing.lastMessage = msg.content;
@@ -267,6 +297,11 @@ function groupMessagesByCustomer(messages: MessageItem[]): ContactGroup[] {
         pendingFollowUp: Boolean(msg.pending_follow_up),
         nextAction: msg.next_action || '',
         unreadCount: !msg.read && msg.direction === 'inbound' ? 1 : 0,
+        isGroup: Boolean(msg.metadata?.is_group),
+        assigneeUserId: Number(msg.assignee_user_id || 0),
+        assigneeName: msg.assignee_name || '',
+        assignmentStatus: msg.assignment_status || 'unassigned',
+        assignmentSource: msg.assignment_source || '',
         messages: [msg],
       });
     }
@@ -288,12 +323,16 @@ function groupMessagesByCustomer(messages: MessageItem[]): ContactGroup[] {
 /** 统一消息中心主页面 */
 export default function Messages() {
   const queryClient = useQueryClient();
+  const currentUser = useAuthStore((s) => s.user);
+  const canManageAssignments = ['owner', 'admin'].includes(String(currentUser?.role || ''));
   const [selectedContactId, setSelectedContactId] = useState<number | null>(null);
   const [searchText, setSearchText] = useState('');
 
   // 输入区状态
   const [inputText, setInputText] = useState('');
   const [selectedChannel, setSelectedChannel] = useState('wework');
+  const [selectedAssigneeId, setSelectedAssigneeId] = useState<number>(0);
+  const [assignmentUpdating, setAssignmentUpdating] = useState(false);
 
   // AI 助手侧边栏
   const [aiSidebarOpen, setAiSidebarOpen] = useState(true);
@@ -375,28 +414,150 @@ export default function Messages() {
     { staleTime: 5 * 60 * 1000 }
   );
 
+  const { data: workforce = {
+    presence: [],
+    assignments: [],
+    online_count: 0,
+    idle_count: 0,
+    assigned_count: 0,
+  } } = useApiQuery<WorkforceOverview>(
+    ['workforce', 'overview'],
+    async () => {
+      const response = await getWorkforceOverview();
+      return unwrapApiResponse<WorkforceOverview>(response);
+    },
+    {
+      refetchInterval: 10 * 1000,
+      refetchIntervalInBackground: false,
+    }
+  );
+  const workforcePresence = Array.isArray(workforce?.presence) ? workforce.presence : [];
+  const workforceAssignments = Array.isArray(workforce?.assignments) ? workforce.assignments : [];
+  const workforceOnlineCount = Number(workforce?.online_count || 0);
+  const workforceIdleCount = Number(workforce?.idle_count || 0);
+
   // 按客户聚合
   const contacts = groupMessagesByCustomer(messagesRaw);
   const selectedContact = contacts.find((c) => c.customerId === selectedContactId) ?? null;
+  const selectedAssignment = (
+    workforceAssignments.find((item) => item.customer_id === selectedContact?.customerId)
+    ?? (selectedContact?.assigneeUserId
+      ? {
+          customer_id: selectedContact.customerId,
+          assignee_user_id: selectedContact.assigneeUserId,
+          assignee_name: selectedContact.assigneeName,
+          status: selectedContact.assignmentStatus,
+          source: selectedContact.assignmentSource,
+        } as CustomerAssignment
+      : null)
+  );
+
+  useEffect(() => {
+    if (!selectedContact) return;
+    const preferred = selectedContact.lastMessageChannel;
+    if (preferred && !['web', 'miniprogram'].includes(preferred)) {
+      setSelectedChannel(preferred);
+    }
+    setSelectedAssigneeId(Number(selectedAssignment?.assignee_user_id || 0));
+  }, [
+    selectedContact?.customerId,
+    selectedContact?.lastMessageChannel,
+    selectedAssignment?.assignee_user_id,
+  ]);
+
+  const refreshAssignments = useCallback(() => {
+    queryClient.invalidateQueries({ queryKey: ['workforce', 'overview'] });
+    queryClient.invalidateQueries({ queryKey: ['messages', 'list'] });
+    queryClient.invalidateQueries({ queryKey: ['customers'] });
+  }, [queryClient]);
+
+  const handleClaimCustomer = async () => {
+    if (!selectedContact) return;
+    setAssignmentUpdating(true);
+    try {
+      await claimCustomer(selectedContact.customerId);
+      toastStore.success('客户已由你承接');
+      refreshAssignments();
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail;
+      toastStore.error(detail?.message || err?.message || '抢单失败，该客户可能已被其他成员承接');
+    } finally {
+      setAssignmentUpdating(false);
+    }
+  };
+
+  const handleAssignCustomer = async () => {
+    if (!selectedContact || selectedAssigneeId <= 0) return;
+    setAssignmentUpdating(true);
+    try {
+      await assignCustomer(selectedContact.customerId, selectedAssigneeId);
+      toastStore.success('客户负责人已更新');
+      refreshAssignments();
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail;
+      toastStore.error(detail?.message || err?.message || '分配失败');
+    } finally {
+      setAssignmentUpdating(false);
+    }
+  };
+
+  const handleAutoAssignCustomer = async () => {
+    if (!selectedContact) return;
+    setAssignmentUpdating(true);
+    try {
+      await autoAssignCustomer(selectedContact.customerId);
+      toastStore.success('已按在线状态和当前负载自动分配');
+      refreshAssignments();
+    } catch (err: any) {
+      toastStore.error(err?.response?.data?.error || err?.message || '自动分配失败');
+    } finally {
+      setAssignmentUpdating(false);
+    }
+  };
+
+  const handleReleaseCustomer = async () => {
+    if (!selectedContact) return;
+    setAssignmentUpdating(true);
+    try {
+      await releaseCustomer(selectedContact.customerId);
+      toastStore.success('客户已释放，可重新分配');
+      refreshAssignments();
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail;
+      toastStore.error(detail?.message || err?.message || '释放失败');
+    } finally {
+      setAssignmentUpdating(false);
+    }
+  };
 
   /* ---- 发送消息 Mutation ---- */
   const sendMutation = useApiMutation<
     unknown,
     { customerId: number; channel: string; contactId: string; content: string }
   >(
-    (vars) => sendMessage(vars.customerId, vars.channel, vars.contactId, vars.content),
+    (vars) => sendMessage(
+      vars.customerId,
+      vars.channel,
+      vars.contactId,
+      vars.content,
+      selectedContact?.customerName ?? '',
+    ),
     {
       onSuccess: () => {
         setInputText('');
         setShowQuickReplies(false);
+        toastStore.success('消息已发送');
         // 立即拉取最新消息
         queryClient.invalidateQueries({ queryKey: ['messages', 'list'] });
         queryClient.invalidateQueries({ queryKey: ['funnel', 'data'] });
         queryClient.invalidateQueries({ queryKey: ['dashboard'] });
         void fetchUnread();
       },
-      onError: () => {
-        // 错误 toast 由 axios 拦截器自动处理
+      onError: (error) => {
+        // HTTP/网络错误由 axios 拦截器提示；HTTP 200 的业务失败需显式展示。
+        if (error?.name === 'MessageSendError') {
+          toastStore.error(error.message || '发送失败');
+        }
       },
     }
   );
@@ -462,10 +623,17 @@ export default function Messages() {
   /** 发送消息 */
   const handleSend = useCallback(() => {
     if (!selectedContact || !inputText.trim()) return;
+    if (selectedContact.isGroup && selectedChannel === 'douyin') {
+      toastStore.error('抖音群消息已汇总；群内发送还需开放平台粉丝群发送能力');
+      return;
+    }
+    const channelMessage = [...selectedContact.messages]
+      .reverse()
+      .find((message) => message.channel_type === selectedChannel);
     sendMutation.mutate({
       customerId: selectedContact.customerId,
       channel: selectedChannel,
-      contactId: selectedContact.messages[0]?.contact_id ?? '',
+      contactId: channelMessage?.contact_id ?? selectedContact.messages[0]?.contact_id ?? '',
       content: inputText.trim(),
     });
   }, [selectedContact, inputText, selectedChannel, sendMutation]);
@@ -532,6 +700,8 @@ export default function Messages() {
 
   const sending = sendMutation.isPending;
   const aiLoading = suggestMutation.isPending;
+  const canReplyCurrent = !(selectedContact?.isGroup && selectedChannel === 'douyin');
+  const currentUserId = Number(currentUser?.id || 0);
   const nextStage = selectedContact ? getNextPipelineStage(selectedContact.stage) : null;
   const advancingStage = advanceStageMutation.isPending;
 
@@ -688,6 +858,11 @@ export default function Messages() {
                         待跟进
                       </span>
                     )}
+                    {selectedContact.isGroup && (
+                      <span className="rounded bg-violet-50 px-1.5 py-0.5 text-[10px] font-medium text-violet-600 dark:bg-violet-500/20 dark:text-violet-300">
+                        外部群
+                      </span>
+                    )}
                   </div>
                   <div className="mt-0.5 flex items-center gap-1.5">
                     {selectedContact.channelTypes.map((ch) => {
@@ -763,6 +938,11 @@ export default function Messages() {
                               isInbound ? 'justify-start' : 'justify-end'
                             )}
                           >
+                            {isInbound && selectedContact.isGroup && Boolean(msg.metadata?.sender_name) && (
+                              <span className="text-[10px] text-violet-500 dark:text-violet-300">
+                                {String(msg.metadata?.sender_name || '')}
+                              </span>
+                            )}
                             <ChannelLogo type={msg.channel_type} size={12} />
                             {msg.ai_intent && (
                               <span
@@ -871,7 +1051,7 @@ export default function Messages() {
                   aria-label="选择发送渠道"
                 >
                   {channelsRaw.length > 0
-                    ? channelsRaw.filter((ch) => ch.type !== 'douyin' && ch.type !== 'web' && ch.type !== 'miniprogram').map((ch) => (
+                    ? channelsRaw.filter((ch) => ch.type !== 'web' && ch.type !== 'miniprogram').map((ch) => (
                         <option key={ch.id} value={ch.type}>{CHANNEL_LABEL[ch.type] ?? ch.name}</option>
                       ))
                     : (
@@ -890,9 +1070,10 @@ export default function Messages() {
                     value={inputText}
                     onChange={(e) => setInputText(e.target.value)}
                     onKeyDown={handleKeyDown}
-                    placeholder="输入消息，Enter 发送，Shift+Enter 换行..."
+                    placeholder={canReplyCurrent ? '输入消息，Enter 发送，Shift+Enter 换行...' : '抖音群消息暂为统一汇总只读'}
                     aria-label="消息输入框"
                     rows={2}
+                    disabled={!canReplyCurrent}
                     className="w-full resize-none rounded-lg border border-gray-200 px-3 py-2 text-sm text-gray-700 outline-none placeholder:text-gray-400 focus:border-blue-400 dark:border-slate-700 dark:bg-slate-700 dark:text-slate-200 dark:placeholder:text-slate-500"
                   />
                 </div>
@@ -923,11 +1104,11 @@ export default function Messages() {
                   {/* 发送按钮 */}
                   <button
                     onClick={handleSend}
-                    disabled={sending || !inputText.trim()}
+                    disabled={sending || !inputText.trim() || !canReplyCurrent}
                     aria-label="发送消息"
                     className={clsx(
                       'flex items-center gap-1 rounded-lg px-3 py-2 text-xs font-medium transition-colors',
-                      sending || !inputText.trim()
+                      sending || !inputText.trim() || !canReplyCurrent
                         ? 'cursor-not-allowed bg-gray-100 text-gray-400 dark:bg-slate-700 dark:text-slate-500'
                         : 'bg-blue-500 text-white hover:bg-blue-600'
                     )}
@@ -974,6 +1155,120 @@ export default function Messages() {
           </div>
 
           <div className="flex-1 space-y-4 overflow-y-auto px-4 py-3 min-h-0">
+            {/* 接待分配与员工负载 */}
+            <div className="rounded-lg bg-white p-3 shadow-sm dark:bg-slate-800 dark:shadow-none">
+              <div className="mb-2 flex items-center justify-between">
+                <div className="flex items-center gap-1.5">
+                  <Users className="h-3.5 w-3.5 text-blue-500" />
+                  <h4 className="text-xs font-semibold text-gray-500 dark:text-slate-400">接待分配</h4>
+                </div>
+                <span className="text-[10px] text-gray-400">
+                  在线 {workforceOnlineCount} · 空闲 {workforceIdleCount}
+                </span>
+              </div>
+
+              <div className="rounded-md bg-gray-50 px-3 py-2 dark:bg-slate-700/60">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs text-gray-500 dark:text-slate-400">当前负责人</span>
+                  <span className={clsx(
+                    'rounded px-1.5 py-0.5 text-[10px] font-medium',
+                    selectedAssignment?.status === 'assigned'
+                      ? 'bg-green-100 text-green-700 dark:bg-green-500/20 dark:text-green-300'
+                      : 'bg-amber-100 text-amber-700 dark:bg-amber-500/20 dark:text-amber-300'
+                  )}>
+                    {selectedAssignment?.status === 'assigned' ? '已分配' : '待分配'}
+                  </span>
+                </div>
+                <p className="mt-1 text-sm font-medium text-gray-900 dark:text-slate-100">
+                  {selectedAssignment?.assignee_name || '尚未分配'}
+                </p>
+                {selectedAssignment?.source && (
+                  <p className="mt-0.5 text-[10px] text-gray-400">
+                    来源：{selectedAssignment.source.includes('auto') ? '空闲优先自动路由' : selectedAssignment.source}
+                  </p>
+                )}
+              </div>
+
+              {canManageAssignments ? (
+                <div className="mt-2 space-y-2">
+                  <select
+                    value={selectedAssigneeId}
+                    onChange={(event) => setSelectedAssigneeId(Number(event.target.value))}
+                    className="w-full rounded-md border border-gray-200 bg-white px-2 py-1.5 text-xs text-gray-700 outline-none focus:border-blue-400 dark:border-slate-600 dark:bg-slate-700 dark:text-slate-200"
+                    aria-label="选择客户负责人"
+                  >
+                    <option value={0}>选择团队成员</option>
+                    {workforcePresence.map((member: WorkforceMember) => (
+                      <option key={member.user_id} value={member.user_id}>
+                        {member.display_name} · {member.availability === 'idle' ? '空闲' : member.online ? '忙碌' : '离线'} · {member.active_count} 个客户
+                      </option>
+                    ))}
+                  </select>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={handleAssignCustomer}
+                      disabled={assignmentUpdating || selectedAssigneeId <= 0}
+                      className="rounded-md bg-blue-600 px-2 py-1.5 text-xs font-medium text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      指定负责人
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleAutoAssignCustomer}
+                      disabled={assignmentUpdating}
+                      className="rounded-md border border-blue-200 px-2 py-1.5 text-xs font-medium text-blue-700 hover:bg-blue-50 disabled:opacity-50 dark:border-blue-500/40 dark:text-blue-300"
+                    >
+                      空闲优先分配
+                    </button>
+                  </div>
+                </div>
+              ) : selectedAssignment?.status !== 'assigned' ? (
+                <button
+                  type="button"
+                  onClick={handleClaimCustomer}
+                  disabled={assignmentUpdating}
+                  className="mt-2 flex w-full items-center justify-center gap-1.5 rounded-md bg-blue-600 px-3 py-2 text-xs font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+                >
+                  <UserCheck className="h-3.5 w-3.5" />
+                  我来承接
+                </button>
+              ) : null}
+
+              {selectedAssignment?.status === 'assigned'
+                && (canManageAssignments || selectedAssignment.assignee_user_id === currentUserId) && (
+                <button
+                  type="button"
+                  onClick={handleReleaseCustomer}
+                  disabled={assignmentUpdating}
+                  className="mt-2 w-full rounded-md px-2 py-1.5 text-xs font-medium text-gray-500 hover:bg-gray-100 disabled:opacity-50 dark:text-slate-400 dark:hover:bg-slate-700"
+                >
+                  释放并重新排队
+                </button>
+              )}
+
+              <div className="mt-3 space-y-1">
+                {workforcePresence.slice(0, 5).map((member: WorkforceMember) => (
+                  <div key={member.user_id} className="flex items-center justify-between text-[10px]">
+                    <span className="flex min-w-0 items-center gap-1.5 text-gray-500 dark:text-slate-400">
+                      <span className={clsx(
+                        'h-1.5 w-1.5 shrink-0 rounded-full',
+                        member.availability === 'idle'
+                          ? 'bg-green-500'
+                          : member.online
+                            ? 'bg-amber-500'
+                            : 'bg-gray-300'
+                      )} />
+                      <span className="truncate">{member.display_name}</span>
+                    </span>
+                    <span className="text-gray-400">
+                      {member.availability === 'idle' ? '空闲' : member.online ? '忙碌' : '离线'} · {member.active_count}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
             {/* 客户画像摘要 */}
             <div className="rounded-lg bg-white p-3 shadow-sm dark:bg-slate-800 dark:shadow-none">
               <h4 className="mb-2 text-xs font-semibold text-gray-500 dark:text-slate-400">客户画像</h4>

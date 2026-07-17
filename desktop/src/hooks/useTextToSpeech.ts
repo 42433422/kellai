@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { API_BASE_URL } from '../api/client';
 
 type SpeakOptions = {
   preferLocal?: boolean;
@@ -8,7 +9,7 @@ type SpeakOptions = {
   onPlaybackEnd?: (info: PlaybackInfo) => void;
 };
 
-const TTS_API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8793').replace(/\/$/, '');
+const TTS_API_BASE_URL = API_BASE_URL.replace(/\/$/, '');
 
 type PlaybackInfo = {
   engine: 'web-audio' | 'html-audio';

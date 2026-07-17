@@ -1,5 +1,6 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
 import { AlertTriangle, RefreshCw } from "lucide-react";
+import { appPath } from "../utils/routing";
 
 interface Props {
   children: ReactNode;
@@ -65,7 +66,7 @@ export default class ErrorBoundary extends Component<Props, State> {
                 重新加载
               </button>
               <button
-                onClick={() => (window.location.href = "/")}
+                onClick={() => (window.location.href = appPath("/"))}
                 className="inline-flex items-center gap-2 rounded-lg border border-gray-200 bg-white px-4 py-2 text-sm font-medium text-gray-600 hover:bg-gray-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700 transition-colors"
               >
                 返回工作台

@@ -28,6 +28,11 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "macOS": {
+      "entitlements": "Entitlements.plist",
+      "infoPlist": "Info.plist",
+      "signingIdentity": "Developer ID Application: jialong Li (G26WSH472M)"
+    },
     "icon": [
       "icons/kellai-32x32.png",
       "icons/kellai-128x128.png",

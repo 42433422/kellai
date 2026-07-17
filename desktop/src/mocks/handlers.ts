@@ -59,6 +59,22 @@ const mockOutboundCalls: Record<number, any[]> = {};
 
 /** mock 短信验证码存储：phone → code（找回密码 / 验证码登录用） */
 const mockSmsCodes: Record<string, string> = {};
+const mockQrLoginSessions: Record<string, {
+  secret: string;
+  status: 'waiting' | 'scanned' | 'authorized' | 'expired' | 'canceled' | 'failed';
+  expiresAt: number;
+  user?: ReturnType<typeof buildMockUser>;
+  login?: {
+    success: boolean;
+    access_token: string;
+    refresh_token: string;
+    access_expires_at: string;
+    refresh_expires_at: string;
+    user: ReturnType<typeof buildMockUser>;
+  };
+  error?: string;
+}> = {};
+const MOCK_QR_LOGIN_TTL_MS = 180 * 1000;
 const mockLlmConfig = {
   provider: 'deepseek',
   model: 'deepseek-chat',
@@ -116,8 +132,8 @@ const channelMockState: Record<string, {
   createdAt: string;
 }> = {
   // 即时通讯
-  wechat:     { id: 'ch_wechat',     name: '微信',         type: 'wechat',     channel_type: 'wechat',     adapter_class: 'WechatAdapter',     enabled: true,  connected: true,  config: {}, message: '已连接', createdAt: '2026-01-01T00:00:00Z' },
-  wework:     { id: 'ch_wework',     name: '企业微信',     type: 'wework',     channel_type: 'wework',     adapter_class: 'WecomAdapter',      enabled: true,  connected: true,  config: { corp_id: 'ww123456', secret: '***', agent_id: '1000002' }, message: '已连接', createdAt: '2026-01-01T00:00:00Z' },
+  wechat:     { id: 'ch_wechat',     name: '微信开放平台', type: 'wechat',     channel_type: 'wechat',     adapter_class: 'WeChatAdapter',      enabled: true,  connected: true,  config: { app_id: 'wx_mock_app', app_secret: '***', oauth_authorized: 'true', oauth_openid: 'mock_openid' }, message: '已连接', createdAt: '2026-01-01T00:00:00Z' },
+  wework:     { id: 'ch_wework',     name: '企业微信',     type: 'wework',     channel_type: 'wework',     adapter_class: 'WecomAdapter',      enabled: true,  connected: true,  config: { corp_id: 'ww123456', secret: '***', agent_id: '1000002', kf_url: 'https://work.weixin.qq.com/kfid/kfcfd8a26b4a56f24ee', open_kfid: 'kfcfd8a26b4a56f24ee' }, message: '已连接', createdAt: '2026-01-01T00:00:00Z' },
   douyin:     { id: 'ch_douyin',     name: '抖音',         type: 'douyin',     channel_type: 'douyin',     adapter_class: 'DouyinAdapter',     enabled: false, connected: false, config: {}, message: '未连接', createdAt: '2026-01-01T00:00:00Z' },
   miniprogram:{ id: 'ch_miniprogram',name: '公众号/小程序', type: 'miniprogram',channel_type: 'miniprogram',adapter_class: 'MiniappAdapter',    enabled: false, connected: false, config: {}, message: '未连接', createdAt: '2026-01-01T00:00:00Z' },
   // 电商平台
@@ -138,6 +154,7 @@ const channelMockState: Record<string, {
 
 /* 每个渠道类型的必填配置字段（测试连接时校验） */
 const channelRequiredFields: Record<string, string[]> = {
+  wechat: ['app_id', 'app_secret'],
   wework: ['corp_id', 'secret', 'agent_id'],
   douyin: ['app_id', 'app_secret'],
   miniprogram: ['app_id', 'app_secret'],
@@ -299,6 +316,115 @@ export const mockAdapter: AxiosAdapter = async (config) => {
       }
     }
     return ok(config, { success: true, data: buildMockUser('test@kellai.com') });
+  }
+
+  if (url === '/api/kellai/auth/qr/start' && method === 'post') {
+    await sendDelay();
+    const sessionId = `mock_qr_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    const secret = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+    const expiresAt = Date.now() + MOCK_QR_LOGIN_TTL_MS;
+    mockQrLoginSessions[sessionId] = {
+      secret,
+      status: 'waiting',
+      expiresAt,
+    };
+    const origin = typeof window !== 'undefined' ? window.location.origin : 'http://127.0.0.1:5173';
+    const query = new URLSearchParams({ qr_session: sessionId, qr_secret: secret });
+    return ok(config, {
+      success: true,
+      data: {
+        session_id: sessionId,
+        secret,
+        login_url: `${origin}/login?${query.toString()}`,
+        expires_in: Math.floor(MOCK_QR_LOGIN_TTL_MS / 1000),
+        expires_at: Math.floor(expiresAt / 1000),
+      },
+    });
+  }
+
+  if (url === '/api/kellai/auth/qr/status' && method === 'get') {
+    await sendDelay();
+    const sessionId = String(params?.session_id || '');
+    const session = mockQrLoginSessions[sessionId];
+    if (!session || session.expiresAt <= Date.now()) {
+      if (session) delete mockQrLoginSessions[sessionId];
+      return ok(config, { success: true, data: { status: 'expired', expired: true } });
+    }
+    return ok(config, {
+      success: true,
+      data: {
+        status: session.status,
+        scanned: session.status === 'scanned' || session.status === 'authorized',
+        authorized: session.status === 'authorized',
+        expired: false,
+        expires_in: Math.max(0, Math.floor((session.expiresAt - Date.now()) / 1000)),
+        user: session.user,
+        login: session.login,
+        error: session.error,
+      },
+    });
+  }
+
+  if (url === '/api/kellai/auth/qr/scan' && method === 'post') {
+    await sendDelay();
+    const sessionId = String(data?.session_id || '');
+    const secret = String(data?.secret || '');
+    const session = mockQrLoginSessions[sessionId];
+    if (!session || session.expiresAt <= Date.now()) {
+      return ok(config, { success: false, error: '二维码已过期' });
+    }
+    if (session.secret !== secret) {
+      return ok(config, { success: false, error: '二维码无效' });
+    }
+    if (session.status === 'waiting') session.status = 'scanned';
+    return ok(config, { success: true, data: { status: session.status } });
+  }
+
+  if (url === '/api/kellai/auth/qr/confirm' && method === 'post') {
+    await sendDelay();
+    const sessionId = String(data?.session_id || '');
+    const secret = String(data?.secret || '');
+    const session = mockQrLoginSessions[sessionId];
+    if (!session || session.expiresAt <= Date.now()) {
+      return ok(config, { success: false, error: '二维码已过期' });
+    }
+    if (session.secret !== secret) {
+      return ok(config, { success: false, error: '二维码无效' });
+    }
+    const userStr = typeof window !== 'undefined' ? localStorage.getItem('auth_user') : null;
+    let user = buildMockUser('test@kellai.com');
+    if (userStr) {
+      try {
+        user = JSON.parse(userStr);
+      } catch {
+        // keep default user
+      }
+    }
+    session.user = user;
+    session.login = {
+      success: true,
+      access_token: 'mock-qr-token-' + Date.now(),
+      refresh_token: 'mock-qr-refresh-' + Date.now(),
+      access_expires_at: new Date(Date.now() + 3600 * 1000).toISOString(),
+      refresh_expires_at: new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString(),
+      user,
+    };
+    session.status = 'authorized';
+    return ok(config, { success: true, data: { status: 'authorized', user } });
+  }
+
+  if (url === '/api/kellai/auth/qr/cancel' && method === 'post') {
+    await sendDelay();
+    const sessionId = String(data?.session_id || '');
+    const secret = String(data?.secret || '');
+    const session = mockQrLoginSessions[sessionId];
+    if (!session) return ok(config, { success: true, data: { status: 'expired' } });
+    if (session.secret !== secret) {
+      return ok(config, { success: false, error: '二维码无效' });
+    }
+    session.status = 'canceled';
+    session.error = '用户已取消';
+    return ok(config, { success: true, data: { status: 'canceled' } });
   }
 
   /* 发送短信验证码（mock：固定 123456，并在响应里回带便于联调） */
@@ -1010,6 +1136,55 @@ export const mockAdapter: AxiosAdapter = async (config) => {
       success: true,
       data: Object.values(channelMockState),
     });
+  }
+
+  if (url === '/api/kellai/channels/wework/customer-entry' && method === 'get') {
+    await sendDelay();
+    const source = String(params?.source || 'settings');
+    const targetUrl = String(channelMockState.wework.config.kf_url || '');
+    const origin = typeof window !== 'undefined' ? window.location.origin : 'http://127.0.0.1:5173';
+    const entryQuery = new URLSearchParams({ source });
+    return ok(config, {
+      success: Boolean(targetUrl),
+      data: {
+        entry_url: `${origin}/api/kellai/channels/wework/customer-entry?${entryQuery.toString()}`,
+        target_url: targetUrl,
+        source,
+      },
+      error: targetUrl ? '' : '请先配置企业微信客服接待链接或 open_kfid',
+    });
+  }
+
+  const oauthInitMatch = url.match(/^\/api\/kellai\/channels\/(wechat|wework)\/oauth\/initiate$/);
+  if (oauthInitMatch && method === 'post') {
+    await sendDelay();
+    const ctype = oauthInitMatch[1];
+    return ok(config, {
+      success: true,
+      data: {
+        url: `about:blank#mock-${ctype}-oauth`,
+        state: `mock_${ctype}_${Date.now()}`,
+        qr_proxy_url: ctype === 'wechat'
+          ? 'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22208%22 height=%22208%22 viewBox=%220 0 208 208%22%3E%3Crect width=%22208%22 height=%22208%22 fill=%22white%22/%3E%3Crect x=%2224%22 y=%2224%22 width=%2252%22 height=%2252%22 fill=%22%2307C160%22/%3E%3Crect x=%22132%22 y=%2224%22 width=%2252%22 height=%2252%22 fill=%22%2307C160%22/%3E%3Crect x=%2224%22 y=%22132%22 width=%2252%22 height=%2252%22 fill=%22%2307C160%22/%3E%3Crect x=%2292%22 y=%2292%22 width=%2220%22 height=%2220%22 fill=%22%2307C160%22/%3E%3Crect x=%22120%22 y=%22120%22 width=%2216%22 height=%2216%22 fill=%22%2307C160%22/%3E%3Crect x=%22152%22 y=%22148%22 width=%2212%22 height=%2212%22 fill=%22%2307C160%22/%3E%3Ctext x=%22104%22 y=%22198%22 text-anchor=%22middle%22 font-size=%2212%22 fill=%22%236b7280%22%3Emock wechat qr%3C/text%3E%3C/svg%3E'
+          : '',
+        expires_in: 300,
+      },
+    });
+  }
+
+  const oauthStatusMatch = url.match(/^\/api\/kellai\/channels\/(wechat|wework)\/oauth\/status$/);
+  if (oauthStatusMatch && method === 'get') {
+    await sendDelay();
+    const ctype = oauthStatusMatch[1];
+    const ch = channelMockState[ctype];
+    if (ch) {
+      ch.enabled = true;
+      ch.connected = true;
+      if (ctype === 'wechat') {
+        ch.config = { ...ch.config, oauth_authorized: 'true', oauth_openid: 'mock_openid' };
+      }
+    }
+    return ok(config, { success: true, data: { authorized: true, expired: false } });
   }
 
   /* LLM 状态（ai 命名空间） */

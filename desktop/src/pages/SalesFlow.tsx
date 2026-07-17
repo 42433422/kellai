@@ -31,10 +31,25 @@ import {
 } from '../api/sales';
 import { useSalesStore } from '../stores/salesStore';
 import { toastStore } from '../stores/toast';
-import { MOCK_CUSTOMERS } from '../mocks/customers';
+import { getCustomers } from '../api/customer';
 import { formatTimeAgo } from '../utils/format';
-import type { SalesFlow, Quote, Contract, LTVForecast, SalesScriptHint, SalesFlowStep } from '../types';
-import { FLOW_STEPS, STEP_LABELS } from '../mocks/sales';
+import type {
+  SalesFlow,
+  Quote,
+  Contract,
+  LTVForecast,
+  SalesScriptHint,
+  SalesFlowStep,
+  CustomerListResponse,
+} from '../types';
+
+const FLOW_STEPS: SalesFlowStep[] = ['requirement', 'proposal', 'promotion', 'signing'];
+const STEP_LABELS: Record<SalesFlowStep, string> = {
+  requirement: '需求确认',
+  proposal: '方案推荐',
+  promotion: '促单',
+  signing: '签约',
+};
 
 const WIZARD_STEPS = FLOW_STEPS.map((id) => ({ id, label: STEP_LABELS[id] }));
 
@@ -50,8 +65,14 @@ export default function SalesFlow() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { selectedCustomerId, setSelectedCustomer, setActiveFlow, setActiveQuote } = useSalesStore();
-  const [customerId, setCustomerId] = useState(selectedCustomerId ?? MOCK_CUSTOMERS[0]?.customer_id ?? 1001);
+  const [customerId, setCustomerId] = useState(selectedCustomerId ?? 0);
   const [search, setSearch] = useState('');
+
+  const customersQuery = useApiQuery<CustomerListResponse>(
+    ['sales', 'customers'],
+    () => getCustomers({ limit: 500 })
+  );
+  const customers = customersQuery.data?.customers ?? [];
 
   const flowQuery = useApiQuery<SalesFlow>(
     ['sales', 'flow', customerId],
@@ -107,18 +128,32 @@ export default function SalesFlow() {
   );
 
   useEffect(() => {
-    setSelectedCustomer(customerId);
+    setSelectedCustomer(customerId > 0 ? customerId : null);
   }, [customerId, setSelectedCustomer]);
+
+  useEffect(() => {
+    if (!customersQuery.data) return;
+    if (customers.length === 0) {
+      if (customerId !== 0) setCustomerId(0);
+      return;
+    }
+    if (!customers.some((customer) => customer.customer_id === customerId)) {
+      const selected = selectedCustomerId
+        ? customers.find((customer) => customer.customer_id === selectedCustomerId)
+        : undefined;
+      setCustomerId(selected?.customer_id ?? customers[0].customer_id);
+    }
+  }, [customerId, customers, customersQuery.data, selectedCustomerId]);
 
   const filteredCustomers = useMemo(() => {
     const kw = search.trim().toLowerCase();
-    if (!kw) return MOCK_CUSTOMERS;
-    return MOCK_CUSTOMERS.filter(
+    if (!kw) return customers;
+    return customers.filter(
       (c) =>
         c.display_name?.toLowerCase().includes(kw) ||
         c.company?.toLowerCase().includes(kw)
     );
-  }, [search]);
+  }, [customers, search]);
 
   const quote = quoteMutation.data;
   const contract = contractMutation.data;
@@ -203,7 +238,13 @@ export default function SalesFlow() {
                 </button>
               ))}
               {filteredCustomers.length === 0 && (
-                <p className="py-6 text-center text-xs text-gray-400">未找到匹配客户</p>
+                <p className="py-6 text-center text-xs text-gray-400">
+                  {customersQuery.isLoading
+                    ? '正在加载客户…'
+                    : search.trim()
+                      ? '未找到匹配客户'
+                      : '还没有真实客户，请先绑定渠道或新建客户'}
+                </p>
               )}
             </div>
           </div>
@@ -267,7 +308,7 @@ export default function SalesFlow() {
                 <button
                   type="button"
                   onClick={() => advanceMutation.mutate()}
-                  disabled={advanceMutation.isPending || isCompleted}
+                  disabled={!customerId || advanceMutation.isPending || isCompleted}
                   className="flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
                 >
                   {advanceMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
@@ -276,7 +317,7 @@ export default function SalesFlow() {
                 <button
                   type="button"
                   onClick={() => quoteMutation.mutate()}
-                  disabled={quoteMutation.isPending}
+                  disabled={!customerId || quoteMutation.isPending}
                   className="flex items-center gap-2 rounded-lg border border-gray-300 px-4 py-2 text-sm font-medium hover:bg-gray-50 dark:border-slate-600 dark:hover:bg-slate-700"
                 >
                   {quoteMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <DollarSign className="h-4 w-4" />}
@@ -413,7 +454,8 @@ export default function SalesFlow() {
           <button
             type="button"
             onClick={() => navigate(`/customers/${customerId}`)}
-            className="flex w-full items-center justify-center gap-1 text-sm text-blue-600 hover:underline dark:text-blue-400"
+            disabled={!customerId}
+            className="flex w-full items-center justify-center gap-1 text-sm text-blue-600 hover:underline disabled:cursor-not-allowed disabled:text-gray-400 dark:text-blue-400 dark:disabled:text-slate-600"
           >
             查看客户详情 <ChevronRight className="h-4 w-4" />
           </button>

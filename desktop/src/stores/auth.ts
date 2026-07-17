@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { request } from "../api/client";
+import { loopbackClient, request } from "../api/client";
 import type {
   User,
   LoginRequest,
@@ -252,6 +252,8 @@ interface AuthState {
   loginBySms: (phone: string, code: string) => Promise<void>;
   /** 注册 */
   register: (data: RegisterRequest) => Promise<void>;
+  /** 接受已有登录响应（扫码登录 / 外部登录回调） */
+  acceptLoginResponse: (data: LoginResponse) => void;
   /** 获取当前用户信息 */
   fetchMe: () => Promise<void>;
   /** 登出 */
@@ -327,6 +329,22 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     });
   },
 
+  acceptLoginResponse: (data: LoginResponse) => {
+    localStorage.setItem("auth_token", data.access_token);
+    if (data.refresh_token) {
+      localStorage.setItem("auth_refresh_token", data.refresh_token);
+    }
+    localStorage.setItem("auth_user", JSON.stringify(data.user));
+    if (data.user?.email) {
+      rememberEmail(data.user.email, data.user?.display_name || data.user?.name || "");
+    }
+    set({
+      token: data.access_token,
+      user: data.user,
+      isAuthenticated: true,
+    });
+  },
+
   fetchMe: async () => {
     const user = await request<User>("get", "/api/kellai/auth/me");
     localStorage.setItem("auth_user", JSON.stringify(user));
@@ -362,7 +380,8 @@ export const useAuthStore = create<AuthState>((set, get) => ({
    *   1) 如果已经登录（token + user 都在），直接返回 true。
    *   2) 否则查找有 autoLoginEnabled 的最新凭据。
    *   3) 用保存的密码调用 login()，成功即进入；失败则清除该凭据的 autoLogin 开关。
-   *   4) 如果没有任何可自动登录的凭据，返回 false。
+   *   4) 没有本地凭据时，仅在 XCMAX 已发起本机绑定请求的情况下进入
+   *      客来来授权页；正常启动不会创建或切换账号。
    */
   attemptSilentAutoLogin: async () => {
     if (get().isAuthenticated) return true;
@@ -370,32 +389,51 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     try {
       const creds = pruneExpiredCredentials();
       const target = creds.find((c) => c.autoLoginEnabled);
-      if (!target) return false;
-      const pwd = deobfuscatePassword(target.password);
-      if (!pwd) {
-        setAutoLoginEnabled(target.email, false);
-        return false;
-      }
-      try {
-        await get().login(target.email, pwd);
-        // 成功：更新 lastAutoLoginAt
-        const list = readCredentials();
-        const idx = list.findIndex(
-          (x) => x.email.toLowerCase() === target.email.toLowerCase()
-        );
-        if (idx >= 0) {
-          list[idx] = {
-            ...list[idx],
-            lastAutoLoginAt: new Date().toISOString(),
-          };
-          writeCredentials(list);
+      if (target) {
+        const pwd = deobfuscatePassword(target.password);
+        if (!pwd) {
+          setAutoLoginEnabled(target.email, false);
+        } else {
+          try {
+            await get().login(target.email, pwd);
+            // 成功：更新 lastAutoLoginAt
+            const list = readCredentials();
+            const idx = list.findIndex(
+              (x) => x.email.toLowerCase() === target.email.toLowerCase()
+            );
+            if (idx >= 0) {
+              list[idx] = {
+                ...list[idx],
+                lastAutoLoginAt: new Date().toISOString(),
+              };
+              writeCredentials(list);
+            }
+            return true;
+          } catch {
+            // 失败（密码错误 / 账号异常）：关闭该凭据的 autoLogin，避免下次再失败
+            setAutoLoginEnabled(target.email, false);
+          }
         }
-        return true;
-      } catch {
-        // 失败（密码错误 / 账号异常）：关闭该凭据的 autoLogin，避免下次再失败
-        setAutoLoginEnabled(target.email, false);
-        return false;
       }
+
+      try {
+        const response = await loopbackClient.post<LoginResponse>(
+          "/api/kellai/auth/xcmax-desktop",
+          {},
+          {
+            headers: { "X-Kellai-Local-Pairing": "1" },
+            skipLoading: true,
+            skipErrorToast: true,
+          }
+        );
+        if (response.data?.success && response.data.access_token && response.data.user) {
+          get().acceptLoginResponse(response.data);
+          return true;
+        }
+      } catch {
+        // XCMAX 未发起绑定时保持普通登录页，避免显示无关错误。
+      }
+      return false;
     } finally {
       set({ silentAutoLoginRunning: false });
     }
