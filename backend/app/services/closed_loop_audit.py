@@ -49,8 +49,9 @@ def _now_iso() -> str:
 
 
 def _data_root() -> Path:
-    raw = (os.environ.get("KELLAI_DATA_DIR") or "").strip()
-    root = Path(raw).expanduser().resolve() if raw else Path(__file__).resolve().parents[3] / "data"
+    from app.services.tenant_context import tenant_data_root
+
+    root = tenant_data_root(required=False)
     root.mkdir(parents=True, exist_ok=True)
     return root
 

@@ -1247,7 +1247,7 @@ class TestDouyinAdapter:
 
         assert result["success"] is True
         assert result["data"]["direction"] == "inbound"
-        inbox = message_store.list_inbox("douyin", limit=10)
+        inbox = message_store.list_inbox("douyin", limit=10, team_id=11)
         assert len(inbox) == 1
         assert inbox[0]["contact_id"] == "customer-open-id"
         assert inbox[0]["contact_name"] == "抖音客户"
@@ -1342,7 +1342,7 @@ class TestDouyinAdapter:
 
         assert result["success"] is True
         assert result["data"]["direction"] == "inbound"
-        inbox = message_store.list_inbox("douyin", limit=10)
+        inbox = message_store.list_inbox("douyin", limit=10, team_id=39)
         assert len(inbox) == 1
         assert inbox[0]["contact_id"] == "miniapp-customer-open-id"
         assert inbox[0]["contact_name"] == "小程序客户"
@@ -1375,14 +1375,14 @@ class TestDouyinAdapter:
 
         pulled = douyin_channel.pull_team_inbox(11, limit=10)
         assert [row["id"] for row in pulled] == [team_11_id]
-        assert {row["id"] for row in message_store.list_inbox("douyin", limit=10)} == {
+        assert {row["id"] for row in message_store.list_inbox("douyin", limit=10, team_id=11)} == {
             team_11_id,
-            team_12_id,
         }
+        assert [row["id"] for row in message_store.list_inbox("douyin", limit=10, team_id=12)] == [team_12_id]
 
         assert douyin_channel.ack_team_inbox(12, [team_11_id]) == 0
         assert douyin_channel.ack_team_inbox(11, [team_11_id]) == 1
-        assert [row["id"] for row in message_store.list_inbox("douyin", limit=10)] == [
+        assert [row["id"] for row in message_store.list_inbox("douyin", limit=10, team_id=12)] == [
             team_12_id
         ]
 
@@ -1469,7 +1469,7 @@ class TestDouyinAdapter:
             result = await routes.douyin_webhook_receive(request, BackgroundTasks())
 
         assert result["data"]["direction"] == "inbound"
-        inbox = message_store.list_inbox("douyin", limit=10)
+        inbox = message_store.list_inbox("douyin", limit=10, team_id=11)
         assert inbox[0]["contact_id"] == f"group:{group_id}"
         assert inbox[0]["contact_name"] == "华东客户交流群"
         assert inbox[0]["metadata"]["is_group"] is True
@@ -1544,7 +1544,7 @@ class TestWorkforceRouting:
                 user_id=2,
             )
         assert workforce_routing.assignment_for_customer(
-            int(second["customer_id"])
+            int(second["customer_id"]), team_id=1
         )["assignee_user_id"] == 3
 
     async def test_inbound_message_auto_assigns_and_syncs_owner(self, tmp_db):
@@ -1569,10 +1569,15 @@ class TestWorkforceRouting:
             )
         )
 
-        assignment = workforce_routing.assignment_for_customer(saved.customer_id)
+        assignment = workforce_routing.assignment_for_customer(
+            saved.customer_id, team_id=1
+        )
         assert assignment is not None
         assert assignment["assignee_user_id"] == 2
-        doc = load_pipeline(saved.customer_id)
+        from app.services.tenant_context import tenant_scope
+
+        with tenant_scope(1):
+            doc = load_pipeline(saved.customer_id)
         assert doc["team_id"] == 1
         assert doc["owner"] == "销售A"
 
@@ -1720,7 +1725,7 @@ class TestWorkforceRouting:
         )
 
         synced = await routes.sync_channel_inbox(
-            routes.ChannelSyncInboxBody(channel_type="douyin", limit=20)
+            routes.ChannelSyncInboxBody(channel_type="douyin", limit=20, team_id=1)
         )
         assert synced["data"]["synced"] == 2
         assert synced["data"]["consumed"] == 2
@@ -1733,10 +1738,10 @@ class TestWorkforceRouting:
         )
 
         private_assignment = workforce_routing.assignment_for_customer(
-            int(private_message["customer_id"])
+            int(private_message["customer_id"]), team_id=1
         )
         group_assignment = workforce_routing.assignment_for_customer(
-            int(group_message["customer_id"])
+            int(group_message["customer_id"]), team_id=1
         )
         assert private_assignment is not None
         assert private_assignment["source"] == "douyin_inbound"
@@ -1766,13 +1771,15 @@ class TestWorkforceRouting:
         assert conflict.value.status_code == 409
 
         workspace_rows = message_store.get_messages_with_state(
-            int(private_message["customer_id"])
+            int(private_message["customer_id"]), team_id=1
         )
         assert workspace_rows[0]["content"] == "私聊咨询企业套餐"
         assert workspace_rows[0]["assignee_user_id"] == 2
         assert workspace_rows[0]["assignee_name"] == "销售A"
         assert workspace_rows[0]["assignment_status"] == "assigned"
-        assert message_store.get_unread_count(int(private_message["customer_id"])) == 1
+        assert message_store.get_unread_count(
+            int(private_message["customer_id"]), team_id=1
+        ) == 1
 
         overview = workforce_routing.routing_overview(1)
         assert overview["online_count"] == 2
@@ -2091,11 +2098,14 @@ class TestInboxEndToEnd:
         assert out["data"]["synced"] == 1
         assert out["data"]["consumed"] == 1
         ack.assert_awaited_once_with(11, ["douyin:remote-message-1"])
-        customer = next(
-            row
-            for row in list_pipeline_client_summaries()
-            if row["display_name"] == "远端抖音客户"
-        )
+        from app.services.tenant_context import tenant_scope
+
+        with tenant_scope(11):
+            customer = next(
+                row
+                for row in list_pipeline_client_summaries()
+                if row["display_name"] == "远端抖音客户"
+            )
         assert customer["team_id"] == 11
 
     async def test_simulate_customer_behavior_returns_scenario_assertions(self, tmp_db):

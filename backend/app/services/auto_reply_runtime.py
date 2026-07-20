@@ -14,6 +14,11 @@ from typing import Any
 
 from app.channels.base import UnifiedMessage
 from app.services.crm_store import _crm_db_path
+from app.services.tenant_context import (
+    infer_legacy_owner_team_id,
+    resolve_team_id,
+    tenant_scope,
+)
 
 
 SAFE_CONFIRMATION_REPLY = (
@@ -50,11 +55,27 @@ def _iso(value: datetime | None = None) -> str:
 
 def ensure_schema() -> None:
     with sqlite3.connect(str(_crm_db_path())) as conn:
+        existing = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='kellai_auto_reply_jobs'"
+        ).fetchone()
+        if existing:
+            info = conn.execute("PRAGMA table_info(kellai_auto_reply_jobs)").fetchall()
+            primary_key = [
+                str(row[1])
+                for row in sorted(info, key=lambda item: int(item[5]))
+                if int(row[5]) > 0
+            ]
+            if primary_key != ["team_id", "inbound_message_id"]:
+                conn.execute(
+                    "ALTER TABLE kellai_auto_reply_jobs "
+                    "RENAME TO kellai_auto_reply_jobs_legacy_tenant"
+                )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS kellai_auto_reply_jobs (
-                inbound_message_id TEXT PRIMARY KEY,
                 team_id INTEGER NOT NULL DEFAULT 0,
+                inbound_message_id TEXT NOT NULL,
                 customer_id INTEGER NOT NULL,
                 channel_type TEXT NOT NULL,
                 contact_id TEXT NOT NULL,
@@ -72,17 +93,42 @@ def ensure_schema() -> None:
                 outbound_message_id TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                sent_at TEXT NOT NULL DEFAULT ''
+                sent_at TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (team_id, inbound_message_id)
             )
             """
         )
+        legacy = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='kellai_auto_reply_jobs_legacy_tenant'"
+        ).fetchone()
+        if legacy:
+            owner_team_id = infer_legacy_owner_team_id()
+            conn.execute(
+                f"""
+                INSERT OR IGNORE INTO kellai_auto_reply_jobs
+                    (team_id, inbound_message_id, customer_id, channel_type,
+                     contact_id, contact_name, inbound_content, content_type,
+                     stage, status, reply_content, policy_reason, attempts,
+                     available_at, lease_until, last_error, outbound_message_id,
+                     created_at, updated_at, sent_at)
+                SELECT CASE WHEN team_id > 0 THEN team_id ELSE {int(owner_team_id or 0)} END,
+                       inbound_message_id, customer_id, channel_type, contact_id,
+                       contact_name, inbound_content, content_type, stage, status,
+                       reply_content, policy_reason, attempts, available_at,
+                       lease_until, last_error, outbound_message_id, created_at,
+                       updated_at, sent_at
+                FROM kellai_auto_reply_jobs_legacy_tenant
+                """
+            )
+            conn.execute("DROP TABLE kellai_auto_reply_jobs_legacy_tenant")
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_auto_reply_status "
-            "ON kellai_auto_reply_jobs(status, available_at)"
+            "CREATE INDEX IF NOT EXISTS idx_auto_reply_team_status "
+            "ON kellai_auto_reply_jobs(team_id, status, available_at)"
         )
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_auto_reply_contact "
-            "ON kellai_auto_reply_jobs(channel_type, contact_id, created_at)"
+            "CREATE INDEX IF NOT EXISTS idx_auto_reply_team_contact "
+            "ON kellai_auto_reply_jobs(team_id, channel_type, contact_id, created_at)"
         )
         conn.commit()
 
@@ -126,6 +172,7 @@ def enqueue_message(message: UnifiedMessage) -> bool:
     if int(message.customer_id or 0) <= 0 or not str(message.contact_id or "").strip():
         return False
     metadata = message.metadata if isinstance(message.metadata, dict) else {}
+    team_id = resolve_team_id(int(metadata.get("team_id") or 0), required=True)
     if bool(metadata.get("is_group")):
         return False
     config = _enabled_config()
@@ -154,7 +201,7 @@ def enqueue_message(message: UnifiedMessage) -> bool:
             """,
             (
                 str(message.id),
-                int(metadata.get("team_id") or 0),
+                team_id,
                 int(message.customer_id),
                 str(message.channel_type or ""),
                 str(message.contact_id or ""),
@@ -189,18 +236,22 @@ def _build_reply(row: sqlite3.Row) -> tuple[str, str]:
     from app.services.ai_copilot import generate_auto_reply
     from app.services.message_store import get_messages
 
-    config = _enabled_config()
-    history_messages = get_messages(int(row["customer_id"]), limit=8)
-    history = [
-        f"{'客服' if str(item.direction) == 'outbound' else '客户'}：{item.content}"
-        for item in reversed(history_messages)
-    ]
-    result = generate_auto_reply(
-        int(row["customer_id"]),
-        message=str(row["inbound_content"] or ""),
-        stage=str(row["stage"] or ""),
-        history=history,
-    )
+    team_id = int(row["team_id"] or 0)
+    with tenant_scope(team_id):
+        config = _enabled_config()
+        history_messages = get_messages(
+            int(row["customer_id"]), limit=8, team_id=team_id
+        )
+        history = [
+            f"{'客服' if str(item.direction) == 'outbound' else '客户'}：{item.content}"
+            for item in reversed(history_messages)
+        ]
+        result = generate_auto_reply(
+            int(row["customer_id"]),
+            message=str(row["inbound_content"] or ""),
+            stage=str(row["stage"] or ""),
+            history=history,
+        )
     policy_reason = _requires_safe_reply(
         str(row["inbound_content"] or ""),
         list(config.get("confirmScenarios") or []),
@@ -218,18 +269,17 @@ def _build_reply(row: sqlite3.Row) -> tuple[str, str]:
 def claim_jobs(*, team_id: int = 0, limit: int = 3) -> list[dict[str, Any]]:
     """Lease pending jobs and attach a generated, policy-checked reply."""
 
-    config = _enabled_config()
-    if not bool(config.get("autoReplyEnabled")):
-        return []
+    team_id = resolve_team_id(team_id, required=True)
+    with tenant_scope(team_id):
+        config = _enabled_config()
+        if not bool(config.get("autoReplyEnabled")):
+            return []
     now = _now()
     now_iso = _iso(now)
     lease_until = _iso(now + timedelta(seconds=90))
     with _connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        where_team = "AND team_id IN (0, ?)" if int(team_id or 0) > 0 else ""
-        params: list[Any] = [now_iso, now_iso]
-        if where_team:
-            params.append(int(team_id))
+        params: list[Any] = [now_iso, now_iso, team_id]
         params.append(max(1, min(int(limit), 10)) * 5)
         candidates = conn.execute(
             f"""
@@ -239,7 +289,7 @@ def claim_jobs(*, team_id: int = 0, limit: int = 3) -> list[dict[str, Any]]:
                     (status IN ('pending', 'failed') AND available_at <= ?)
                  OR (status = 'processing' AND lease_until != '' AND lease_until <= ?)
               )
-              {where_team}
+              AND team_id = ?
             ORDER BY created_at ASC
             LIMIT ?
             """,
@@ -247,9 +297,13 @@ def claim_jobs(*, team_id: int = 0, limit: int = 3) -> list[dict[str, Any]]:
         ).fetchall()
 
         # Coalesce bursts from one contact: answer the latest inbound message.
-        latest_by_contact: dict[tuple[str, str], sqlite3.Row] = {}
+        latest_by_contact: dict[tuple[int, str, str], sqlite3.Row] = {}
         for row in candidates:
-            key = (str(row["channel_type"]), str(row["contact_id"]))
+            key = (
+                int(row["team_id"]),
+                str(row["channel_type"]),
+                str(row["contact_id"]),
+            )
             previous = latest_by_contact.get(key)
             if previous is None or str(row["created_at"]) >= str(previous["created_at"]):
                 latest_by_contact[key] = row
@@ -257,13 +311,17 @@ def claim_jobs(*, team_id: int = 0, limit: int = 3) -> list[dict[str, Any]]:
         selected_ids = {str(row["inbound_message_id"]) for row in selected}
         for row in candidates:
             inbound_id = str(row["inbound_message_id"])
-            key = (str(row["channel_type"]), str(row["contact_id"]))
+            key = (
+                int(row["team_id"]),
+                str(row["channel_type"]),
+                str(row["contact_id"]),
+            )
             latest = latest_by_contact.get(key)
             if latest is not None and inbound_id != str(latest["inbound_message_id"]):
                 conn.execute(
                     "UPDATE kellai_auto_reply_jobs SET status='superseded', updated_at=? "
-                    "WHERE inbound_message_id=?",
-                    (now_iso, inbound_id),
+                    "WHERE team_id=? AND inbound_message_id=?",
+                    (now_iso, team_id, inbound_id),
                 )
         for inbound_id in selected_ids:
             conn.execute(
@@ -271,9 +329,9 @@ def claim_jobs(*, team_id: int = 0, limit: int = 3) -> list[dict[str, Any]]:
                 UPDATE kellai_auto_reply_jobs
                 SET status='processing', attempts=attempts+1, lease_until=?,
                     last_error='', updated_at=?
-                WHERE inbound_message_id=?
+                WHERE team_id=? AND inbound_message_id=?
                 """,
-                (lease_until, now_iso, inbound_id),
+                (lease_until, now_iso, team_id, inbound_id),
             )
 
     jobs: list[dict[str, Any]] = []
@@ -289,9 +347,9 @@ def claim_jobs(*, team_id: int = 0, limit: int = 3) -> list[dict[str, Any]]:
                 """
                 UPDATE kellai_auto_reply_jobs
                 SET reply_content=?, policy_reason=?, updated_at=?
-                WHERE inbound_message_id=? AND status='processing'
+                WHERE team_id=? AND inbound_message_id=? AND status='processing'
                 """,
-                (reply, policy_reason, _iso(), inbound_id),
+                (reply, policy_reason, _iso(), team_id, inbound_id),
             )
         jobs.append(
             {
@@ -321,36 +379,34 @@ def complete_job(
     inbound_id = str(inbound_message_id or "").strip()
     if not inbound_id:
         return False
+    try:
+        team_id = resolve_team_id(team_id, required=True)
+    except PermissionError:
+        return False
     now = _now()
     with _connect() as conn:
-        team_clause = " AND team_id IN (0, ?)" if int(team_id or 0) > 0 else ""
         if success:
             params: list[Any] = [
                 str(outbound_message_id or ""),
                 _iso(now),
                 _iso(now),
+                team_id,
                 inbound_id,
             ]
-            if team_clause:
-                params.append(int(team_id))
             cursor = conn.execute(
                 f"""
                 UPDATE kellai_auto_reply_jobs
                 SET status='sent', outbound_message_id=?, sent_at=?, lease_until='',
                     last_error='', updated_at=?
-                WHERE inbound_message_id=? AND status != 'sent'
-                {team_clause}
+                WHERE team_id=? AND inbound_message_id=? AND status != 'sent'
                 """,
                 params,
             )
         else:
-            select_params: list[Any] = [inbound_id]
-            if team_clause:
-                select_params.append(int(team_id))
             row = conn.execute(
-                "SELECT attempts FROM kellai_auto_reply_jobs WHERE inbound_message_id=?"
-                f"{team_clause}",
-                select_params,
+                "SELECT attempts FROM kellai_auto_reply_jobs "
+                "WHERE team_id=? AND inbound_message_id=?",
+                (team_id, inbound_id),
             ).fetchone()
             if row is None:
                 return False
@@ -360,16 +416,14 @@ def complete_job(
                 _iso(now + timedelta(seconds=delay)),
                 str(error or "发送失败")[:1000],
                 _iso(now),
+                team_id,
                 inbound_id,
             ]
-            if team_clause:
-                update_params.append(int(team_id))
             cursor = conn.execute(
                 f"""
                 UPDATE kellai_auto_reply_jobs
                 SET status='failed', available_at=?, lease_until='', last_error=?, updated_at=?
-                WHERE inbound_message_id=? AND status != 'sent'
-                {team_clause}
+                WHERE team_id=? AND inbound_message_id=? AND status != 'sent'
                 """,
                 update_params,
             )
@@ -377,26 +431,20 @@ def complete_job(
 
 
 def runtime_status(*, team_id: int = 0) -> dict[str, Any]:
-    config = _enabled_config()
+    team_id = resolve_team_id(team_id, required=True)
+    with tenant_scope(team_id):
+        config = _enabled_config()
     with _connect() as conn:
-        if int(team_id or 0) > 0:
-            rows = conn.execute(
-                "SELECT status, COUNT(*) AS count FROM kellai_auto_reply_jobs "
-                "WHERE team_id IN (0, ?) GROUP BY status",
-                (int(team_id),),
-            ).fetchall()
-            latest = conn.execute(
-                "SELECT * FROM kellai_auto_reply_jobs WHERE team_id IN (0, ?) "
-                "ORDER BY updated_at DESC LIMIT 1",
-                (int(team_id),),
-            ).fetchone()
-        else:
-            rows = conn.execute(
-                "SELECT status, COUNT(*) AS count FROM kellai_auto_reply_jobs GROUP BY status"
-            ).fetchall()
-            latest = conn.execute(
-                "SELECT * FROM kellai_auto_reply_jobs ORDER BY updated_at DESC LIMIT 1"
-            ).fetchone()
+        rows = conn.execute(
+            "SELECT status, COUNT(*) AS count FROM kellai_auto_reply_jobs "
+            "WHERE team_id = ? GROUP BY status",
+            (team_id,),
+        ).fetchall()
+        latest = conn.execute(
+            "SELECT * FROM kellai_auto_reply_jobs WHERE team_id = ? "
+            "ORDER BY updated_at DESC LIMIT 1",
+            (team_id,),
+        ).fetchone()
     counts = {str(row["status"]): int(row["count"] or 0) for row in rows}
     latest_payload: dict[str, Any] = {}
     if latest is not None:

@@ -237,12 +237,14 @@ class DouyinAdapter(ChannelAdapter):
             try:
                 from app.services.message_store import get_messages
 
-                for message in get_messages(customer_id, "douyin", limit=100):
+                for message in get_messages(
+                    customer_id, "douyin", limit=100, team_id=team_id
+                ):
                     if str(message.contact_id or "") != str(contact_id or ""):
                         continue
                     metadata = message.metadata if isinstance(message.metadata, dict) else {}
                     message_team_id = int(metadata.get("team_id") or 0)
-                    if team_id > 0 and message_team_id not in {0, int(team_id)}:
+                    if team_id > 0 and message_team_id != int(team_id):
                         continue
                     resolved_name = resolved_name or str(message.contact_name or "").strip()
                     if str(metadata.get("source") or "") == "douyin_web_portal":
@@ -287,13 +289,15 @@ class DouyinAdapter(ChannelAdapter):
             try:
                 from app.services.message_store import get_messages
 
-                for message in get_messages(customer_id, "douyin", limit=50):
+                for message in get_messages(
+                    customer_id, "douyin", limit=50, team_id=team_id
+                ):
                     metadata = message.metadata if isinstance(message.metadata, dict) else {}
                     if str(message.contact_id or "") != str(contact_id or ""):
                         continue
                     if str(message.direction or "").lower() != "inbound":
                         continue
-                    if int(metadata.get("team_id") or 0) not in {0, int(team_id)}:
+                    if int(metadata.get("team_id") or 0) != int(team_id):
                         continue
                     if metadata.get("server_message_id") and metadata.get("conversation_id"):
                         raw = dict(metadata)
@@ -422,7 +426,11 @@ class DouyinAdapter(ChannelAdapter):
             else:
                 from app.services.message_store import list_inbox
 
-                rows = list_inbox(self.channel_type, limit=int(limit))
+                rows = list_inbox(
+                    self.channel_type,
+                    limit=int(limit),
+                    team_id=team_id,
+                )
         except Exception as exc:
             logger.warning("读取抖音收件箱失败: %s", exc)
             return []

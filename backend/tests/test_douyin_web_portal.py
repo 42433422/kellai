@@ -250,10 +250,11 @@ def test_synced_outbound_replaces_desktop_provisional(portal):
             direction="outbound",
             content="桌面自动回复",
             content_type="text",
-            metadata={
-                "source": "douyin_desktop_automation",
-                "pending_portal_sync": True,
-            },
+                metadata={
+                    "source": "douyin_desktop_automation",
+                    "pending_portal_sync": True,
+                    "team_id": 3,
+                },
             created_at="2023-11-14T22:13:20+00:00",
         )
     )

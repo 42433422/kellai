@@ -16,25 +16,33 @@ import threading
 from pathlib import Path
 from typing import Any, Optional
 
+from app.services.tenant_context import current_team_id, tenant_data_root
+
 logger = logging.getLogger(__name__)
 
 _LOCK = threading.RLock()
 
-_CONFIG_PATH = Path(
-    os.environ.get("KELLAI_CHANNEL_CONFIG_PATH")
-    or str(Path(__file__).resolve().parents[3] / "data" / "channel_configs.json")
-)
+def _config_path() -> Path:
+    explicit = (os.environ.get("KELLAI_CHANNEL_CONFIG_PATH") or "").strip()
+    team_id = current_team_id()
+    if explicit:
+        path = Path(explicit).expanduser().resolve()
+        if team_id > 0:
+            return path.parent / "tenants" / str(team_id) / path.name
+        return path
+    return tenant_data_root(required=False) / "channel_configs.json"
 
 
 def _ensure_parent() -> None:
-    _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _config_path().parent.mkdir(parents=True, exist_ok=True)
 
 
 def _read_disk() -> dict[str, Any]:
-    if not _CONFIG_PATH.exists():
+    path = _config_path()
+    if not path.exists():
         return {}
     try:
-        raw = _CONFIG_PATH.read_text(encoding="utf-8")
+        raw = path.read_text(encoding="utf-8")
         if not raw.strip():
             return {}
         data = json.loads(raw)
@@ -46,10 +54,11 @@ def _read_disk() -> dict[str, Any]:
 
 def _write_disk(data: dict[str, Any]) -> None:
     _ensure_parent()
-    tmp = _CONFIG_PATH.with_suffix(_CONFIG_PATH.suffix + ".tmp")
+    path = _config_path()
+    tmp = path.with_suffix(path.suffix + ".tmp")
     try:
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(_CONFIG_PATH)
+        tmp.replace(path)
     except Exception as exc:
         logger.warning("写入渠道配置失败: %s", exc)
 

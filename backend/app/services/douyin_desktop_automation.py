@@ -38,7 +38,9 @@ def _now_iso() -> str:
 
 
 def _cache_path() -> Path:
-    return _crm_db_path().parent / "douyin-desktop-automation.json"
+    from app.services.tenant_context import tenant_data_root
+
+    return tenant_data_root(required=False) / "douyin-desktop-automation.json"
 
 
 def _read_cache() -> dict[str, Any]:
@@ -331,8 +333,9 @@ def _flow_coordinates(bounds: dict[str, float]) -> dict[str, int]:
         "search_y": round(y + height * 0.118),
         "first_result_x": round(x + width * 0.477),
         "first_result_y": round(y + height * 0.251),
-        "input_x": round(x + width * 0.608),
-        "input_y": round(y + height * 0.760),
+        # 抖音 8.1 将消息编辑器向右移；留在输入区中部，避免点到左侧容器。
+        "input_x": round(x + width * 0.70),
+        "input_y": round(y + height * 0.72),
     }
 
 

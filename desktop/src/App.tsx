@@ -29,6 +29,7 @@ const Funnel = lazy(() => import("./pages/Funnel"));
 const Messages = lazy(() => import("./pages/Messages"));
 const CustomerDetail = lazy(() => import("./pages/CustomerDetail"));
 const Customers = lazy(() => import("./pages/Customers"));
+const AIAssets = lazy(() => import("./pages/AIAssets"));
 const AIAssistant = lazy(() => import("./pages/AIAssistant"));
 const Settings = lazy(() => import("./pages/Settings"));
 const SalesFlow = lazy(() => import("./pages/SalesFlow"));
@@ -275,6 +276,7 @@ export default function App() {
               <Route path="messages" element={<Page><Messages /></Page>} />
               <Route path="customers/:id" element={<Page><CustomerDetail /></Page>} />
               <Route path="customers" element={<Page><Customers /></Page>} />
+              <Route path="ai-assets" element={<Page><AIAssets /></Page>} />
               <Route path="ai" element={<Page><AIAssistant /></Page>} />
               <Route path="settings" element={<Page><Settings /></Page>} />
               {/* v3 Sales */}

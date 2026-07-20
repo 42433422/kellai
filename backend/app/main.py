@@ -17,6 +17,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api.routes import router
 from app.api import sales, content, scout, flow, finance, open as open_api
+from app.services.tenant_context import bind_request_tenant, reset_request_tenant
 
 # --- 日志基础配置 ---
 logging.basicConfig(
@@ -269,6 +270,25 @@ async def _request_log_middleware(
     user_id: object = "-"
     user_info: dict | None = None
 
+    # 浏览器的 CORS 预检请求不会携带 Authorization。严格认证若在这里
+    # 提前返回 401，CORSMiddleware 就没有机会生成 allow-origin/headers，
+    # Tauri WebView 中所有带 Bearer token 的真实请求都会被浏览器拦截。
+    # 预检本身不执行业务路由，认证仍由随后真正的请求完成。
+    if request.method == "OPTIONS":
+        request.state.user = None
+        request.state.user_id = user_id
+        response = await call_next(request)
+        duration_ms = (time.perf_counter() - start) * 1000.0
+        logger.info(
+            "request %s %s status=%s duration=%.2fms user_id=%s",
+            request.method,
+            path,
+            response.status_code,
+            duration_ms,
+            user_id,
+        )
+        return response
+
     token = _extract_bearer(request)
     if token:
         try:
@@ -303,6 +323,7 @@ async def _request_log_middleware(
     request.state.user = user_info
     request.state.user_id = user_id
 
+    tenant_tokens = bind_request_tenant(user_info)
     try:
         response = await call_next(request)
         status_code = response.status_code
@@ -317,6 +338,8 @@ async def _request_log_middleware(
             exc,
         )
         raise
+    finally:
+        reset_request_tenant(tenant_tokens)
 
     duration_ms = (time.perf_counter() - start) * 1000.0
     logger.info(
@@ -336,8 +359,20 @@ async def _request_log_middleware(
 def create_app() -> FastAPI:
     _ensure_data_dir()
     _bootstrap_auth()
+    try:
+        from app.services.tenant_context import migrate_legacy_single_tenant_files
 
-    app = FastAPI(title="客来来", version="0.1.0", description="商机流水线 · 独立于 XCAGI")
+        migration = migrate_legacy_single_tenant_files()
+        if migration.get("migrated"):
+            logger.info(
+                "旧版单租户文件已复制到隔离目录: team_id=%s files=%s",
+                migration.get("team_id"),
+                len(migration.get("copied") or []),
+            )
+    except Exception as exc:
+        logger.warning("租户文件迁移检查失败: %s", exc)
+
+    app = FastAPI(title="客来来", version="1.0.1", description="商机流水线 · 独立于 XCAGI")
 
     # CORS：白名单
     origins = _load_cors_origins()

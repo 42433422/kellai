@@ -18,7 +18,9 @@ _LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
 
 def _store_path() -> Path:
-    root = Path(os.environ.get("KELLAI_DATA_DIR") or Path.cwd() / "data").expanduser().resolve()
+    from app.services.tenant_context import tenant_data_root
+
+    root = tenant_data_root(required=False)
     path = root / "integrations" / "xcmax.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
@@ -26,6 +28,10 @@ def _store_path() -> Path:
 
 def _read() -> dict[str, Any]:
     path = _store_path()
+    return _read_path(path)
+
+
+def _read_path(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {"version": 1, "connection": None}
     try:
@@ -156,6 +162,11 @@ def approve_authorization(
     accepted_scopes: list[str],
     current_user: dict[str, Any],
 ) -> dict[str, Any]:
+    from app.services.tenant_context import current_team_id
+
+    team_id = current_team_id()
+    if team_id <= 0:
+        raise RuntimeError("缺少已认证的租户上下文")
     token = secrets.token_urlsafe(40)
     user = {
         "id": current_user.get("id") or "",
@@ -178,6 +189,7 @@ def approve_authorization(
         "access_token": token,
         "authorized_scopes": accepted_scopes,
         "authorized_by": user,
+        "team_id": team_id,
     }
     _write(state)
     return body.get("data") if isinstance(body.get("data"), dict) else {}
@@ -211,12 +223,47 @@ def _public_connection(connection: Any) -> dict[str, Any] | None:
 
 
 def authorize_access_token(token: str, required_scope: str) -> dict[str, Any]:
-    connection = _read().get("connection")
-    if not isinstance(connection, dict):
-        raise HTTPException(status_code=401, detail="XCMAX 尚未完成授权")
-    expected = str(connection.get("access_token") or "")
-    if not token or not expected or not secrets.compare_digest(token, expected):
+    from app.services.tenant_context import (
+        base_data_root,
+        current_team_id,
+        infer_legacy_owner_team_id,
+    )
+
+    candidates: list[tuple[int, dict[str, Any]]] = []
+    context_team_id = current_team_id()
+    if context_team_id > 0:
+        state = _read()
+        connection = state.get("connection")
+        if isinstance(connection, dict):
+            candidates.append((context_team_id, connection))
+    else:
+        tenant_root = base_data_root() / "tenants"
+        if tenant_root.is_dir():
+            for path in tenant_root.glob("*/integrations/xcmax.json"):
+                try:
+                    team_id = int(path.parents[1].name)
+                except (TypeError, ValueError):
+                    continue
+                connection = _read_path(path).get("connection")
+                if isinstance(connection, dict):
+                    candidates.append((team_id, connection))
+        legacy_path = base_data_root() / "integrations" / "xcmax.json"
+        legacy_connection = _read_path(legacy_path).get("connection")
+        legacy_team_id = infer_legacy_owner_team_id()
+        if isinstance(legacy_connection, dict) and legacy_team_id > 0:
+            candidates.append((legacy_team_id, legacy_connection))
+
+    connection: dict[str, Any] | None = None
+    matched_team_id = 0
+    for candidate_team_id, candidate in candidates:
+        expected = str(candidate.get("access_token") or "")
+        if token and expected and secrets.compare_digest(token, expected):
+            connection = dict(candidate)
+            matched_team_id = int(candidate_team_id)
+            break
+    if connection is None:
         raise HTTPException(status_code=401, detail="XCMAX 本地访问令牌无效")
     if required_scope not in set(connection.get("authorized_scopes") or []):
         raise HTTPException(status_code=403, detail="该数据权限未授权")
+    connection["team_id"] = matched_team_id
     return connection

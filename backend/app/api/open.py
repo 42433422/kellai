@@ -28,9 +28,9 @@ def _now_iso() -> str:
 
 
 def _store_path() -> Path:
-    data_dir = os.environ.get("KELLAI_DATA_DIR")
-    root = Path(data_dir) if data_dir else Path(__file__).resolve().parents[3] / "data"
-    return root / "open_platform.json"
+    from app.services.tenant_context import tenant_data_root
+
+    return tenant_data_root(required=False) / "open_platform.json"
 
 
 def _default_state() -> dict[str, Any]:

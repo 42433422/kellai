@@ -25,6 +25,7 @@ import {
   Code,
   BookOpen,
   Zap,
+  Boxes,
 } from "lucide-react";
 import { clsx } from "clsx";
 
@@ -44,6 +45,7 @@ const NAV_PAGES = [
   { to: "/funnel", label: "漏斗看板", icon: Filter, category: "页面" },
   { to: "/messages", label: "消息中心", icon: MessageSquare, category: "页面" },
   { to: "/customers", label: "客户管理", icon: Users, category: "页面" },
+  { to: "/ai-assets", label: "AI 资产", icon: Boxes, category: "页面" },
   { to: "/ai", label: "AI 助手", icon: Bot, category: "页面" },
   { to: "/settings", label: "设置", icon: Settings, category: "页面" },
   { to: "/sales/flow", label: "自动销售流程", icon: GitBranch, category: "销售增长" },
@@ -71,6 +73,7 @@ const SEARCH_ALIASES: Record<string, string[]> = {
   "漏斗看板": ["漏斗", "看板", "funnel", "pipeline"],
   "消息中心": ["消息", "聊天", "message", "chat"],
   "客户管理": ["客户", "crm", "customer"],
+  "AI 资产": ["ai", "资产", "账号", "状态", "模型", "asset", "account"],
   "AI 助手": ["ai", "助手", "bot", "机器人"],
   "设置": ["设置", "配置", "settings", "config"],
   "自动销售流程": ["销售", "auto", "flow", "成交"],

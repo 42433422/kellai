@@ -36,6 +36,7 @@ import {
   Code,
   BookOpen,
   Sparkles,
+  Boxes,
   type LucideIcon,
 } from "lucide-react";
 import { useAuthStore } from "../stores/auth";
@@ -77,6 +78,7 @@ const coreNavConfig: NavConfig[] = [
   { to: "/funnel", icon: Filter, label: "漏斗看板", badgeFrom: () => 0, tour: "nav-funnel" },
   { to: "/messages", icon: MessageSquare, label: "消息中心", badgeFrom: (s) => s.unreadTotal, tour: "nav-messages" },
   { to: "/customers", icon: Users, label: "客户管理", badgeFrom: () => 0, tour: "nav-customers" },
+  { to: "/ai-assets", icon: Boxes, label: "AI 资产", badgeFrom: () => 0, tour: "nav-ai-assets" },
   { to: "/ai", icon: Bot, label: "AI 助手", badgeFrom: () => 0, tour: "nav-ai" },
   { to: "/settings", icon: Settings, label: "设置", badgeFrom: () => 0, tour: "nav-settings" },
 ];
@@ -93,6 +95,7 @@ export const breadcrumbMap: Record<string, string> = {
   "/funnel": "漏斗看板",
   "/messages": "消息中心",
   "/customers": "客户管理",
+  "/ai-assets": "AI 资产",
   "/ai": "AI 助手",
   "/settings": "设置",
   "/sales/flow": "自动销售流程",

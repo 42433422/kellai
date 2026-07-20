@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterator
 
 from app.services.crm_store import _crm_db_path
+from app.services.tenant_context import resolve_team_id, tenant_scope
 
 
 PRESENCE_TTL_SECONDS = 45
@@ -48,24 +49,6 @@ def ensure_schema() -> None:
             CREATE INDEX IF NOT EXISTS idx_presence_team_heartbeat
                 ON kellai_employee_presence(team_id, last_heartbeat_ts);
 
-            CREATE TABLE IF NOT EXISTS kellai_customer_assignments (
-                customer_id INTEGER PRIMARY KEY,
-                team_id INTEGER NOT NULL,
-                assignee_user_id INTEGER NOT NULL,
-                status TEXT NOT NULL DEFAULT 'assigned',
-                source TEXT NOT NULL DEFAULT 'auto',
-                assigned_by_user_id INTEGER NOT NULL DEFAULT 0,
-                version INTEGER NOT NULL DEFAULT 1,
-                assigned_at TEXT NOT NULL,
-                last_activity_ts INTEGER NOT NULL DEFAULT 0,
-                last_activity_at TEXT NOT NULL DEFAULT '',
-                updated_at TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_assignments_team_assignee
-                ON kellai_customer_assignments(team_id, assignee_user_id, status);
-            CREATE INDEX IF NOT EXISTS idx_assignments_activity
-                ON kellai_customer_assignments(team_id, last_activity_ts);
-
             CREATE TABLE IF NOT EXISTS kellai_assignment_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 customer_id INTEGER NOT NULL,
@@ -77,9 +60,72 @@ def ensure_schema() -> None:
                 detail_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_assignment_events_customer
-                ON kellai_assignment_events(customer_id, id);
             """
+        )
+        existing = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='kellai_customer_assignments'"
+        ).fetchone()
+        if existing:
+            info = conn.execute("PRAGMA table_info(kellai_customer_assignments)").fetchall()
+            primary_key = [
+                str(row[1])
+                for row in sorted(info, key=lambda item: int(item[5]))
+                if int(row[5]) > 0
+            ]
+            if primary_key != ["team_id", "customer_id"]:
+                conn.execute(
+                    "ALTER TABLE kellai_customer_assignments "
+                    "RENAME TO kellai_customer_assignments_legacy_tenant"
+                )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS kellai_customer_assignments (
+                team_id INTEGER NOT NULL,
+                customer_id INTEGER NOT NULL,
+                assignee_user_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'assigned',
+                source TEXT NOT NULL DEFAULT 'auto',
+                assigned_by_user_id INTEGER NOT NULL DEFAULT 0,
+                version INTEGER NOT NULL DEFAULT 1,
+                assigned_at TEXT NOT NULL,
+                last_activity_ts INTEGER NOT NULL DEFAULT 0,
+                last_activity_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (team_id, customer_id)
+            )
+            """
+        )
+        legacy = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='kellai_customer_assignments_legacy_tenant'"
+        ).fetchone()
+        if legacy:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO kellai_customer_assignments
+                    (team_id, customer_id, assignee_user_id, status, source,
+                     assigned_by_user_id, version, assigned_at, last_activity_ts,
+                     last_activity_at, updated_at)
+                SELECT team_id, customer_id, assignee_user_id, status, source,
+                       assigned_by_user_id, version, assigned_at, last_activity_ts,
+                       last_activity_at, updated_at
+                FROM kellai_customer_assignments_legacy_tenant
+                WHERE team_id > 0
+                """
+            )
+            conn.execute("DROP TABLE kellai_customer_assignments_legacy_tenant")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_assignments_team_assignee "
+            "ON kellai_customer_assignments(team_id, assignee_user_id, status)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_assignments_activity "
+            "ON kellai_customer_assignments(team_id, last_activity_ts)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_assignment_events_team_customer "
+            "ON kellai_assignment_events(team_id, customer_id, id)"
         )
         conn.commit()
 
@@ -102,7 +148,8 @@ def _conn(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
 
 
 def heartbeat(*, team_id: int, user_id: int, state: str = "online") -> dict[str, Any]:
-    if int(team_id) <= 0 or int(user_id) <= 0:
+    resolved_team_id = resolve_team_id(team_id, required=True)
+    if int(user_id) <= 0:
         raise ValueError("缺少有效团队或用户")
     reported_state = str(state or "online").strip().lower()
     if reported_state not in {"online", "busy", "away"}:
@@ -122,10 +169,10 @@ def heartbeat(*, team_id: int, user_id: int, state: str = "online") -> dict[str,
                 last_heartbeat_at = excluded.last_heartbeat_at,
                 updated_at = excluded.updated_at
             """,
-            (int(team_id), int(user_id), reported_state, now_ts, now, now),
+            (resolved_team_id, int(user_id), reported_state, now_ts, now, now),
         )
     return {
-        "team_id": int(team_id),
+        "team_id": resolved_team_id,
         "user_id": int(user_id),
         "reported_state": reported_state,
         "online": True,
@@ -145,6 +192,7 @@ def _team_members(team_id: int) -> list[dict[str, Any]]:
 
 
 def presence_snapshot(team_id: int) -> list[dict[str, Any]]:
+    team_id = resolve_team_id(team_id, required=True)
     now_ts = _now_ts()
     active_since = now_ts - ACTIVE_LOAD_WINDOW_SECONDS
     members = _team_members(team_id)
@@ -255,21 +303,28 @@ def _assignment_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     }
 
 
-def _select_assignment(conn: sqlite3.Connection, customer_id: int) -> sqlite3.Row | None:
+def _select_assignment(
+    conn: sqlite3.Connection, customer_id: int, team_id: int
+) -> sqlite3.Row | None:
     return conn.execute(
         """
         SELECT a.*, u.display_name AS assignee_name, u.role AS assignee_role
         FROM kellai_customer_assignments a
         LEFT JOIN kellai_users u ON u.id = a.assignee_user_id
-        WHERE a.customer_id = ?
+        WHERE a.team_id = ? AND a.customer_id = ?
         """,
-        (int(customer_id),),
+        (int(team_id), int(customer_id)),
     ).fetchone()
 
 
-def assignment_for_customer(customer_id: int) -> dict[str, Any] | None:
+def assignment_for_customer(
+    customer_id: int, *, team_id: int | None = None
+) -> dict[str, Any] | None:
+    resolved_team_id = resolve_team_id(team_id)
     with _conn() as conn:
-        return _assignment_dict(_select_assignment(conn, int(customer_id)))
+        return _assignment_dict(
+            _select_assignment(conn, int(customer_id), resolved_team_id)
+        )
 
 
 def _record_event(
@@ -303,26 +358,34 @@ def _record_event(
     )
 
 
-def _sync_pipeline_owner(customer_id: int, assignment: dict[str, Any] | None) -> None:
+def _sync_pipeline_owner(
+    customer_id: int,
+    assignment: dict[str, Any] | None,
+    *,
+    team_id: int,
+) -> None:
     try:
         from app.services.pipeline import load_pipeline, save_pipeline
 
-        doc = load_pipeline(int(customer_id))
-        if assignment and assignment.get("status") == "assigned":
-            doc["team_id"] = int(assignment.get("team_id") or doc.get("team_id") or 0)
-            doc["owner"] = str(
-                assignment.get("assignee_name")
-                or f"成员{assignment.get('assignee_user_id')}"
-            )
-            doc["owner_user_id"] = int(assignment.get("assignee_user_id") or 0)
-            doc["assignment_source"] = str(assignment.get("source") or "")
-            doc["assignment_status"] = "assigned"
-        else:
-            doc["owner"] = ""
-            doc["owner_user_id"] = 0
-            doc["assignment_source"] = ""
-            doc["assignment_status"] = "unassigned"
-        save_pipeline(doc)
+        with tenant_scope(team_id):
+            doc = load_pipeline(int(customer_id))
+            if assignment and assignment.get("status") == "assigned":
+                doc["team_id"] = int(
+                    assignment.get("team_id") or doc.get("team_id") or 0
+                )
+                doc["owner"] = str(
+                    assignment.get("assignee_name")
+                    or f"成员{assignment.get('assignee_user_id')}"
+                )
+                doc["owner_user_id"] = int(assignment.get("assignee_user_id") or 0)
+                doc["assignment_source"] = str(assignment.get("source") or "")
+                doc["assignment_status"] = "assigned"
+            else:
+                doc["owner"] = ""
+                doc["owner_user_id"] = 0
+                doc["assignment_source"] = ""
+                doc["assignment_status"] = "unassigned"
+            save_pipeline(doc)
     except Exception:
         # 分配表是 SSOT；客户档案同步失败不应破坏原子分配。
         return
@@ -337,6 +400,7 @@ def assign_customer(
     source: str = "manual",
     allow_override: bool = True,
 ) -> dict[str, Any]:
+    team_id = resolve_team_id(team_id, required=True)
     now = _now_iso()
     now_ts = _now_ts()
     with _conn(immediate=True) as conn:
@@ -354,7 +418,7 @@ def assign_customer(
             or str(member["role"]) not in {"owner", "admin", "sales"}
         ):
             raise ValueError("指定成员不在当前团队或没有接待权限")
-        existing = _select_assignment(conn, int(customer_id))
+        existing = _select_assignment(conn, int(customer_id), team_id)
         existing_data = _assignment_dict(existing)
         if (
             existing_data
@@ -380,8 +444,7 @@ def assign_customer(
                  assigned_by_user_id, version, assigned_at, last_activity_ts,
                  last_activity_at, updated_at)
             VALUES (?, ?, ?, 'assigned', ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(customer_id) DO UPDATE SET
-                team_id = excluded.team_id,
+            ON CONFLICT(team_id, customer_id) DO UPDATE SET
                 assignee_user_id = excluded.assignee_user_id,
                 status = 'assigned',
                 source = excluded.source,
@@ -421,8 +484,10 @@ def assign_customer(
                 )
             },
         )
-        assignment = _assignment_dict(_select_assignment(conn, int(customer_id))) or {}
-    _sync_pipeline_owner(customer_id, assignment)
+        assignment = _assignment_dict(
+            _select_assignment(conn, int(customer_id), team_id)
+        ) or {}
+    _sync_pipeline_owner(customer_id, assignment, team_id=team_id)
     return assignment
 
 
@@ -443,14 +508,15 @@ def auto_assign_customer(
     team_id: int,
     source: str = "auto_route",
 ) -> dict[str, Any] | None:
-    existing = assignment_for_customer(customer_id)
+    team_id = resolve_team_id(team_id, required=True)
+    existing = assignment_for_customer(customer_id, team_id=team_id)
     if (
         existing
         and existing.get("status") == "assigned"
         and int(existing.get("team_id") or 0) == int(team_id)
     ):
-        touch_assignment(customer_id)
-        return assignment_for_customer(customer_id)
+        touch_assignment(customer_id, team_id=team_id)
+        return assignment_for_customer(customer_id, team_id=team_id)
     candidates = presence_snapshot(team_id)
     if not candidates:
         return None
@@ -479,16 +545,17 @@ def auto_assign_customer(
     )
 
 
-def touch_assignment(customer_id: int) -> bool:
+def touch_assignment(customer_id: int, *, team_id: int | None = None) -> bool:
+    resolved_team_id = resolve_team_id(team_id)
     now = _now_iso()
     with _conn() as conn:
         cur = conn.execute(
             """
             UPDATE kellai_customer_assignments
             SET last_activity_ts = ?, last_activity_at = ?, updated_at = ?
-            WHERE customer_id = ? AND status = 'assigned'
+            WHERE team_id = ? AND customer_id = ? AND status = 'assigned'
             """,
-            (_now_ts(), now, now, int(customer_id)),
+            (_now_ts(), now, now, resolved_team_id, int(customer_id)),
         )
         return bool(cur.rowcount)
 
@@ -499,9 +566,10 @@ def release_customer(
     team_id: int,
     actor_user_id: int,
 ) -> dict[str, Any] | None:
+    team_id = resolve_team_id(team_id, required=True)
     now = _now_iso()
     with _conn(immediate=True) as conn:
-        existing = _select_assignment(conn, int(customer_id))
+        existing = _select_assignment(conn, int(customer_id), team_id)
         data = _assignment_dict(existing)
         if data is None or int(data["team_id"]) != int(team_id):
             return None
@@ -509,9 +577,9 @@ def release_customer(
             """
             UPDATE kellai_customer_assignments
             SET status = 'released', version = version + 1, updated_at = ?
-            WHERE customer_id = ?
+            WHERE team_id = ? AND customer_id = ?
             """,
-            (now, int(customer_id)),
+            (now, team_id, int(customer_id)),
         )
         _record_event(
             conn,
@@ -522,12 +590,13 @@ def release_customer(
             actor_user_id=actor_user_id,
             source="manual",
         )
-        released = _assignment_dict(_select_assignment(conn, int(customer_id)))
-    _sync_pipeline_owner(customer_id, None)
+        released = _assignment_dict(_select_assignment(conn, int(customer_id), team_id))
+    _sync_pipeline_owner(customer_id, None, team_id=team_id)
     return released
 
 
 def list_assignments(team_id: int, *, limit: int = 500) -> list[dict[str, Any]]:
+    team_id = resolve_team_id(team_id, required=True)
     with _conn() as conn:
         rows = conn.execute(
             """
@@ -548,6 +617,7 @@ def list_assignments(team_id: int, *, limit: int = 500) -> list[dict[str, Any]]:
 
 
 def routing_overview(team_id: int) -> dict[str, Any]:
+    team_id = resolve_team_id(team_id, required=True)
     presence = presence_snapshot(team_id)
     assignments = list_assignments(team_id)
     return {

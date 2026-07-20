@@ -90,6 +90,15 @@ def test_automation_error_is_returned_to_api_layer(automation, monkeypatch):
     assert "辅助功能权限" in result["error"]
 
 
+def test_message_input_fallback_tracks_current_douyin_layout(automation):
+    coordinates = automation._flow_coordinates(
+        {"X": 621.0, "Y": 129.0, "Width": 1299.0, "Height": 811.0}
+    )
+
+    assert coordinates["input_x"] == 1530
+    assert coordinates["input_y"] == 713
+
+
 @pytest.mark.parametrize(
     ("current_matches", "expected_reuse"),
     [(True, "true"), (False, "false")],

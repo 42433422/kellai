@@ -74,6 +74,7 @@ def test_auto_reply_job_is_deduplicated_claimed_and_completed(monkeypatch, tmp_p
         "inbound-1",
         success=True,
         outbound_message_id="outbound-1",
+        team_id=3,
     ) is True
     status = auto_reply_runtime.runtime_status(team_id=3)
     assert status["counts"]["sent"] == 1

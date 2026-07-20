@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from app.services.tenant_context import current_team_id, tenant_data_root
+
 logger = logging.getLogger(__name__)
 
 
@@ -58,6 +60,10 @@ def _stage_rank(stage: str | None) -> int:
 
 
 def _resolve_data_roots() -> list[Path]:
+    team_id = current_team_id()
+    if team_id > 0:
+        return [tenant_data_root(team_id) / "pipelines"]
+
     roots: list[Path] = []
     seen: set[str] = set()
 
@@ -101,6 +107,7 @@ def _default_pipeline(customer_id: int, username: str = "") -> dict[str, Any]:
     return {
         "customer_id": int(customer_id),
         "market_user_id": int(customer_id),
+        "team_id": current_team_id(),
         "username": str(username or "").strip(),
         # 手动维护的客户资料字段
         "name": "",
@@ -154,6 +161,12 @@ def _write_pipeline_file(path: Path, doc: dict[str, Any]) -> dict[str, Any]:
     if uid > 0:
         doc["customer_id"] = uid
         doc["market_user_id"] = uid
+    team_id = current_team_id()
+    document_team_id = int(doc.get("team_id") or 0)
+    if team_id > 0 and document_team_id not in {0, team_id}:
+        raise PermissionError("禁止写入其他租户的客户档案")
+    if team_id > 0:
+        doc["team_id"] = team_id
     doc["updated_at"] = _now_iso()
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -169,10 +182,25 @@ def load_pipeline(customer_id: int, username: str = "") -> dict[str, Any]:
     uid = int(customer_id)
     path = _pipeline_file(uid)
     doc = _read_pipeline_file(path)
+    team_id = current_team_id()
+    if doc is None and team_id > 0:
+        # Upgrade compatibility: only import a legacy flat document when its
+        # persisted tenant already matches the authenticated tenant.
+        configured = (os.environ.get("KELLAI_DATA_DIR") or "").strip()
+        legacy_root = (
+            Path(configured).expanduser().resolve()
+            if configured
+            else Path(__file__).resolve().parents[3] / "data"
+        ) / "pipelines"
+        legacy_doc = _read_pipeline_file(legacy_root / f"{uid}.json")
+        if legacy_doc and int(legacy_doc.get("team_id") or 0) == team_id:
+            doc = _write_pipeline_file(path, legacy_doc)
     if doc is None:
         doc = _default_pipeline(uid, username=username)
         _write_pipeline_file(path, doc)
         return doc
+    if team_id > 0 and int(doc.get("team_id") or 0) != team_id:
+        raise PermissionError("客户档案不属于当前租户")
     doc.setdefault("customer_id", uid)
     doc.setdefault("market_user_id", uid)
     if username and not doc.get("username"):
@@ -335,9 +363,12 @@ def list_pipeline_client_summaries(*, include_demo: bool = False) -> list[dict[s
         logger.warning("读取演示客户标记失败，将仅按档案标记过滤", exc_info=True)
 
     rows: list[dict[str, Any]] = []
+    team_id = current_team_id()
     for doc in _iter_pipeline_docs():
         uid = _customer_id_from_doc(doc)
         if uid <= 0:
+            continue
+        if team_id > 0 and int(doc.get("team_id") or 0) != team_id:
             continue
         is_demo = _is_demo_pipeline(doc, demo_customer_ids)
         if is_demo and not include_demo:

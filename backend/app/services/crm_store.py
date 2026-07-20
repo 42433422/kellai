@@ -10,7 +10,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from app.services.pipeline import _pipeline_roots, load_pipeline
+from app.services.pipeline import load_pipeline
+from app.services.tenant_context import (
+    base_data_root,
+    current_team_id,
+    infer_legacy_owner_team_id,
+)
 
 
 class CrmSyncError(Exception):
@@ -86,7 +91,10 @@ def _crm_db_path() -> Path:
     """统一数据库路径：data/kellai.db。
     历史上 crm/auth/messages 各自有独立 db，本版本统一为单个 kellai.db。
     """
-    root = _pipeline_roots()[0].parent
+    # Authentication and tenant-tagged business tables share one SQLite file.
+    # Do not derive this from the request-scoped pipeline directory, otherwise
+    # token verification would accidentally switch databases per tenant.
+    root = base_data_root()
     root.mkdir(parents=True, exist_ok=True)
     return root / "kellai.db"
 
@@ -109,6 +117,7 @@ def ensure_crm_schema() -> None:
             """
             CREATE TABLE IF NOT EXISTS kellai_crm_opportunities (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                team_id INTEGER NOT NULL DEFAULT 0,
                 customer_id INTEGER NOT NULL,
                 company TEXT,
                 status TEXT DEFAULT 'open',
@@ -122,6 +131,7 @@ def ensure_crm_schema() -> None:
             """
             CREATE TABLE IF NOT EXISTS kellai_crm_invoices (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                team_id INTEGER NOT NULL DEFAULT 0,
                 customer_id INTEGER NOT NULL,
                 opportunity_id INTEGER,
                 invoice_no TEXT NOT NULL,
@@ -134,11 +144,29 @@ def ensure_crm_schema() -> None:
             )
             """
         )
-        # pipeline 快照表，用于高级查询
+        owner_team_id = infer_legacy_owner_team_id()
+        for table in ("kellai_crm_opportunities", "kellai_crm_invoices"):
+            columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+            if "team_id" not in columns:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN team_id INTEGER NOT NULL DEFAULT 0")
+            if owner_team_id > 0:
+                conn.execute(f"UPDATE {table} SET team_id = ? WHERE team_id = 0", (owner_team_id,))
+
+        # pipeline 快照表必须使用复合主键；不同租户可以拥有相同 customer_id。
+        existing = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='kellai_pipelines'"
+        ).fetchone()
+        if existing:
+            info = conn.execute("PRAGMA table_info(kellai_pipelines)").fetchall()
+            columns = {str(row[1]) for row in info}
+            primary_key = [str(row[1]) for row in sorted(info, key=lambda item: int(item[5])) if int(row[5]) > 0]
+            if "team_id" not in columns or primary_key != ["team_id", "customer_id"]:
+                conn.execute("ALTER TABLE kellai_pipelines RENAME TO kellai_pipelines_legacy_tenant")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS kellai_pipelines (
-                customer_id INTEGER PRIMARY KEY,
+                team_id INTEGER NOT NULL DEFAULT 0,
+                customer_id INTEGER NOT NULL,
                 market_user_id INTEGER,
                 username TEXT DEFAULT '',
                 stage TEXT DEFAULT 'idle',
@@ -160,9 +188,44 @@ def ensure_crm_schema() -> None:
                 crm_db_synced_at TEXT DEFAULT '',
                 crm_invoice_id INTEGER DEFAULT 0,
                 timeline_json TEXT DEFAULT '[]',
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (team_id, customer_id)
             )
             """
+        )
+        legacy = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='kellai_pipelines_legacy_tenant'"
+        ).fetchone()
+        if legacy:
+            legacy_columns = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(kellai_pipelines_legacy_tenant)")
+            }
+            legacy_team_expr = "team_id" if "team_id" in legacy_columns else str(int(owner_team_id or 0))
+            conn.execute(
+                f"""
+                INSERT OR IGNORE INTO kellai_pipelines
+                SELECT {legacy_team_expr}, customer_id, market_user_id, username, stage,
+                       channel_sources, ai_score, ai_tags, intake_sent,
+                       intake_form_notice_sent, connected_welcome_sent,
+                       last_message_preview, intake_submitted_at, landing_contact_id,
+                       intake_form_json, erp_customer_id, erp_customer_name,
+                       crm_opportunity_id, crm_quote_id, crm_funnel_synced_at,
+                       crm_db_synced_at, crm_invoice_id, timeline_json, updated_at
+                FROM kellai_pipelines_legacy_tenant
+                """
+            )
+            conn.execute("DROP TABLE kellai_pipelines_legacy_tenant")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_crm_opportunities_team_customer "
+            "ON kellai_crm_opportunities(team_id, customer_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_crm_invoices_team_customer "
+            "ON kellai_crm_invoices(team_id, customer_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pipelines_team_updated "
+            "ON kellai_pipelines(team_id, updated_at)"
         )
         conn.commit()
 
@@ -175,8 +238,8 @@ def get_opportunity_by_customer(customer_id: int) -> dict[str, Any] | None:
     ensure_crm_schema()
     with _connect() as conn:
         row = conn.execute(
-            "SELECT * FROM kellai_crm_opportunities WHERE customer_id = ? ORDER BY id DESC LIMIT 1",
-            (int(customer_id),),
+            "SELECT * FROM kellai_crm_opportunities WHERE team_id = ? AND customer_id = ? ORDER BY id DESC LIMIT 1",
+            (current_team_id(), int(customer_id)),
         ).fetchone()
     return dict(row) if row else None
 
@@ -229,10 +292,11 @@ def sync_pipeline_to_sqlite(doc: dict[str, Any]) -> None:
     if uid <= 0:
         return
     with _connect() as conn:
+        team_id = current_team_id() or int(doc.get("team_id") or 0)
         conn.execute(
             """
             INSERT INTO kellai_pipelines (
-                customer_id, market_user_id, username, stage,
+                team_id, customer_id, market_user_id, username, stage,
                 channel_sources, ai_score, ai_tags,
                 intake_sent, intake_form_notice_sent, connected_welcome_sent,
                 last_message_preview, intake_submitted_at, landing_contact_id,
@@ -240,7 +304,7 @@ def sync_pipeline_to_sqlite(doc: dict[str, Any]) -> None:
                 crm_opportunity_id, crm_quote_id, crm_funnel_synced_at,
                 crm_db_synced_at, crm_invoice_id, timeline_json, updated_at
             ) VALUES (
-                ?, ?, ?, ?,
+                ?, ?, ?, ?, ?,
                 ?, ?, ?,
                 ?, ?, ?,
                 ?, ?, ?,
@@ -248,7 +312,7 @@ def sync_pipeline_to_sqlite(doc: dict[str, Any]) -> None:
                 ?, ?, ?,
                 ?, ?, ?, ?
             )
-            ON CONFLICT(customer_id) DO UPDATE SET
+            ON CONFLICT(team_id, customer_id) DO UPDATE SET
                 market_user_id=excluded.market_user_id,
                 username=excluded.username,
                 stage=excluded.stage,
@@ -273,6 +337,7 @@ def sync_pipeline_to_sqlite(doc: dict[str, Any]) -> None:
                 updated_at=excluded.updated_at
             """,
             (
+                team_id,
                 uid,
                 int(doc.get("market_user_id") or uid),
                 str(doc.get("username") or ""),
@@ -308,8 +373,8 @@ def query_pipelines_from_sqlite(
 ) -> list[dict[str, Any]]:
     """从 SQLite 查询 pipeline，支持按阶段、渠道、AI 评分筛选。"""
     ensure_crm_schema()
-    conditions: list[str] = []
-    params: list[Any] = []
+    conditions: list[str] = ["team_id = ?"]
+    params: list[Any] = [current_team_id()]
 
     if stage.strip():
         conditions.append("stage = ?")
@@ -338,8 +403,8 @@ def get_pipeline_from_sqlite(customer_id: int) -> dict[str, Any] | None:
     ensure_crm_schema()
     with _connect() as conn:
         row = conn.execute(
-            "SELECT * FROM kellai_pipelines WHERE customer_id = ?",
-            (int(customer_id),),
+            "SELECT * FROM kellai_pipelines WHERE team_id = ? AND customer_id = ?",
+            (current_team_id(), int(customer_id)),
         ).fetchone()
     return _pipeline_row_to_dict(row) if row else None
 
@@ -349,7 +414,7 @@ def delete_pipeline_from_sqlite(customer_id: int) -> bool:
     ensure_crm_schema()
     with _connect() as conn:
         cur = conn.execute(
-            "DELETE FROM kellai_pipelines WHERE customer_id = ?",
-            (int(customer_id),),
+            "DELETE FROM kellai_pipelines WHERE team_id = ? AND customer_id = ?",
+            (current_team_id(), int(customer_id)),
         )
         return cur.rowcount > 0

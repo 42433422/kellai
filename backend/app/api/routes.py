@@ -223,6 +223,8 @@ class ChannelSyncInboxBody(BaseModel):
     """同步渠道收件箱到客户消息与漏斗闭环。"""
     channel_type: str = Field(default="", max_length=32)
     limit: int = Field(default=50, ge=1, le=200)
+    # 仅供已验签 webhook 交给后台任务；普通请求仍由认证上下文校验。
+    team_id: int = Field(default=0, ge=0, exclude=True)
 
 
 class SimulateCustomerBehaviorBody(BaseModel):
@@ -1008,7 +1010,11 @@ async def sync_channel_inbox(body: ChannelSyncInboxBody, request: Request = None
     seen_ids: set[str] = set()
     errors: list[dict[str, str]] = []
     user = get_request_user(request) if request is not None else None
-    team_id = int((user or {}).get("team_id") or 0)
+    from app.services.tenant_context import resolve_team_id
+
+    team_id = resolve_team_id(
+        int((user or {}).get("team_id") or body.team_id or 0)
+    )
 
     for channel_type in channel_types:
         remote_douyin = False
@@ -1066,7 +1072,7 @@ async def sync_channel_inbox(body: ChannelSyncInboxBody, request: Request = None
                     exc_info=True,
                 )
 
-    consumed = mark_inbox_consumed(local_consumed_ids)
+    consumed = mark_inbox_consumed(local_consumed_ids, team_id=team_id)
     if remote_douyin_ids:
         try:
             from app.services.douyin_channel import remote_ack_inbox
@@ -1828,7 +1834,7 @@ async def douyin_webhook_receive(request: Request, background_tasks: BackgroundT
     if not bridge_server_enabled():
         background_tasks.add_task(
             sync_channel_inbox,
-            ChannelSyncInboxBody(channel_type="douyin", limit=50),
+            ChannelSyncInboxBody(channel_type="douyin", limit=50, team_id=int(team_id)),
         )
     return {
         "success": True,
@@ -2810,11 +2816,10 @@ def get_messages(
         team_id = current_user.get("team_id")
         all_clients = list_pipeline_client_summaries()
         if team_id:
-            # 新同步客户严格按团队隔离；team_id=0 的历史档案继续兼容可见。
             team_customer_ids = {
                 c["customer_id"]
                 for c in all_clients
-                if int(c.get("team_id") or 0) in {0, int(team_id)}
+                if int(c.get("team_id") or 0) == int(team_id)
             }
         else:
             team_customer_ids = {c["customer_id"] for c in all_clients}
@@ -3029,7 +3034,7 @@ def get_unread_summary(
         if c.get("customer_id")
         and (
             not team_id
-            or int(c.get("team_id") or 0) in {0, int(team_id)}
+            or int(c.get("team_id") or 0) == int(team_id)
         )
     }
 
@@ -3042,8 +3047,8 @@ def get_unread_summary(
         }
         filtered_total = sum(filtered_by.values())
     else:
-        filtered_by = summary["by_customer"]
-        filtered_total = summary["total"]
+        filtered_by = {}
+        filtered_total = 0
 
     return {
         "success": True,
@@ -3072,7 +3077,7 @@ def mark_messages_read(body: MarkReadBody, current_user: CurrentUser):
             int(c["customer_id"])
             for c in list_pipeline_client_summaries()
             if c.get("customer_id")
-            and int(c.get("team_id") or 0) in {0, int(team_id)}
+            and int(c.get("team_id") or 0) == int(team_id)
         }
 
     updated = 0
@@ -3085,8 +3090,9 @@ def mark_messages_read(body: MarkReadBody, current_user: CurrentUser):
         with _connect() as conn:
             placeholders = ",".join("?" for _ in body.message_ids)
             rows = conn.execute(
-                f"SELECT id, customer_id FROM kellai_messages WHERE id IN ({placeholders})",
-                body.message_ids,
+                f"SELECT id, customer_id FROM kellai_messages WHERE team_id = ? "
+                f"AND id IN ({placeholders})",
+                [int(team_id or 0), *body.message_ids],
             ).fetchall()
         if visible_ids is not None:
             allowed_ids = [r["id"] for r in rows if int(r["customer_id"]) in visible_ids]
@@ -3124,10 +3130,12 @@ def _workforce_team_id(current_user: dict) -> int:
 
 def _ensure_customer_in_team(customer_id: int, team_id: int) -> None:
     from app.services.pipeline import load_pipeline
+    from app.services.tenant_context import tenant_scope
 
-    doc = load_pipeline(int(customer_id))
+    with tenant_scope(int(team_id)):
+        doc = load_pipeline(int(customer_id))
     doc_team_id = int(doc.get("team_id") or 0)
-    if doc_team_id not in {0, int(team_id)}:
+    if doc_team_id != int(team_id):
         raise HTTPException(status_code=404, detail={"message": "客户不在当前团队中"})
 
 
@@ -3269,8 +3277,7 @@ def get_customers(
     clients = list_pipeline_client_summaries()
     team_id = int(current_user.get("team_id") or 0)
     if team_id:
-        # 新同步的第三方客户严格按团队隔离；team_id=0 的历史档案继续兼容可见。
-        clients = [c for c in clients if int(c.get("team_id") or 0) in {0, team_id}]
+        clients = [c for c in clients if int(c.get("team_id") or 0) == team_id]
 
     # 按阶段筛选
     if stage:
@@ -3409,7 +3416,7 @@ def status():
         "success": True,
         "data": {
             "product": "客来来",
-            "version": "0.1.0",
+            "version": "1.0.1",
             "independent": True,
         },
     }
@@ -3511,10 +3518,14 @@ def xcmax_data_status(request: Request):
     from app.services.message_store import get_unread_summary
     from app.services.pipeline import list_pipeline_client_summaries
     from app.services.xcmax_integration import authorize_access_token
+    from app.services.tenant_context import tenant_scope
 
-    authorize_access_token(_require_xcmax_loopback(request), "customer_profiles.read")
-    customers = list_pipeline_client_summaries(include_demo=False)
-    unread = get_unread_summary()
+    connection = authorize_access_token(
+        _require_xcmax_loopback(request), "customer_profiles.read"
+    )
+    with tenant_scope(int(connection.get("team_id") or 0)):
+        customers = list_pipeline_client_summaries(include_demo=False)
+        unread = get_unread_summary()
     return {
         "success": True,
         "data": {
@@ -3529,9 +3540,15 @@ def xcmax_data_status(request: Request):
 def xcmax_customers(request: Request, limit: int = 12):
     from app.services.pipeline import list_pipeline_client_summaries
     from app.services.xcmax_integration import authorize_access_token
+    from app.services.tenant_context import tenant_scope
 
-    authorize_access_token(_require_xcmax_loopback(request), "customer_profiles.read")
-    rows = list_pipeline_client_summaries(include_demo=False)[: max(1, min(int(limit), 50))]
+    connection = authorize_access_token(
+        _require_xcmax_loopback(request), "customer_profiles.read"
+    )
+    with tenant_scope(int(connection.get("team_id") or 0)):
+        rows = list_pipeline_client_summaries(include_demo=False)[
+            : max(1, min(int(limit), 50))
+        ]
     customers = [
         {
             "customer_id": int(row.get("customer_id") or 0),
@@ -3551,9 +3568,15 @@ def xcmax_customers(request: Request, limit: int = 12):
 def xcmax_customer_conversations(customer_id: int, request: Request, limit: int = 30):
     from app.services.message_store import get_messages_with_state
     from app.services.xcmax_integration import authorize_access_token
+    from app.services.tenant_context import tenant_scope
 
-    authorize_access_token(_require_xcmax_loopback(request), "customer_conversations.read")
-    messages = get_messages_with_state(int(customer_id), limit=max(1, min(int(limit), 100)))
+    connection = authorize_access_token(
+        _require_xcmax_loopback(request), "customer_conversations.read"
+    )
+    with tenant_scope(int(connection.get("team_id") or 0)):
+        messages = get_messages_with_state(
+            int(customer_id), limit=max(1, min(int(limit), 100))
+        )
     return {"success": True, "data": {"customer_id": int(customer_id), "messages": messages}}
 
 

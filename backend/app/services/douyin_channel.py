@@ -1137,10 +1137,11 @@ def _miniapp_live_verified(team_id: int) -> bool:
             """
             SELECT metadata_json
             FROM kellai_channel_inbox
-            WHERE channel_type = 'douyin'
+            WHERE team_id = ? AND channel_type = 'douyin'
             ORDER BY received_at DESC
             LIMIT 500
-            """
+            """,
+            (int(team_id),),
         ).fetchall()
     expected_app_id = miniapp_app_id()
     for row in rows:
@@ -1281,11 +1282,11 @@ def pull_team_inbox(team_id: int, *, limit: int = 50) -> list[dict[str, Any]]:
                 """
                 SELECT *
                 FROM kellai_channel_inbox
-                WHERE channel_type = 'douyin' AND consumed = 0
+                WHERE team_id = ? AND channel_type = 'douyin' AND consumed = 0
                 ORDER BY received_at ASC, id ASC
                 LIMIT ? OFFSET ?
                 """,
-                (batch_size, offset),
+                (int(team_id), batch_size, offset),
             ).fetchall()
             if not rows:
                 break
@@ -1322,10 +1323,10 @@ def ack_team_inbox(team_id: int, message_ids: list[str]) -> int:
             f"""
             SELECT id, metadata_json
             FROM kellai_channel_inbox
-            WHERE channel_type = 'douyin' AND consumed = 0
+            WHERE team_id = ? AND channel_type = 'douyin' AND consumed = 0
               AND id IN ({placeholders})
             """,
-            clean_ids,
+            [int(team_id), *clean_ids],
         ).fetchall()
         owned_ids: list[str] = []
         for row in rows:
@@ -1342,9 +1343,9 @@ def ack_team_inbox(team_id: int, message_ids: list[str]) -> int:
             f"""
             UPDATE kellai_channel_inbox
             SET consumed = 1
-            WHERE consumed = 0 AND id IN ({owned_placeholders})
+            WHERE team_id = ? AND consumed = 0 AND id IN ({owned_placeholders})
             """,
-            owned_ids,
+            [int(team_id), *owned_ids],
         )
         conn.commit()
         return int(cur.rowcount or 0)

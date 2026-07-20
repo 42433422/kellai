@@ -119,10 +119,9 @@ def _safe_rate(rate: int) -> int:
 
 
 def _data_root() -> Path:
-    configured = (os.environ.get("KELLAI_DATA_DIR") or "").strip()
-    if configured:
-        return Path(configured).expanduser().resolve()
-    return Path(__file__).resolve().parents[3] / "data"
+    from app.services.tenant_context import tenant_data_root
+
+    return tenant_data_root(required=False)
 
 
 def _tts_cache_dir() -> Path:

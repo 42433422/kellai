@@ -464,6 +464,27 @@ fn message_input() -> Result<Option<(OwnedAX, Rect)>, String> {
     }))
 }
 
+fn message_input_near(input_x: f64, input_y: f64) -> Result<Option<(OwnedAX, Rect)>, String> {
+    if let Some(input) = message_input()? {
+        return Ok(Some(input));
+    }
+
+    // Chromium's accessibility tree can briefly omit descendants while the
+    // message overlay is repainting. Fall back to the element under the known
+    // input point and walk upwards instead of treating that transient state as
+    // a logged-out session.
+    let Ok(element) = ancestor_with_role(input_x, input_y, "AXTextArea") else {
+        return Ok(None);
+    };
+    let rect = element_rect(element.0).unwrap_or(Rect {
+        x: input_x,
+        y: input_y,
+        width: 1.0,
+        height: 1.0,
+    });
+    Ok(Some((element, rect)))
+}
+
 fn focus_element(element: AXUIElementRef) -> Result<(), String> {
     let attribute = CFString::new("AXFocused");
     let enabled = CFBoolean::true_value();
@@ -487,14 +508,14 @@ pub(crate) fn ensure_message_panel(
     message_icon_x: f64,
     message_icon_y: f64,
 ) -> Result<(), String> {
-    if let Some((element, rect)) = message_input()? {
+    if let Some((element, rect)) = message_input_near(input_x, input_y)? {
         click_at(rect.x + rect.width * 0.35, rect.y + rect.height * 0.5)?;
         let _ = focus_element(element.0);
         return Ok(());
     }
     click_at(message_icon_x, message_icon_y)?;
     thread::sleep(Duration::from_secs(1));
-    if let Some((element, rect)) = message_input()? {
+    if let Some((element, rect)) = message_input_near(input_x, input_y)? {
         click_at(rect.x + rect.width * 0.35, rect.y + rect.height * 0.5)?;
         let _ = focus_element(element.0);
         return Ok(());
@@ -631,7 +652,7 @@ pub(crate) fn current_conversation_matches(
 }
 
 pub(crate) fn fill_and_send(content: &str, input_x: f64, input_y: f64) -> Result<(), String> {
-    let (input_element, input) = message_input()?
+    let (input_element, input) = message_input_near(input_x, input_y)?
         .ok_or_else(|| "未找到抖音消息输入框，请确认已登录并打开消息能力".to_string())?;
     click_at(input.x + input.width * 0.35, input.y + input.height * 0.5)?;
     let _ = focus_element(input_element.0);

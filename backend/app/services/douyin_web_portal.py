@@ -514,10 +514,10 @@ def _ingest_message(
             """
             SELECT content, direction, created_at
             FROM kellai_messages
-            WHERE id = ?
+            WHERE team_id = ? AND id = ?
             LIMIT 1
             """,
-            (message_id,),
+            (int(team_id), message_id),
         ).fetchone()
         if existing:
             if (
@@ -528,13 +528,14 @@ def _ingest_message(
                 return False
             message_id = _collision_message_id(team_id, contact_id, item)
             if conn.execute(
-                "SELECT 1 FROM kellai_messages WHERE id = ? LIMIT 1",
-                (message_id,),
+                "SELECT 1 FROM kellai_messages WHERE team_id = ? AND id = ? LIMIT 1",
+                (int(team_id), message_id),
             ).fetchone():
                 return False
     provisional_customer_id = 0
     if direction == "outbound":
         provisional_customer_id = _remove_matching_desktop_provisional(
+            team_id=team_id,
             contact_id=contact_id,
             content=content,
             created_at=created_at,
@@ -590,12 +591,13 @@ def _ingest_message(
                 message_id,
                 exc_info=True,
             )
-    mark_inbox_consumed([message_id])
+    mark_inbox_consumed([message_id], team_id=team_id)
     return bool(saved.id)
 
 
 def _remove_matching_desktop_provisional(
     *,
+    team_id: int,
     contact_id: str,
     content: str,
     created_at: str,
@@ -610,14 +612,15 @@ def _remove_matching_desktop_provisional(
             """
             SELECT id, customer_id, metadata_json, created_at
             FROM kellai_messages
-            WHERE channel_type = 'douyin'
+            WHERE team_id = ?
+              AND channel_type = 'douyin'
               AND contact_id = ?
               AND direction = 'outbound'
               AND content = ?
             ORDER BY created_at DESC
             LIMIT 10
             """,
-            (str(contact_id), str(content)),
+            (int(team_id), str(contact_id), str(content)),
         ).fetchall()
         for row in rows:
             try:
@@ -632,7 +635,10 @@ def _remove_matching_desktop_provisional(
                 continue
             if abs((remote_at - local_at).total_seconds()) > 300:
                 continue
-            conn.execute("DELETE FROM kellai_messages WHERE id = ?", (str(row[0]),))
+            conn.execute(
+                "DELETE FROM kellai_messages WHERE team_id = ? AND id = ?",
+                (int(team_id), str(row[0])),
+            )
             conn.commit()
             return int(row[1] or 0)
     return 0

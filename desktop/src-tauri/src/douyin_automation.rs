@@ -198,8 +198,10 @@ fn coordinates(bounds: &WindowBounds) -> FlowCoordinates {
         message_icon_y: (bounds.y + bounds.height * 0.04).round() as i64,
         search_x: (bounds.x + bounds.width * 0.384).round() as i64,
         search_y: (bounds.y + bounds.height * 0.118).round() as i64,
-        input_x: (bounds.x + bounds.width * 0.608).round() as i64,
-        input_y: (bounds.y + bounds.height * 0.760).round() as i64,
+        // Douyin 8.1 moved the message composer farther right. Keep the
+        // fallback point inside the textarea instead of on its left wrapper.
+        input_x: (bounds.x + bounds.width * 0.70).round() as i64,
+        input_y: (bounds.y + bounds.height * 0.72).round() as i64,
     }
 }
 
@@ -608,7 +610,22 @@ pub fn request_accessibility_permission() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_permission_error, compact_error_detail, ScriptPermissionError};
+    use super::{
+        classify_permission_error, compact_error_detail, coordinates, ScriptPermissionError,
+        WindowBounds,
+    };
+
+    #[test]
+    fn message_input_fallback_tracks_current_douyin_layout() {
+        let point = coordinates(&WindowBounds {
+            x: 621.0,
+            y: 129.0,
+            width: 1299.0,
+            height: 811.0,
+        });
+        assert_eq!(point.input_x, 1530);
+        assert_eq!(point.input_y, 713);
+    }
 
     #[test]
     fn classifies_accessibility_denial() {

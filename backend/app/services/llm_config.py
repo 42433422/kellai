@@ -12,6 +12,8 @@ from typing import Any
 
 import httpx
 
+from app.services.tenant_context import current_team_id, tenant_data_root
+
 
 PROVIDER_CONFIGS: dict[str, dict[str, str]] = {
     "custom": {
@@ -117,7 +119,11 @@ AUTO_PROVIDER_ORDER = (
     "mimo",
     "xai",
 )
-_LAST_PROBE: dict[str, Any] = {}
+_LAST_PROBE_BY_TEAM: dict[int, dict[str, Any]] = {}
+
+
+def _last_probe() -> dict[str, Any]:
+    return dict(_LAST_PROBE_BY_TEAM.get(current_team_id()) or {})
 
 
 def _now_iso() -> str:
@@ -125,11 +131,7 @@ def _now_iso() -> str:
 
 
 def _data_root() -> Path:
-    raw = (os.environ.get("KELLAI_DATA_DIR") or "").strip()
-    if raw:
-        root = Path(raw).expanduser().resolve()
-    else:
-        root = Path(__file__).resolve().parents[3] / "data"
+    root = tenant_data_root(required=False)
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -367,7 +369,7 @@ def public_config() -> dict[str, Any]:
     api_key = str(cfg.get("api_key") or "")
     key_prefix = f"{api_key[:6]}...{api_key[-4:]}" if len(api_key) >= 12 else ("已保存" if api_key else "")
     disk_probe = cfg.get("last_probe") if isinstance(cfg.get("last_probe"), dict) else {}
-    probe = disk_probe or _LAST_PROBE
+    probe = disk_probe or _last_probe()
     ready = bool(effective.get("api_key"))
     connected = bool(probe.get("success")) if probe else False
     message = "LLM 已连通" if connected else ("已保存 Key，尚未通过连通验证" if ready else "请先在设置页保存真实 LLM API Key")
@@ -444,7 +446,11 @@ def diagnostics() -> dict[str, Any]:
         for name in names:
             env_presence[name] = bool(_env_value(name))
 
-    probe = saved.get("last_probe") if isinstance(saved.get("last_probe"), dict) else _LAST_PROBE
+    probe = (
+        saved.get("last_probe")
+        if isinstance(saved.get("last_probe"), dict)
+        else _last_probe()
+    )
     return {
         "config_path": str(_config_path()),
         "config_exists": _config_path().is_file(),
@@ -505,7 +511,6 @@ def save_config(payload: dict[str, Any]) -> dict[str, Any]:
 
 def probe_llm_connection(*, update_disk: bool = True, timeout_sec: float = 15.0) -> dict[str, Any]:
     """Call the configured provider once and return a sanitized connectivity report."""
-    global _LAST_PROBE
     cfg = effective_config()
     if not cfg.get("api_key"):
         result = {
@@ -593,7 +598,7 @@ def probe_llm_connection(*, update_disk: bool = True, timeout_sec: float = 15.0)
                 "error": str(exc)[:300],
             }
 
-    _LAST_PROBE = result
+    _LAST_PROBE_BY_TEAM[current_team_id()] = result
     if update_disk:
         disk = _read_disk()
         if disk:

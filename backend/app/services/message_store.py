@@ -6,12 +6,18 @@ import json
 import logging
 import sqlite3
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from typing import Any
 
 from app.channels.base import UnifiedMessage
 from app.services.crm_store import _crm_db_path
+from app.services.tenant_context import (
+    current_team_id,
+    infer_legacy_owner_team_id,
+    resolve_team_id,
+    tenant_scope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -23,10 +29,27 @@ def _now_iso() -> str:
 def ensure_messages_schema() -> None:
     """确保消息表 + 收件箱表存在（共享 kellai.db）。"""
     with sqlite3.connect(str(_crm_db_path())) as conn:
+        owner_team_id = infer_legacy_owner_team_id()
+        existing_messages = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='kellai_messages'"
+        ).fetchone()
+        if existing_messages:
+            info = conn.execute("PRAGMA table_info(kellai_messages)").fetchall()
+            columns = {str(row[1]) for row in info}
+            primary_key = [
+                str(row[1])
+                for row in sorted(info, key=lambda item: int(item[5]))
+                if int(row[5]) > 0
+            ]
+            if "team_id" not in columns or primary_key != ["team_id", "id"]:
+                conn.execute(
+                    "ALTER TABLE kellai_messages RENAME TO kellai_messages_legacy_tenant"
+                )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS kellai_messages (
-                id TEXT PRIMARY KEY,
+                team_id INTEGER NOT NULL DEFAULT 0,
+                id TEXT NOT NULL,
                 customer_id INTEGER NOT NULL,
                 channel_type TEXT NOT NULL,
                 contact_id TEXT NOT NULL,
@@ -36,21 +59,68 @@ def ensure_messages_schema() -> None:
                 content_type TEXT NOT NULL DEFAULT 'text',
                 metadata_json TEXT,
                 created_at TEXT NOT NULL,
-                is_read INTEGER NOT NULL DEFAULT 0
+                is_read INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (team_id, id)
             )
             """
         )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_messages_customer ON kellai_messages(customer_id)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_messages_channel ON kellai_messages(channel_type)"
-        )
+        legacy_messages = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='kellai_messages_legacy_tenant'"
+        ).fetchone()
+        if legacy_messages:
+            legacy_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(kellai_messages_legacy_tenant)")
+            }
+            if "team_id" in legacy_columns:
+                team_expr = (
+                    "CASE WHEN team_id > 0 THEN team_id "
+                    "WHEN json_valid(metadata_json) "
+                    "THEN COALESCE(CAST(json_extract(metadata_json, '$.team_id') AS INTEGER), "
+                    f"{int(owner_team_id or 0)}) ELSE {int(owner_team_id or 0)} END"
+                )
+            else:
+                team_expr = (
+                    "CASE WHEN json_valid(metadata_json) "
+                    "THEN COALESCE(CAST(json_extract(metadata_json, '$.team_id') AS INTEGER), "
+                    f"{int(owner_team_id or 0)}) ELSE {int(owner_team_id or 0)} END"
+                )
+            conn.execute(
+                f"""
+                INSERT OR IGNORE INTO kellai_messages
+                    (team_id, id, customer_id, channel_type, contact_id,
+                     contact_name, direction, content, content_type,
+                     metadata_json, created_at, is_read)
+                SELECT {team_expr}, id, customer_id, channel_type, contact_id,
+                       contact_name, direction, content, content_type,
+                       metadata_json, created_at, is_read
+                FROM kellai_messages_legacy_tenant
+                """
+            )
+            conn.execute("DROP TABLE kellai_messages_legacy_tenant")
         # 渠道收件箱：适配器主动拉取 / webhook 入库的"待消费"消息
+        existing_inbox = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='kellai_channel_inbox'"
+        ).fetchone()
+        if existing_inbox:
+            info = conn.execute("PRAGMA table_info(kellai_channel_inbox)").fetchall()
+            columns = {str(row[1]) for row in info}
+            primary_key = [
+                str(row[1])
+                for row in sorted(info, key=lambda item: int(item[5]))
+                if int(row[5]) > 0
+            ]
+            if "team_id" not in columns or primary_key != ["team_id", "id"]:
+                conn.execute(
+                    "ALTER TABLE kellai_channel_inbox "
+                    "RENAME TO kellai_channel_inbox_legacy_tenant"
+                )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS kellai_channel_inbox (
-                id TEXT PRIMARY KEY,
+                team_id INTEGER NOT NULL DEFAULT 0,
+                id TEXT NOT NULL,
                 channel_type TEXT NOT NULL,
                 contact_id TEXT NOT NULL,
                 contact_name TEXT NOT NULL DEFAULT '',
@@ -59,17 +129,76 @@ def ensure_messages_schema() -> None:
                 content_type TEXT NOT NULL DEFAULT 'text',
                 metadata_json TEXT,
                 received_at TEXT NOT NULL,
-                consumed INTEGER NOT NULL DEFAULT 0
+                consumed INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (team_id, id)
             )
             """
         )
+        legacy_inbox = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='kellai_channel_inbox_legacy_tenant'"
+        ).fetchone()
+        if legacy_inbox:
+            legacy_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(kellai_channel_inbox_legacy_tenant)")
+            }
+            if "team_id" in legacy_columns:
+                team_expr = (
+                    "CASE WHEN team_id > 0 THEN team_id "
+                    "WHEN json_valid(metadata_json) "
+                    "THEN COALESCE(CAST(json_extract(metadata_json, '$.team_id') AS INTEGER), "
+                    f"{int(owner_team_id or 0)}) ELSE {int(owner_team_id or 0)} END"
+                )
+            else:
+                team_expr = (
+                    "CASE WHEN json_valid(metadata_json) "
+                    "THEN COALESCE(CAST(json_extract(metadata_json, '$.team_id') AS INTEGER), "
+                    f"{int(owner_team_id or 0)}) ELSE {int(owner_team_id or 0)} END"
+                )
+            conn.execute(
+                f"""
+                INSERT OR IGNORE INTO kellai_channel_inbox
+                    (team_id, id, channel_type, contact_id, contact_name,
+                     direction, content, content_type, metadata_json,
+                     received_at, consumed)
+                SELECT {team_expr}, id, channel_type, contact_id, contact_name,
+                       direction, content, content_type, metadata_json,
+                       received_at, consumed
+                FROM kellai_channel_inbox_legacy_tenant
+                """
+            )
+            conn.execute("DROP TABLE kellai_channel_inbox_legacy_tenant")
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_inbox_channel ON kellai_channel_inbox(channel_type)"
+            "CREATE INDEX IF NOT EXISTS idx_messages_team_customer "
+            "ON kellai_messages(team_id, customer_id)"
         )
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_inbox_consumed ON kellai_channel_inbox(consumed)"
+            "CREATE INDEX IF NOT EXISTS idx_messages_team_channel "
+            "ON kellai_messages(team_id, channel_type)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_inbox_team_channel "
+            "ON kellai_channel_inbox(team_id, channel_type)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_inbox_team_consumed "
+            "ON kellai_channel_inbox(team_id, consumed)"
         )
         conn.commit()
+
+
+def _effective_team_id(
+    explicit_team_id: int | None = None,
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> int:
+    metadata_team_id = int((metadata or {}).get("team_id") or 0)
+    if explicit_team_id and metadata_team_id and int(explicit_team_id) != metadata_team_id:
+        from app.services.tenant_context import TenantIsolationError
+
+        raise TenantIsolationError("请求租户与消息租户不一致")
+    return resolve_team_id(int(explicit_team_id or metadata_team_id or 0))
 
 
 @contextmanager
@@ -87,62 +216,74 @@ def _connect():
 def save_message(msg: UnifiedMessage) -> UnifiedMessage:
     """保存一条消息到数据库。"""
     ensure_messages_schema()
-    if int(msg.customer_id or 0) <= 0:
-        try:
-            from app.services.growth_loop import resolve_customer_for_message
-            from app.services.pipeline import _customer_id_from_doc
+    metadata = dict(msg.metadata) if isinstance(msg.metadata, dict) else {}
+    team_id = _effective_team_id(metadata=metadata)
+    if team_id > 0:
+        metadata["team_id"] = team_id
+        msg = msg.model_copy(update={"metadata": metadata})
+    scope = tenant_scope(team_id) if team_id > 0 else nullcontext()
+    with scope:
+        if int(msg.customer_id or 0) <= 0:
+            try:
+                from app.services.growth_loop import resolve_customer_for_message
+                from app.services.pipeline import _customer_id_from_doc
 
-            doc = resolve_customer_for_message(msg)
-            uid = _customer_id_from_doc(doc)
-            if uid > 0:
-                msg = msg.model_copy(update={"customer_id": uid})
-        except Exception:
-            logger.warning("保存消息前解析客户失败: message_id=%s", msg.id, exc_info=True)
-    is_read = 0 if str(msg.direction or "").lower() == "inbound" else 1
-    with _connect() as conn:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO kellai_messages
-                (id, customer_id, channel_type, contact_id, contact_name,
-                 direction, content, content_type, metadata_json, created_at, is_read)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                msg.id,
-                msg.customer_id,
-                msg.channel_type,
-                msg.contact_id,
-                msg.contact_name,
-                msg.direction,
-                msg.content,
-                msg.content_type,
-                json.dumps(msg.metadata, ensure_ascii=False),
-                msg.created_at,
-                is_read,
-            ),
-        )
-    try:
-        from app.services.growth_loop import apply_message_to_growth_loop
-
-        apply_message_to_growth_loop(msg)
-    except Exception:
-        logger.warning("消息已保存但增长闭环更新失败: message_id=%s", msg.id, exc_info=True)
-    try:
-        from app.services.workforce_routing import auto_assign_customer, touch_assignment
-
-        metadata = msg.metadata if isinstance(msg.metadata, dict) else {}
-        team_id = int(metadata.get("team_id") or 0)
-        if int(msg.customer_id or 0) > 0 and team_id > 0:
-            if str(msg.direction or "").lower() == "inbound":
-                auto_assign_customer(
-                    customer_id=int(msg.customer_id),
-                    team_id=team_id,
-                    source=f"{msg.channel_type}_inbound",
+                doc = resolve_customer_for_message(msg)
+                uid = _customer_id_from_doc(doc)
+                if uid > 0:
+                    msg = msg.model_copy(update={"customer_id": uid})
+            except Exception:
+                logger.warning(
+                    "保存消息前解析客户失败: message_id=%s", msg.id, exc_info=True
                 )
-            else:
-                touch_assignment(int(msg.customer_id))
-    except Exception:
-        logger.warning("消息已保存但接待分配更新失败: message_id=%s", msg.id, exc_info=True)
+        is_read = 0 if str(msg.direction or "").lower() == "inbound" else 1
+        with _connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO kellai_messages
+                    (team_id, id, customer_id, channel_type, contact_id, contact_name,
+                     direction, content, content_type, metadata_json, created_at, is_read)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    team_id,
+                    msg.id,
+                    msg.customer_id,
+                    msg.channel_type,
+                    msg.contact_id,
+                    msg.contact_name,
+                    msg.direction,
+                    msg.content,
+                    msg.content_type,
+                    json.dumps(msg.metadata, ensure_ascii=False),
+                    msg.created_at,
+                    is_read,
+                ),
+            )
+        try:
+            from app.services.growth_loop import apply_message_to_growth_loop
+
+            apply_message_to_growth_loop(msg)
+        except Exception:
+            logger.warning(
+                "消息已保存但增长闭环更新失败: message_id=%s", msg.id, exc_info=True
+            )
+        try:
+            from app.services.workforce_routing import auto_assign_customer, touch_assignment
+
+            if int(msg.customer_id or 0) > 0 and team_id > 0:
+                if str(msg.direction or "").lower() == "inbound":
+                    auto_assign_customer(
+                        customer_id=int(msg.customer_id),
+                        team_id=team_id,
+                        source=f"{msg.channel_type}_inbound",
+                    )
+                else:
+                    touch_assignment(int(msg.customer_id), team_id=team_id)
+        except Exception:
+            logger.warning(
+                "消息已保存但接待分配更新失败: message_id=%s", msg.id, exc_info=True
+            )
     return msg
 
 
@@ -151,12 +292,15 @@ def get_messages(
     channel_type: str = "",
     limit: int = 50,
     since: str = "",
+    *,
+    team_id: int | None = None,
 ) -> list[UnifiedMessage]:
     """获取消息列表。"""
     ensure_messages_schema()
     with _connect() as conn:
-        clauses: list[str] = ["customer_id = ?"]
-        params: list[Any] = [int(customer_id)]
+        resolved_team_id = _effective_team_id(team_id)
+        clauses: list[str] = ["team_id = ?", "customer_id = ?"]
+        params: list[Any] = [resolved_team_id, int(customer_id)]
         if channel_type:
             clauses.append("channel_type = ?")
             params.append(channel_type)
@@ -200,12 +344,15 @@ def get_messages_with_state(
     channel_type: str = "",
     limit: int = 50,
     since: str = "",
+    *,
+    team_id: int | None = None,
 ) -> list[dict[str, Any]]:
     """获取消息列表，包含前端闭环展示需要的 read/customer/stage/intent 字段。"""
     ensure_messages_schema()
     with _connect() as conn:
-        clauses: list[str] = ["customer_id = ?"]
-        params: list[Any] = [int(customer_id)]
+        resolved_team_id = _effective_team_id(team_id)
+        clauses: list[str] = ["team_id = ?", "customer_id = ?"]
+        params: list[Any] = [resolved_team_id, int(customer_id)]
         if channel_type:
             clauses.append("channel_type = ?")
             params.append(channel_type)
@@ -238,7 +385,9 @@ def get_messages_with_state(
     try:
         from app.services.workforce_routing import assignment_for_customer
 
-        assignment = assignment_for_customer(int(customer_id)) or {}
+        assignment = assignment_for_customer(
+            int(customer_id), team_id=resolved_team_id
+        ) or {}
     except Exception:
         logger.debug("获取客户接待分配失败: customer_id=%s", customer_id, exc_info=True)
         assignment = {}
@@ -280,7 +429,7 @@ def get_messages_with_state(
     return result
 
 
-def get_demo_customer_ids() -> set[int]:
+def get_demo_customer_ids(*, team_id: int | None = None) -> set[int]:
     """Return customers created by built-in simulations or product audits.
 
     Mock mode only controls the frontend adapter. Simulation endpoints persist
@@ -290,9 +439,12 @@ def get_demo_customer_ids() -> set[int]:
     """
     demo_sources = {"closed_loop_audit", "llm_full_flow"}
     customer_ids: set[int] = set()
+    resolved_team_id = _effective_team_id(team_id)
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT customer_id, metadata_json FROM kellai_messages WHERE metadata_json IS NOT NULL"
+            "SELECT customer_id, metadata_json FROM kellai_messages "
+            "WHERE team_id = ? AND metadata_json IS NOT NULL",
+            (resolved_team_id,),
         ).fetchall()
     for row in rows:
         raw = row["metadata_json"]
@@ -315,18 +467,20 @@ def get_demo_customer_ids() -> set[int]:
     return customer_ids
 
 
-def get_unread_count(customer_id: int) -> int:
+def get_unread_count(customer_id: int, *, team_id: int | None = None) -> int:
     """获取单客户未读消息数量。"""
     ensure_messages_schema()
     with _connect() as conn:
         row = conn.execute(
-            "SELECT COUNT(*) AS cnt FROM kellai_messages WHERE customer_id = ? AND is_read = 0 AND direction = 'inbound'",
-            (int(customer_id),),
+            "SELECT COUNT(*) AS cnt FROM kellai_messages "
+            "WHERE team_id = ? AND customer_id = ? "
+            "AND is_read = 0 AND direction = 'inbound'",
+            (_effective_team_id(team_id), int(customer_id)),
         ).fetchone()
     return int(row["cnt"]) if row else 0
 
 
-def get_unread_summary() -> dict[str, int]:
+def get_unread_summary(*, team_id: int | None = None) -> dict[str, int]:
     """获取未读消息汇总。
 
     返回:
@@ -336,7 +490,7 @@ def get_unread_summary() -> dict[str, int]:
         }
 
     只统计入站消息（direction='inbound'）且未读（is_read=0）的。
-    团队隔离由调用方（routes）按需过滤；此处只做统计聚合。
+    统计在数据层按当前认证租户强制隔离。
     """
     ensure_messages_schema()
     with _connect() as conn:
@@ -344,9 +498,10 @@ def get_unread_summary() -> dict[str, int]:
             """
             SELECT customer_id, COUNT(*) AS cnt
             FROM kellai_messages
-            WHERE is_read = 0 AND direction = 'inbound'
+            WHERE team_id = ? AND is_read = 0 AND direction = 'inbound'
             GROUP BY customer_id
-            """
+            """,
+            (_effective_team_id(team_id),),
         ).fetchall()
     by_customer: dict[str, int] = {}
     total = 0
@@ -359,34 +514,41 @@ def get_unread_summary() -> dict[str, int]:
     return {"total": total, "by_customer": by_customer}
 
 
-def mark_as_read(message_ids: list[str]) -> int:
+def mark_as_read(message_ids: list[str], *, team_id: int | None = None) -> int:
     """将消息标记为已读，返回实际更新的行数。"""
     if not message_ids:
         return 0
     ensure_messages_schema()
     with _connect() as conn:
         placeholders = ",".join("?" for _ in message_ids)
+        resolved_team_id = _effective_team_id(team_id)
         cur = conn.execute(
-            f"UPDATE kellai_messages SET is_read = 1 WHERE id IN ({placeholders}) AND is_read = 0",
-            message_ids,
+            f"UPDATE kellai_messages SET is_read = 1 WHERE team_id = ? "
+            f"AND id IN ({placeholders}) AND is_read = 0",
+            [resolved_team_id, *message_ids],
         )
         return int(cur.rowcount or 0)
 
 
-def mark_all_as_read(customer_id: int | None = None) -> int:
+def mark_all_as_read(
+    customer_id: int | None = None, *, team_id: int | None = None
+) -> int:
     """将全部（指定客户 / 全局）入站未读消息标记为已读，返回更新的行数。"""
     ensure_messages_schema()
+    resolved_team_id = _effective_team_id(team_id)
     with _connect() as conn:
         if customer_id is not None:
             cur = conn.execute(
                 "UPDATE kellai_messages SET is_read = 1 "
-                "WHERE customer_id = ? AND is_read = 0 AND direction = 'inbound'",
-                (int(customer_id),),
+                "WHERE team_id = ? AND customer_id = ? "
+                "AND is_read = 0 AND direction = 'inbound'",
+                (resolved_team_id, int(customer_id)),
             )
         else:
             cur = conn.execute(
                 "UPDATE kellai_messages SET is_read = 1 "
-                "WHERE is_read = 0 AND direction = 'inbound'"
+                "WHERE team_id = ? AND is_read = 0 AND direction = 'inbound'",
+                (resolved_team_id,),
             )
         return int(cur.rowcount or 0)
 
@@ -406,6 +568,7 @@ def push_inbox(
     content_type: str = "text",
     metadata: dict | None = None,
     msg_id: str | None = None,
+    team_id: int | None = None,
 ) -> str:
     """把一条入站消息写入收件箱（适配器 / webhook 接收方调用）。
 
@@ -414,16 +577,21 @@ def push_inbox(
     import secrets as _secrets
 
     ensure_messages_schema()
+    safe_metadata = dict(metadata or {})
+    resolved_team_id = _effective_team_id(team_id, metadata=safe_metadata)
+    if resolved_team_id > 0:
+        safe_metadata["team_id"] = resolved_team_id
     mid = msg_id or f"{channel_type}:{int(time.time() * 1000)}:{_secrets.token_hex(4)}"
     with _connect() as conn:
         conn.execute(
             """
             INSERT OR IGNORE INTO kellai_channel_inbox
-                (id, channel_type, contact_id, contact_name, direction,
+                (team_id, id, channel_type, contact_id, contact_name, direction,
                  content, content_type, metadata_json, received_at, consumed)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
             """,
             (
+                resolved_team_id,
                 mid,
                 channel_type,
                 contact_id,
@@ -431,7 +599,7 @@ def push_inbox(
                 direction,
                 content,
                 content_type,
-                json.dumps(metadata or {}, ensure_ascii=False),
+                json.dumps(safe_metadata, ensure_ascii=False),
                 _now_iso(),
             ),
         )
@@ -443,12 +611,14 @@ def list_inbox(
     *,
     limit: int = 50,
     include_consumed: bool = False,
+    team_id: int | None = None,
 ) -> list[dict]:
     """列出收件箱消息。"""
     ensure_messages_schema()
+    resolved_team_id = _effective_team_id(team_id)
     with _connect() as conn:
-        clauses = []
-        params: list[Any] = []
+        clauses = ["team_id = ?"]
+        params: list[Any] = [resolved_team_id]
         if channel_type:
             clauses.append("channel_type = ?")
             params.append(channel_type)
@@ -470,6 +640,7 @@ def list_inbox(
             except (json.JSONDecodeError, TypeError):
                 meta = {}
         result.append({
+            "team_id": int(r["team_id"] or 0),
             "id": r["id"],
             "channel_type": r["channel_type"],
             "contact_id": r["contact_id"],
@@ -484,16 +655,20 @@ def list_inbox(
     return result
 
 
-def mark_inbox_consumed(message_ids: list[str]) -> int:
+def mark_inbox_consumed(
+    message_ids: list[str], *, team_id: int | None = None
+) -> int:
     """把收件箱消息标记为已消费。"""
     if not message_ids:
         return 0
     ensure_messages_schema()
     with _connect() as conn:
         placeholders = ",".join("?" for _ in message_ids)
+        resolved_team_id = _effective_team_id(team_id)
         cur = conn.execute(
-            f"UPDATE kellai_channel_inbox SET consumed = 1 WHERE id IN ({placeholders})",
-            message_ids,
+            f"UPDATE kellai_channel_inbox SET consumed = 1 WHERE team_id = ? "
+            f"AND id IN ({placeholders})",
+            [resolved_team_id, *message_ids],
         )
         return int(cur.rowcount or 0)
 
