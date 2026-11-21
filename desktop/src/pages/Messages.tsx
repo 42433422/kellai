@@ -15,7 +15,8 @@ import {
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import ChannelLogo, { CHANNEL_BRAND_COLOR } from '../components/ChannelLogo';
-import { getMessages, sendMessage, suggestReply, getChannels, getDeliveryReceipt, deliveryLabel, MessageSendError, type DeliveryReceipt } from '../api/messages';
+import MessageDeliveryReceipt from '../components/MessageDeliveryReceipt';
+import { getMessages, sendMessage, suggestReply, getChannels, getDeliveryReceiptForView, deliveryLabel, MessageSendError, type DeliveryReceipt } from '../api/messages';
 import { updatePipelineStage } from '../api/funnel';
 import { getScriptHint } from '../api/sales';
 import { useApiQuery, useApiMutation, useQueryClient } from '../hooks/useApiQuery';
@@ -336,6 +337,11 @@ export default function Messages() {
   const [inputText, setInputText] = useState('');
   const [selectedChannel, setSelectedChannel] = useState('wework');
   const [deliveryNotice, setDeliveryNotice] = useState<DeliveryReceipt | null>(null);
+  const receiptAccountKey = currentUser?.team_id && currentUser?.id ? `${currentUser.team_id}:${currentUser.id}` : '';
+  const receiptViewKey = JSON.stringify([receiptAccountKey, selectedContactId, selectedChannel]);
+  const receiptViewRef = useRef({ key: receiptViewKey });
+  if (receiptViewRef.current.key !== receiptViewKey) receiptViewRef.current = { key: receiptViewKey };
+  const receiptView = receiptViewRef.current;
   const [selectedAssigneeId, setSelectedAssigneeId] = useState<number>(0);
   const [assignmentUpdating, setAssignmentUpdating] = useState(false);
 
@@ -728,7 +734,7 @@ export default function Messages() {
     && (!selectedCapability.capabilities.message_types || selectedCapability.capabilities.message_types.includes('text'))
     && selectedContact?.messages.some((message) => message.channel_type === selectedChannel && message.contact_id)
     && !(selectedContact?.isGroup && selectedChannel === 'douyin'));
-  useEffect(() => { setDeliveryNotice(null); }, [currentUser?.id, selectedContactId, selectedChannel]);
+  useEffect(() => { setDeliveryNotice(null); }, [currentUser?.team_id, currentUser?.id, selectedContactId, selectedChannel]);
   const currentUserId = Number(currentUser?.id || 0);
   const nextStage = selectedContact ? getNextPipelineStage(selectedContact.stage) : null;
   const advancingStage = advanceStageMutation.isPending;
@@ -934,7 +940,7 @@ export default function Messages() {
                     const isInbound = msg.direction === 'inbound';
                     return (
                       <div
-                        key={msg.id}
+                        key={`${receiptViewKey}:${msg.id}`}
                         className={clsx('flex', isInbound ? 'justify-start' : 'justify-end')}
                       >
                         {/* 入站消息：左侧头像 */}
@@ -1001,6 +1007,10 @@ export default function Messages() {
                               {speech.isSpeaking(msg.content) ? '停止' : '朗读'}
                             </button>
                           </div>
+                          {!isInbound && <MessageDeliveryReceipt
+                            message={msg} accountKey={receiptAccountKey}
+                            isCurrentView={() => receiptViewRef.current === receiptView}
+                          />}
                         </div>
 
                         {/* 出站消息：右侧头像 */}
@@ -1073,11 +1083,15 @@ export default function Messages() {
               {deliveryNotice && <div className="mb-2 flex items-center justify-between gap-3 rounded border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900" role="status">
                 <span>{deliveryLabel(deliveryNotice)}</span>
                 <button type="button" className="shrink-0 underline" onClick={async () => {
-                  const actor = currentAccountKey();
+                  const actor = receiptAccountKey;
+                  const requestId = deliveryNotice.request_id;
+                  const currentView = () => receiptViewRef.current === receiptView;
                   try {
-                    const receipt = await getDeliveryReceipt(deliveryNotice.request_id, actor);
-                    if (currentAccountKey() === actor) setDeliveryNotice(receipt);
-                  } catch { toastStore.error('暂时无法读取回执，请稍后再查'); }
+                    const receipt = await getDeliveryReceiptForView(requestId, actor, currentView);
+                    if (receipt) setDeliveryNotice((current) => currentView() && current?.request_id === requestId ? receipt : current);
+                  } catch {
+                    if (currentView() && currentAccountKey() === actor) toastStore.error('暂时无法读取回执，请稍后再查');
+                  }
                 }}>查询回执</button>
               </div>}
               <div className="flex items-end gap-3">

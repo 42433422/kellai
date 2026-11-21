@@ -82,10 +82,44 @@ export const deliveryLabel = (receipt: DeliveryReceipt) => {
   return '发送结果待确认，请查询原请求回执';
 };
 
+export interface MessageDeliveryProjection {
+  id: string;
+  direction: string;
+  metadata?: Record<string, unknown>;
+}
+
+/** Adapt the server's persisted message projection, never ordinary history. */
+export const deliveryReceiptFromMessage = (message: MessageDeliveryProjection): DeliveryReceipt | null => {
+  const requestId = message.metadata?.delivery_request_id;
+  if (message.direction !== 'outbound' || !message.id || typeof requestId !== 'string'
+    || !requestId.trim() || requestId !== requestId.trim() || Array.from(requestId).length > 200) return null;
+  const state = typeof message.metadata?.delivery_state === 'string' ? message.metadata.delivery_state : '';
+  const status: DeliveryReceipt['status'] = ['accepted', 'sent', 'delivered', 'read'].includes(state)
+    ? 'accepted' : state === 'failed' ? 'failed' : state === 'sending' ? 'sending' : 'unknown';
+  return {
+    request_id: requestId, message_id: message.id, status, persisted: true,
+    provider_state: state,
+    provider_message_id: typeof message.metadata?.provider_message_id === 'string'
+      ? message.metadata.provider_message_id : undefined,
+  };
+};
+
 export const getDeliveryReceipt = async (requestId: string, accountKey = currentAccountKey()): Promise<DeliveryReceipt> => {
   const response = await api.get(`/api/kellai/messages/requests/${encodeURIComponent(requestId)}`,
     { expectedAccount: accountKey, skipErrorToast: true, skipLoading: true });
   return response.data.data;
+};
+
+/** A read-only lookup may update only the account and view that requested it. */
+export const getDeliveryReceiptForView = async (
+  requestId: string, accountKey: string, isCurrentView: () => boolean,
+): Promise<DeliveryReceipt | null> => {
+  const current = () => Boolean(accountKey) && currentAccountKey() === accountKey && isCurrentView();
+  if (!current()) return null;
+  const receipt = await getDeliveryReceipt(requestId, accountKey);
+  if (!current()) return null;
+  if (receipt.request_id !== requestId) throw new MessageSendError('回执与原发送请求不符，请稍后重查');
+  return receipt;
 };
 
 // Only request IDs and hashes survive a refresh. No message text, credentials

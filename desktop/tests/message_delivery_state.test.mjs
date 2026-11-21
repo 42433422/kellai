@@ -1,19 +1,16 @@
 import assert from 'node:assert/strict';
 import { webcrypto } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 import test, { beforeEach } from 'node:test';
 import { build } from 'esbuild';
+import React from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
 
 // Bundle the actual product API with only the network/native transport replaced.
 // No browser, provider account, native app or new test dependency is required.
-const bundled = await build({
-  stdin: {
-    contents: "export * from './src/api/messages.ts'; export * from './src/api/deliveryState.ts';",
-    resolveDir: fileURLToPath(new URL('..', import.meta.url)), loader: 'ts',
-  },
-  bundle: true, platform: 'node', format: 'esm', write: false,
-  plugins: [{ name: 'test-transports', setup(builder) {
-    builder.onResolve({ filter: /^\.\/client$/ }, () => ({ path: 'client', namespace: 'transport' }));
+const transportPlugin = { name: 'test-transports', setup(builder) {
+    builder.onResolve({ filter: /^(?:\.\/client|\.\.\/api\/client)$/ }, () => ({ path: 'client', namespace: 'transport' }));
     builder.onResolve({ filter: /^@tauri-apps\/api\/core$/ }, () => ({ path: 'native', namespace: 'transport' }));
     builder.onLoad({ filter: /.*/, namespace: 'transport' }, ({ path }) => ({ contents: path === 'client'
       ? `export const currentAccountKey = () => globalThis.__deliveryHarness.account;
@@ -22,9 +19,26 @@ const bundled = await build({
            get: (...args) => globalThis.__deliveryHarness.get(...args)
          };`
       : `export const invoke = (...args) => globalThis.__deliveryHarness.invoke(...args);` }));
-  } }],
+  } };
+const bundled = await build({
+  stdin: {
+    contents: "export * from './src/api/messages.ts'; export * from './src/api/deliveryState.ts';",
+    resolveDir: fileURLToPath(new URL('..', import.meta.url)), loader: 'ts',
+  },
+  bundle: true, platform: 'node', format: 'esm', write: false,
+  plugins: [transportPlugin],
 });
 const api = await import(`data:text/javascript;base64,${Buffer.from(bundled.outputFiles[0].text).toString('base64')}`);
+const componentBundle = await build({
+  entryPoints: [fileURLToPath(new URL('../src/components/MessageDeliveryReceipt.tsx', import.meta.url))],
+  bundle: true, platform: 'node', format: 'cjs', write: false, jsx: 'automatic',
+  external: ['react', 'react/jsx-runtime'], plugins: [transportPlugin],
+});
+const componentModule = { exports: {} };
+new Function('require', 'module', 'exports', componentBundle.outputFiles[0].text)(
+  createRequire(import.meta.url), componentModule, componentModule.exports,
+);
+const MessageDeliveryReceipt = componentModule.exports.default;
 
 class MemoryStorage {
   values = new Map();
@@ -247,4 +261,99 @@ test('worker synchronization, claim and result carry their captured account', as
     delivery_key: 'auto:inbound', success: false }, '7:1');
   assert.equal(requests.length, 3);
   assert.deepEqual(requests.map((request) => request.config.expectedAccount), ['7:1', '7:1', '7:1']);
+});
+
+const projectedMessage = (requestId, state) => ({
+  id: `delivery:${requestId}`, direction: 'outbound', contact_id: 'same-contact',
+  metadata: { delivery_request_id: requestId, delivery_state: state, provider_message_id: `platform:${requestId}` },
+});
+
+test('server projections retain separate receipt IDs and never promote ordinary history', () => {
+  const first = api.deliveryReceiptFromMessage(projectedMessage('first-request', 'read'));
+  const second = api.deliveryReceiptFromMessage(projectedMessage('second-request', 'accepted'));
+  assert.equal(first.request_id, 'first-request');
+  assert.equal(first.provider_message_id, 'platform:first-request');
+  assert.equal(api.deliveryLabel(first), '渠道回执：已读');
+  assert.equal(second.request_id, 'second-request');
+  assert.equal(api.deliveryLabel(second), '渠道已受理，送达待确认');
+  for (const message of [
+    { id: 'legacy-outbound', direction: 'outbound' },
+    { id: 'provider-only', direction: 'outbound', metadata: { delivery_state: 'read', provider_message_id: 'old' } },
+    { ...projectedMessage('inbound', 'read'), direction: 'inbound' },
+    projectedMessage('', 'accepted'), projectedMessage(' request ', 'accepted'),
+    projectedMessage('x'.repeat(201), 'accepted'), projectedMessage(123, 'accepted'),
+  ]) assert.equal(api.deliveryReceiptFromMessage(message), null);
+  assert.equal(api.deliveryReceiptFromMessage(projectedMessage('unknown-state', undefined)).status, 'unknown');
+  assert.equal(api.deliveryReceiptFromMessage(projectedMessage('failed-state', 'failed')).status, 'failed');
+});
+
+test('actual message receipt component renders two same-contact statuses and read-only controls', () => {
+  const messages = [projectedMessage('first-request', 'read'), projectedMessage('second-request', 'accepted')];
+  const html = renderToStaticMarkup(React.createElement(React.Fragment, null,
+    messages.map((message) => React.createElement(MessageDeliveryReceipt, {
+      key: message.id, message, accountKey: '7:1', isCurrentView: () => true,
+    })),
+  ));
+  const rows = html.split('data-delivery-request-id=');
+  assert.equal(rows.length, 3);
+  assert.match(rows[1], /^"first-request"/);
+  assert.match(rows[1], /渠道回执：已读/);
+  assert.match(rows[1], /aria-label="查询此消息回执：first-request"/);
+  assert.match(rows[2], /^"second-request"/);
+  assert.match(rows[2], /渠道已受理，送达待确认/);
+  assert.match(rows[2], /aria-label="查询此消息回执：second-request"/);
+  assert.equal(localStorage.values.size, 0, 'message history must not create a browser ledger');
+});
+
+test('actual component hides ledger-free history and conservatively renders unknown projections', () => {
+  const render = (message) => renderToStaticMarkup(React.createElement(MessageDeliveryReceipt, {
+    message, accountKey: '7:1', isCurrentView: () => true,
+  }));
+  assert.equal(render({ id: 'old-message', direction: 'outbound', metadata: { delivery_state: 'read' } }), '');
+  assert.equal(render({ ...projectedMessage('incoming', 'read'), direction: 'inbound' }), '');
+  const html = render(projectedMessage('unknown-projection', 'unsupported'));
+  assert.match(html, /发送结果待确认，请查询原请求回执/);
+  assert.doesNotMatch(html, /渠道已受理/);
+});
+
+test('receipt queries keep two original request IDs independent and only use GET', async () => {
+  const requests = [];
+  const firstReply = deferred();
+  __deliveryHarness.get = async (url, config) => {
+    requests.push({ url, config });
+    if (url.endsWith('/first-request')) return firstReply.promise;
+    return response({ ...accepted('second-request'), provider_state: 'sent' });
+  };
+  const first = api.getDeliveryReceiptForView('first-request', '7:1', () => true);
+  const second = await api.getDeliveryReceiptForView('second-request', '7:1', () => true);
+  firstReply.resolve(response({ ...accepted('first-request'), provider_state: 'read' }));
+  assert.equal((await first).request_id, 'first-request');
+  assert.equal(second.request_id, 'second-request');
+  assert.equal(second.provider_state, 'sent');
+  assert.deepEqual(requests.map(({ url }) => url), [
+    '/api/kellai/messages/requests/first-request', '/api/kellai/messages/requests/second-request',
+  ]);
+  assert.deepEqual(requests.map(({ config }) => config.expectedAccount), ['7:1', '7:1']);
+  assert.equal(localStorage.values.size, 0);
+});
+
+for (const change of ['account', 'contact']) {
+  test(`late receipt after ${change} change is discarded`, async () => {
+    const pending = deferred();
+    let currentView = { contact: 7 };
+    const originalView = currentView;
+    __deliveryHarness.get = async () => pending.promise;
+    const original = api.getDeliveryReceiptForView('first-request', '7:1', () => currentView === originalView);
+    if (change === 'account') __deliveryHarness.account = '8:2';
+    else currentView = { contact: 8 };
+    pending.resolve(response({ ...accepted('first-request'), provider_state: 'read' }));
+    assert.equal(await original, null);
+  });
+}
+
+test('receipt query refuses an already stale view or mismatched request response', async () => {
+  assert.equal(await api.getDeliveryReceiptForView('old-request', '7:1', () => false), null);
+  assert.equal(await api.getDeliveryReceiptForView('old-account', '8:2', () => true), null);
+  __deliveryHarness.get = async () => response(accepted('unrelated-request'));
+  await assert.rejects(api.getDeliveryReceiptForView('original-request', '7:1', () => true), /回执与原发送请求不符/);
 });
