@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   kellai-backend:
     build:
@@ -8,7 +6,7 @@ services:
     container_name: kellai-backend
     restart: unless-stopped
     ports:
-      - "${KELLAI_PORT:-8790}:8790"
+      - "127.0.0.1:${KELLAI_PORT:-8793}:8790"
     volumes:
       - kellai-data:/data
     environment:
@@ -23,6 +21,8 @@ services:
       - KELLAI_PORT=8790
       - KELLAI_DATA_DIR=/data
       - KELLAI_LOG_LEVEL=${KELLAI_LOG_LEVEL:-INFO}
+      - KELLAI_CHANNEL_WORKER_ENABLED=${KELLAI_CHANNEL_WORKER_ENABLED:-1}
+      - KELLAI_CHANNEL_ENV_TEAM_ID=${KELLAI_CHANNEL_ENV_TEAM_ID:-}
 
 volumes:
   kellai-data:

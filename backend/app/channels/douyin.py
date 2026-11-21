@@ -25,7 +25,7 @@ from typing import Any
 import httpx
 
 from app.channels.base import ChannelAdapter, UnifiedMessage
-from app.channels.http_client import read_env
+from app.channels.http_client import read_env, checked_json, send_error
 from app.services.douyin_channel import (
     DouyinChannelError,
     access_context,
@@ -106,9 +106,9 @@ class DouyinAdapter(ChannelAdapter):
         """
         content = (content or "").strip()
         if not content:
-            return {"success": False, "message_id": "", "error": "消息内容为空"}
+            return {"success": False, "message_id": "", "error": "消息内容为空", "delivery_state": "failed", "definitely_not_sent": True}
         if not contact_id:
-            return {"success": False, "message_id": "", "error": "contact_id 不能为空"}
+            return {"success": False, "message_id": "", "error": "contact_id 不能为空", "delivery_state": "failed", "definitely_not_sent": True}
 
         team_id = int(kwargs.get("team_id") or 0)
         desktop_target = self._resolve_desktop_target(
@@ -118,6 +118,8 @@ class DouyinAdapter(ChannelAdapter):
             team_id=team_id,
         )
         if desktop_target:
+            if kwargs.get("_bridge_local_execution"):
+                return send_error("requires_desktop_execution", definitely_not_sent=True)
             from app.services.douyin_desktop_automation import (
                 automation_enabled,
                 send_message as send_desktop_message,
@@ -132,9 +134,9 @@ class DouyinAdapter(ChannelAdapter):
                 )
 
         if not self._is_configured():
-            return {"success": False, "message_id": "", "error": _UNCONFIGURED_MSG}
+            return {"success": False, "message_id": "", "error": _UNCONFIGURED_MSG, "delivery_state": "failed", "definitely_not_sent": True}
         if team_id <= 0:
-            return {"success": False, "message_id": "", "error": "发送抖音私信缺少当前团队上下文"}
+            return {"success": False, "message_id": "", "error": "发送抖音私信缺少当前团队上下文", "delivery_state": "failed", "definitely_not_sent": True}
 
         reply_context = self._resolve_reply_context(
             customer_id=int(kwargs.get("customer_id") or 0),
@@ -143,11 +145,12 @@ class DouyinAdapter(ChannelAdapter):
             supplied=kwargs.get("reply_context"),
         )
         try:
-            if remote_bridge_enabled():
+            if remote_bridge_enabled() and not kwargs.get("_bridge_local_execution"):
                 return await remote_send_message(
                     team_id=team_id,
                     contact_id=contact_id,
                     content=content,
+                    idempotency_key=str(kwargs.get("idempotency_key") or ""),
                     persona_id=str(kwargs.get("persona_id") or ""),
                     customer_id=int(kwargs.get("customer_id") or 0),
                     reply_context=reply_context,
@@ -165,9 +168,13 @@ class DouyinAdapter(ChannelAdapter):
                     "success": False,
                     "message_id": "",
                     "error": "该客户还没有可回复的抖音私信上下文，请先让客户向已绑定抖音号发送一条新私信",
+                    "delivery_state": "failed", "definitely_not_sent": True,
                 }
             client = await self._get_client()
-            auth = await access_context(team_id)
+            try:
+                auth = await access_context(team_id)
+            except Exception as exc:
+                return send_error(f"抖音发送前获取授权失败: {type(exc).__name__}", definitely_not_sent=True)
             payload = {
                 "message_type": "text",
                 "to_user_id": contact_id,
@@ -186,10 +193,7 @@ class DouyinAdapter(ChannelAdapter):
                 },
                 json=payload,
             )
-            try:
-                body = resp.json()
-            except Exception:
-                body = {"raw": resp.text}
+            body = checked_json(resp)
             data = body.get("data", {}) if isinstance(body, dict) else {}
             extra = body.get("extra", {}) if isinstance(body, dict) else {}
             error_code = int(
@@ -198,7 +202,7 @@ class DouyinAdapter(ChannelAdapter):
                 or body.get("errcode", 0)
                 or 0
             )
-            if resp.status_code >= 400 or error_code != 0:
+            if error_code != 0:
                 description = (
                     data.get("description")
                     or extra.get("description")
@@ -209,18 +213,23 @@ class DouyinAdapter(ChannelAdapter):
                     "success": False,
                     "message_id": "",
                     "error": f"error_code={error_code} description={description}",
+                    "delivery_state": "failed", "definitely_not_sent": True,
                 }
+            sent_id = str(data.get("server_msg_id") or data.get("message_id") or "")
+            if not sent_id:
+                return send_error("抖音未返回消息ID，发送结果未知")
             return {
                 "success": True,
-                "message_id": str(data.get("server_msg_id") or data.get("message_id") or ""),
+                "delivery_state": "accepted",
+                "message_id": sent_id,
                 "error": "",
                 "open_id": str(auth["open_id"]),
             }
         except DouyinChannelError as exc:
-            return {"success": False, "message_id": "", "error": str(exc)}
+            return send_error(exc)
         except Exception as exc:
             logger.warning("抖音 send_message 异常: %s", exc)
-            return {"success": False, "message_id": "", "error": str(exc)}
+            return send_error(exc)
 
     @staticmethod
     def _resolve_desktop_target(
@@ -335,19 +344,24 @@ class DouyinAdapter(ChannelAdapter):
                 "success": False,
                 "message_id": "",
                 "error": "抖音私信事件缺少经营抖音号 open_id，请确认已订阅 im_receive_msg / im_send_msg",
+                "delivery_state": "failed", "definitely_not_sent": True,
             }
         if not message_id or not conversation_id:
             return {
                 "success": False,
                 "message_id": "",
                 "error": "抖音私信事件缺少消息 ID 或会话 ID，暂时无法回复",
+                "delivery_state": "failed", "definitely_not_sent": True,
             }
 
-        token_context = await business_token_context(
-            team_id=team_id,
-            owner_open_id=owner_open_id,
-            scope="im.direct_message",
-        )
+        try:
+            token_context = await business_token_context(
+                team_id=team_id,
+                owner_open_id=owner_open_id,
+                scope="im.direct_message",
+            )
+        except Exception as exc:
+            return send_error(f"抖音私信发送前获取授权失败: {type(exc).__name__}", definitely_not_sent=True)
         client = await self._get_client()
         response = await client.post(
             "/im/send/msg/",
@@ -367,10 +381,7 @@ class DouyinAdapter(ChannelAdapter):
                 "scene": "im_reply_msg",
             },
         )
-        try:
-            body = response.json()
-        except Exception:
-            body = {"raw": response.text}
+        body = checked_json(response)
         data = body.get("data", {}) if isinstance(body, dict) else {}
         extra = body.get("extra", {}) if isinstance(body, dict) else {}
         error_code = int(
@@ -380,7 +391,7 @@ class DouyinAdapter(ChannelAdapter):
             or body.get("error_code", 0)
             or 0
         )
-        if response.status_code >= 400 or error_code != 0:
+        if error_code != 0:
             description = str(
                 data.get("description")
                 or extra.get("description")
@@ -392,6 +403,7 @@ class DouyinAdapter(ChannelAdapter):
                 "success": False,
                 "message_id": "",
                 "error": f"error_code={error_code} description={description}",
+                    "delivery_state": "failed", "definitely_not_sent": True,
             }
         sent_id = str(
             body.get("msg_id")
@@ -399,8 +411,11 @@ class DouyinAdapter(ChannelAdapter):
             or data.get("server_msg_id")
             or ""
         )
+        if not sent_id:
+            return send_error("抖音私信未返回消息ID，发送结果未知")
         return {
             "success": True,
+            "delivery_state": "accepted",
             "message_id": sent_id,
             "error": "",
             "open_id": owner_open_id,

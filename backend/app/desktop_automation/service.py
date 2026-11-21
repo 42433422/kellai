@@ -235,44 +235,12 @@ class DesktopAutomationService:
     # ------------------------------------------------------------------
 
     def send_wechat_message(self, contact_name: str, message: str) -> dict[str, Any]:
-        """发送微信消息。
-
-        Args:
-            contact_name: 联系人名称
-            message: 消息文本
-
-        Returns:
-            {"success": bool, "message_sent": bool, "error": str}
-        """
-        text = str(message or "").strip()
-        contact = str(contact_name or "").strip()
-        if not contact or not text:
-            return {"success": False, "message_sent": False, "error": "contact_or_message_empty"}
-
-        if not self._use_real:
-            logger.info("wechat send stub contact=%s len=%s", contact, len(text))
-            return {
-                "success": False,
-                "message_sent": False,
-                "error": "desktop_automation_not_configured",
-                "hint": "配置 KELLAI_WECHAT_AUTOMATION=1 并接入真实发送实现",
-            }
-
-        # 确保已连接
-        if not self.automation._connected:
-            conn = self.automation.connect()
-            if not conn.get("connected"):
-                return {
-                    "success": False,
-                    "message_sent": False,
-                    "error": f"微信连接失败: {conn.get('message', '')}",
-                }
-
-        return self.automation.send_text_message(contact, text)
-
-    # ------------------------------------------------------------------
-    # 信息获取
-    # ------------------------------------------------------------------
+        """Legacy display-name sends cannot bypass the authorized message ledger."""
+        return {
+            "success": False, "message_sent": False, "definitely_not_sent": True,
+            "error": "legacy_name_target_disabled",
+            "hint": "使用已配置的公众号/企业渠道，在消息中心确认稳定联系人后发送。",
+        }
 
     def get_unread_count(self) -> int:
         """获取未读消息数量。"""

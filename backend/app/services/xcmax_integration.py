@@ -167,6 +167,12 @@ def approve_authorization(
     team_id = current_team_id()
     if team_id <= 0:
         raise RuntimeError("缺少已认证的租户上下文")
+    allowed = {"customer_profiles.read", "customer_conversations.read", "channels.read", "messages.send"}
+    if not accepted_scopes or not set(accepted_scopes).issubset(allowed):
+        raise RuntimeError("授权范围无效")
+    if "messages.send" in accepted_scopes:
+        from app.services.messaging import require_actor
+        require_actor(current_user, manage=True)
     token = secrets.token_urlsafe(40)
     user = {
         "id": current_user.get("id") or "",
@@ -266,4 +272,17 @@ def authorize_access_token(token: str, required_scope: str) -> dict[str, Any]:
     if required_scope not in set(connection.get("authorized_scopes") or []):
         raise HTTPException(status_code=403, detail="该数据权限未授权")
     connection["team_id"] = matched_team_id
+    if required_scope == "messages.send":
+        # Removing/demoting an approver immediately removes its delegated write
+        # access. Legacy read-only bindings never acquire this scope implicitly.
+        from app.services.auth import get_user
+        from app.services.messaging import require_actor
+        user_id = (connection.get("authorized_by") or {}).get("id")
+        try:
+            actor = get_user(int(user_id))
+        except (TypeError, ValueError):
+            actor = None
+        if not actor or int(actor.get("team_id") or 0) != matched_team_id:
+            raise HTTPException(status_code=403, detail="发送授权的账号已失效，请重新授权")
+        connection["actor"] = require_actor(actor, manage=True)
     return connection

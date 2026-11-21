@@ -29,6 +29,7 @@ import { useMessageStore } from '../stores/message';
 import { ONBOARDING_WELCOME_CACHE_KEY, ONBOARDING_WELCOME_SPEECH_TEXT } from '../constants/onboardingTour';
 import { playPreparedTextToSpeech, preloadTextToSpeech, unlockTextToSpeechAudio } from '../hooks/useTextToSpeech';
 import { estimateSpeechHoldMs } from '../utils/onboardingSpeech';
+import { useAuthStore } from '../stores/auth';
 import ChannelLogo, { CHANNEL_BRAND_COLOR } from '../components/ChannelLogo';
 import { toastStore } from '../stores/toast';
 import {
@@ -105,7 +106,7 @@ type TabKey = (typeof TABS)[number]['key'];
 const channelNameMap: Record<string, string> = {
   wechat: '微信开放平台',
   wework: '企业微信',
-  phone: '电话',
+  phone: '短信（Twilio / 阿里云）',
   douyin: '抖音',
   miniprogram: '公众号/小程序',
   email: '邮件',
@@ -120,6 +121,7 @@ const channelNameMap: Record<string, string> = {
   whatsapp: 'WhatsApp',
   telegram: 'Telegram',
   line: 'LINE',
+  chatwoot: 'Chatwoot 多渠道网关',
 };
 
 /** 渠道分组（用于分区渲染） */
@@ -127,6 +129,7 @@ const channelGroups: Array<{ key: string; title: string; types: string[] }> = [
   { key: 'im', title: '即时通讯', types: ['wechat', 'wework', 'douyin', 'miniprogram'] },
   { key: 'ecom', title: '电商平台', types: ['pdd', 'taobao', 'jd', 'alibaba'] },
   { key: 'oversea', title: '海外渠道', types: ['whatsapp', 'telegram', 'line'] },
+  { key: 'gateway', title: '多渠道网关', types: ['chatwoot'] },
   { key: 'other', title: '其他方式', types: ['phone', 'email', 'sms', 'web'] },
 ];
 
@@ -149,8 +152,9 @@ const channelAuthModeMap: Record<string, ChannelAuthMode> = {
   whatsapp: 'form',
   telegram: 'form',
   line: 'form',
+  chatwoot: 'form',
   // 其他
-  phone: 'select',   // 选外呼线路
+  phone: 'form',     // 短信服务商凭据
   email: 'none',     // 无需配置
   sms: 'none',
   web: 'none',
@@ -168,15 +172,39 @@ const channelScanTips: Record<string, { app: string; description: string }> = {
   alibaba: { app: '千牛 / 阿里卖家', description: '使用 1688 卖家端 App 扫码，授权客服工作台' },
 };
 
-/** 渠道配置字段映射（仅 form 模式用） */
-const channelConfigFieldsMap: Record<string, { key: string; label: string; type: 'text' | 'password' | 'select'; placeholder?: string; options?: { label: string; value: string }[] }[]> = {
+type ChannelConfigField = {
+  key: string;
+  label: string;
+  type: 'text' | 'password' | 'select';
+  placeholder?: string;
+  options?: { label: string; value: string }[];
+  providers?: string[];
+  defaultValue?: string;
+  description?: string;
+};
+
+type ChannelFormSchema = {
+  required?: string[];
+  properties?: Record<string, {
+    title?: string;
+    writeOnly?: boolean;
+    enum?: string[];
+    default?: string;
+    description?: string;
+    'x-providers'?: string[];
+    'x-enum-labels'?: Record<string, string>;
+  }>;
+  oneOf?: Array<{ properties?: { provider?: { const?: string } }; required?: string[] }>;
+};
+
+/** 渠道配置字段映射（后端 schema 不可用时的回退） */
+const channelConfigFieldsMap: Record<string, ChannelConfigField[]> = {
   wechat: [
     { key: 'app_id', label: '开放平台 AppID', type: 'text', placeholder: 'wx1234567890abcdef' },
     { key: 'app_secret', label: '开放平台 AppSecret', type: 'password', placeholder: '请输入网站应用 AppSecret' },
     { key: 'official_app_id', label: '公众号 AppID（可选）', type: 'text', placeholder: '用于客服消息发送' },
     { key: 'official_app_secret', label: '公众号 AppSecret（可选）', type: 'password', placeholder: '用于拉取公众号 access_token' },
     { key: 'token', label: '回调 Token（可选）', type: 'password', placeholder: '公众平台服务器配置 Token' },
-    { key: 'encoding_aes_key', label: 'EncodingAESKey（可选）', type: 'password', placeholder: '明文模式可留空' },
     { key: 'bot_webhook', label: '兼容 Webhook（可选）', type: 'text', placeholder: 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...' },
   ],
   wework: [
@@ -188,11 +216,17 @@ const channelConfigFieldsMap: Record<string, { key: string; label: string; type:
     { key: 'open_kfid', label: '客服账号 ID（自动解析，可选）', type: 'text', placeholder: 'kfcxxxxxxxxxxxxxxxx' },
   ],
   phone: [
-    { key: 'line', label: '外呼线路', type: 'select', options: [
-      { label: '线路 1 - 电信', value: 'line1' },
-      { label: '线路 2 - 移动', value: 'line2' },
-      { label: '线路 3 - 联通', value: 'line3' },
+    { key: 'provider', label: '短信服务商', type: 'select', defaultValue: 'twilio', options: [
+      { label: 'Twilio 文本短信', value: 'twilio' },
+      { label: '阿里云模板短信', value: 'aliyun' },
     ] },
+    { key: 'account_sid', label: 'Twilio Account SID', type: 'text', providers: ['twilio'] },
+    { key: 'auth_token', label: 'Twilio Auth Token', type: 'password', providers: ['twilio'] },
+    { key: 'from_number', label: 'Twilio 发送号码', type: 'text', providers: ['twilio'], placeholder: '+15551234567', description: '使用已开通短信能力的号码，按 E.164 格式填写。' },
+    { key: 'access_key_id', label: '阿里云 AccessKey ID', type: 'text', providers: ['aliyun'] },
+    { key: 'access_key_secret', label: '阿里云 AccessKey Secret', type: 'password', providers: ['aliyun'] },
+    { key: 'sign_name', label: '已审核短信签名', type: 'text', providers: ['aliyun'] },
+    { key: 'template_code', label: '已审核模板 CODE', type: 'text', providers: ['aliyun'], placeholder: 'SMS_123456789', description: '发送需显式模板参数；模板发送界面尚未实现。' },
   ],
   douyin: [
     { key: 'app_id', label: '网站应用 Client Key', type: 'text', placeholder: '用于测试白名单和基础账号授权' },
@@ -246,23 +280,62 @@ const channelRequiredConfigFieldsMap: Record<string, string[]> = {
   whatsapp: ['phone_number_id', 'access_token'],
   telegram: ['bot_token'],
   line: ['channel_access_token'],
-  phone: ['line'],
+  phone: ['provider', 'account_sid', 'auth_token', 'from_number'],
 };
 
-/** 默认平台列表（API 返回空时用作兜底） */
-const DEFAULT_PLATFORMS: string[] = channelGroups.flatMap((g) => g.types);
+function smsProvider(channel: Channel, values: Record<string, unknown> = channel.config) {
+  const schema = channel.config_schema as ChannelFormSchema | undefined;
+  return String(values?.provider ?? channel.config?.provider ?? schema?.properties?.provider?.default ?? 'twilio').trim().toLowerCase();
+}
 
-/** 根据 type 构造"未连接"占位 Channel */
-function makeDisconnectedChannel(type: string, _idx: number): Channel {
-  return {
-    id: `default-${type}`,
-    name: channelNameMap[type] ?? type,
-    type: type as Channel['type'],
-    connected: false,
-    enabled: false,
-    config: {},
-    createdAt: new Date().toISOString(),
-  };
+function fieldsFor(channel: Channel, values: Record<string, unknown> = channel.config, includeAll = false): ChannelConfigField[] {
+  const properties = (channel.config_schema as ChannelFormSchema | undefined)?.properties;
+  let fields: ChannelConfigField[];
+  if (properties && Object.keys(properties).length) {
+    fields = Object.entries(properties).map(([key, schema]) => ({
+      key, label: schema.title || key,
+      type: schema.enum?.length ? 'select' : schema.writeOnly ? 'password' : 'text',
+      placeholder: schema.writeOnly ? '已保存的凭据保持掩码，填写新值才替换' : '',
+      options: schema.enum?.map((value) => ({ value, label: schema['x-enum-labels']?.[value] ?? value })),
+      providers: schema['x-providers'],
+      defaultValue: schema.default,
+      description: schema.description,
+    }));
+  } else {
+    fields = channelConfigFieldsMap[channel.type] ?? [];
+  }
+  return fields.filter((field) => (
+    !(channel.type === 'wechat' && field.key === 'encoding_aes_key')
+    && (includeAll || !field.providers || field.providers.includes(smsProvider(channel, values)))
+  ));
+}
+
+function requiredFieldsFor(channel: Channel, values: Record<string, unknown> = channel.config) {
+  const schema = channel.config_schema as ChannelFormSchema | undefined;
+  const base = schema?.required ?? channelRequiredConfigFieldsMap[channel.type] ?? fieldsFor(channel, values).map((field) => field.key);
+  if (channel.type !== 'phone') return base;
+  const provider = smsProvider(channel, values);
+  if (schema?.oneOf) {
+    const branch = schema.oneOf.find((item) => item.properties?.provider?.const === provider);
+    return [...new Set([...base, ...(branch?.required ?? [])])];
+  }
+  if (provider === 'aliyun') return ['provider', 'access_key_id', 'access_key_secret', 'sign_name', 'template_code'];
+  return provider === 'twilio' ? channelRequiredConfigFieldsMap.phone : ['provider'];
+}
+
+function initialConfigValues(channel: Channel) {
+  const values: Record<string, string> = {};
+  fieldsFor(channel, channel.config, true).forEach((field) => {
+    values[field.key] = String(channel.config?.[field.key] ?? field.defaultValue ?? '');
+  });
+  if (channel.type === 'phone') values.provider = smsProvider(channel);
+  return values;
+}
+
+function phoneConfigNotice(channel: Channel, values: Record<string, unknown> = channel.config) {
+  return smsProvider(channel, values) === 'aliyun'
+    ? '阿里云仅发送已审核模板，需显式提供匹配的模板参数。当前模板发送界面尚未实现，通用文本入口将阻止发送。此渠道不提供语音外呼。'
+    : 'Twilio 支持向已绑定客户手机号发送文本短信。账号鉴权不代表短信送达；原生上行短信和送达回调尚未接入，此渠道不提供语音外呼。';
 }
 
 function fieldLabelOf(channelType: string, fieldKey: string) {
@@ -271,19 +344,22 @@ function fieldLabelOf(channelType: string, fieldKey: string) {
 }
 
 function onboardingFallback(channel: Channel) {
-  const fields = channelConfigFieldsMap[channel.type] ?? [];
-  const requiredFields = channelRequiredConfigFieldsMap[channel.type] ?? fields.map((item) => item.key);
+  const fields = fieldsFor(channel);
+  const requiredFields = requiredFieldsFor(channel);
   const optionalFields = fields.map((item) => item.key).filter((key) => !requiredFields.includes(key));
   const savedFields = Object.entries(channel.config || {})
     .filter(([, value]) => String(value ?? '').trim())
     .map(([key]) => key);
-  const missing = requiredFields.filter((key) => !String(channel.config?.[key] ?? '').trim());
+  const missing = requiredFields.filter((key) => {
+    if (channel.type === 'phone' && key === 'provider') return !['twilio', 'aliyun'].includes(smsProvider(channel));
+    return !String(channel.config?.[key] ?? '').trim();
+  });
   const requiredComplete = missing.length === 0;
   const mode = channelAuthModeMap[channel.type] ?? 'form';
   const hasScan = mode === 'scan' || mode === 'both';
   const hasManual = fields.length > 0;
   const status = channel.connected ? 'connected' : savedFields.length > 0 ? 'saved' : mode === 'none' ? 'ready' : 'not_started';
-  return {
+  const profile = {
     status,
     recommended_mode: mode === 'both' ? 'scan' : mode,
     auth_modes: mode === 'both' ? ['scan', 'form'] : [mode],
@@ -327,22 +403,36 @@ function onboardingFallback(channel: Channel) {
     can_manual: hasManual,
     enabled: channel.enabled,
   } as NonNullable<Channel['onboarding']>;
+  if (channel.type === 'phone') {
+    const isAliyun = smsProvider(channel) === 'aliyun';
+    profile.materials = isAliyun
+      ? ['阿里云 AccessKey ID / Secret', '已审核的短信签名和模板 CODE']
+      : ['Twilio Account SID / Auth Token', '已开通短信能力的 Twilio 发送号码'];
+    profile.external_steps = ['选择服务商并保存对应凭据', isAliyun ? '每次模板发送须明确提供匹配的 JSON 变量' : '测试账号鉴权，再核验真实接收手机'];
+    profile.success_criteria = ['发送返回真实平台消息标识', '核验接收手机实际收到短信；API 受理不等于最终送达'];
+    profile.stages[profile.stages.length - 1] = { key: 'verify_sms', label: '真实短信验收', status: channel.connected ? 'current' : 'pending' };
+    if (isAliyun && requiredComplete) profile.next_action = '阿里云模板凭据已保存；模板发送界面尚未实现，不能通过通用文本入口发送。';
+    else if (channel.connected) profile.next_action = '账号鉴权通过。发送真实短信并核验接收手机；原生上行与送达回调尚未接通。';
+  }
+  return profile;
 }
 
 function onboardingOf(channel: Channel) {
   return channel.onboarding ?? onboardingFallback(channel);
 }
 
-function connectedOnboarding(profile: NonNullable<Channel['onboarding']>) {
+function connectedOnboarding(profile: NonNullable<Channel['onboarding']>, channelType?: string) {
   return {
     ...profile,
     status: 'connected' as const,
     missing_required_fields: [],
     stages: profile.stages.map((step) => ({
       ...step,
-      status: step.key === 'sync' ? 'current' as const : 'done' as const,
+      status: step.key === 'sync' || step.key === 'verify_sms' ? 'current' as const : 'done' as const,
     })),
-    next_action: '同步收件箱，确认客户消息能进入漏斗。',
+    next_action: channelType === 'phone'
+      ? '账号鉴权通过。发送真实短信并核验接收手机；原生上行与送达回调尚未接通。'
+      : '同步收件箱，确认客户消息能进入漏斗。',
   };
 }
 
@@ -530,7 +620,7 @@ function ChannelTab() {
       .then((res) => {
         const data = (res as any)?.data?.data ?? (res as any)?.data ?? res;
         const normalized = Array.isArray(data)
-          ? data.filter((item) => DEFAULT_PLATFORMS.includes(String(item?.type ?? item?.channel_type ?? '')))
+          ? data.filter((item) => item && typeof item.type === 'string')
           : [];
         setChannels(normalized);
       })
@@ -541,22 +631,12 @@ function ChannelTab() {
   /** 打开配置弹窗 */
   const openConfig = (channel: Channel) => {
     setConfigChannel(channel);
-    const fields = channelConfigFieldsMap[channel.type] ?? [];
-    const values: Record<string, string> = {};
-    fields.forEach((f) => {
-      values[f.key] = (channel.config[f.key] as string) ?? '';
-    });
-    setConfigValues(values);
+    setConfigValues(initialConfigValues(channel));
   };
 
   const openOnboarding = (channel: Channel) => {
     setOnboardingChannel(channel);
-    const fields = channelConfigFieldsMap[channel.type] ?? [];
-    const values: Record<string, string> = {};
-    fields.forEach((f) => {
-      values[f.key] = (channel.config[f.key] as string) ?? '';
-    });
-    setConfigValues(values);
+    setConfigValues(initialConfigValues(channel));
   };
 
   /** 测试连接 */
@@ -575,7 +655,7 @@ function ChannelTab() {
           ...c,
           connected: true,
           enabled: true,
-          onboarding: connectedOnboarding(onboardingOf({ ...c, connected: true, enabled: true })),
+          onboarding: connectedOnboarding(onboardingOf({ ...c, connected: true, enabled: true }), c.type),
         });
         setChannels((prev) =>
           prev.map((c) => (c.type === channelType ? markConnected(c) : c))
@@ -638,6 +718,20 @@ function ChannelTab() {
           };
         });
       }
+      if (channelType === 'phone') {
+        // The provider changes text/template capability; read the registry's current result.
+        try {
+          const response = (await getChannels()) as any;
+          const refreshed = response?.data?.data ?? response?.data ?? response;
+          const phone = Array.isArray(refreshed) ? refreshed.find((item: Channel) => item.type === 'phone') : undefined;
+          if (phone) {
+            setChannels((prev) => prev.map((item) => item.type === 'phone' ? phone : item));
+            setOnboardingChannel((prev) => prev?.type === 'phone' ? phone : prev);
+          }
+        } catch {
+          // Saving has already succeeded; a catalog read failure must not turn it into a failed save.
+        }
+      }
       setTestResult((prev) => ({ ...prev, [channelType]: { success: true, message: '已保存配置，下一步测试连接' } }));
     } catch (err) {
       setTestResult((prev) => ({
@@ -682,21 +776,12 @@ function ChannelTab() {
     return <div className="flex items-center justify-center py-20"><AlertCircle className="h-5 w-5 text-red-400" /><span className="ml-2 text-sm text-red-500">{error}</span></div>;
   }
 
-  /** 用 DEFAULT_PLATFORMS 补齐后端尚未注册的轻量入口，保持接入页固定完整。 */
-  const channelsByType = new Map<Channel['type'], Channel>(
-    DEFAULT_PLATFORMS.map((t, i) => {
-      const ch = makeDisconnectedChannel(t, i);
-      return [ch.type, ch];
-    })
-  );
-  channels.forEach((channel) => {
-    if (DEFAULT_PLATFORMS.includes(channel.type)) {
-      channelsByType.set(channel.type, channel);
-    }
-  });
-  const displayChannels: Channel[] = DEFAULT_PLATFORMS
-    .map((type) => channelsByType.get(type as Channel['type']))
-    .filter(Boolean) as Channel[];
+  // The backend registry is authoritative; never fabricate available channels.
+  const channelsByType = new Map(channels.map((channel) => [channel.type, channel]));
+  const displayChannels = channels;
+  const knownTypes = new Set(channelGroups.flatMap((group) => group.types));
+  const groups = [...channelGroups, { key: 'additional', title: '其他已注册渠道',
+    types: channels.filter((channel) => !knownTypes.has(channel.type)).map((channel) => channel.type) }];
 
   return (
     <div data-tour="settings-channels">
@@ -709,11 +794,11 @@ function ChannelTab() {
           已连接 <b className="text-green-600">{displayChannels.filter((c) => c.connected).length}</b> / {displayChannels.length}
         </span>
         <span>·</span>
-        <span>共 {channelGroups.length} 个分组</span>
+        <span>共 {groups.filter((group) => group.types.some((type) => channelsByType.has(type as Channel['type']))).length} 个分组</span>
       </div>
 
       {/* 分区渲染：即时通讯 / 电商 / 海外 / 其他 */}
-      {channelGroups.map((group) => {
+      {groups.map((group) => {
         const groupChannels = group.types
           .map((t) => channelsByType.get(t as Channel['type']))
           .filter(Boolean) as Channel[];
@@ -793,6 +878,11 @@ function ChannelTab() {
                 </div>
               </div>
 
+              <div className="mt-3 text-xs leading-5 text-slate-600">
+                <span>接收：{channel.capabilities?.receive ? '已实现' : '未接通'} · 发送：{channel.capabilities?.send ? '已实现' : '未接通'}</span>
+                <p>{channel.capabilities?.limitations?.[0]}</p>
+                {channel.type === 'chatwoot' && <p>在 Chatwoot 完成平台账号连接后，填写网关配置，并把签名回调指向本服务 /api/kellai/webhook/chatwoot/团队编号。</p>}
+              </div>
               <div className="mt-4 rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-600">
                 <div className="flex items-center justify-between gap-2">
                   <span>接入进度 {doneSteps}/{profile.stages.length}</span>
@@ -845,11 +935,12 @@ function ChannelTab() {
                 </button>
                 <button
                   onClick={() => handleSyncInbox(channel.type)}
-                  disabled={syncingChannel === channel.type}
+                  disabled={syncingChannel === channel.type || channel.type === 'phone'}
+                  title={channel.type === 'phone' ? '原生上行短信尚未接入，双向短信可使用 Chatwoot 收件箱' : undefined}
                   aria-label={`同步 ${channelNameMap[channel.type] ?? channel.name} 收件箱`}
                   className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-600 transition hover:bg-gray-50 disabled:opacity-50"
                 >
-                  {syncingChannel === channel.type ? '同步中...' : '同步收件箱'}
+                  {channel.type === 'phone' ? '需网关接收' : syncingChannel === channel.type ? '同步中...' : '同步收件箱'}
                 </button>
                 {hasCustomerEntry && (
                   <button
@@ -1302,7 +1393,8 @@ function ChannelOnboardingModal({
 }) {
   const [saving, setSaving] = useState(false);
   const profile = onboardingOf(channel);
-  const fields = channelConfigFieldsMap[channel.type] ?? [];
+  const fields = fieldsFor(channel, values);
+  const liveRequiredFields = channel.type === 'phone' ? requiredFieldsFor(channel, values) : profile.required_fields;
   const channelLabel = channelNameMap[channel.type] ?? channel.name;
   const doneSteps = profile.stages.filter((step) => step.status === 'done').length;
   const progress = profile.stages.length ? Math.round((doneSteps / profile.stages.length) * 100) : 100;
@@ -1314,13 +1406,14 @@ function ChannelOnboardingModal({
     channel.type === 'douyin'
     && String(channel.config?.remote_miniapp_configured ?? '').toLowerCase() === 'true'
   );
-  const liveMissingFields = profile.required_fields.filter((key) => {
+  const liveMissingFields = liveRequiredFields.filter((key) => {
     if (remoteCredentialsConfigured && ['app_id', 'app_secret', 'client_key', 'client_secret'].includes(key)) {
       return false;
     }
     if (remoteMiniappConfigured && ['miniapp_app_id', 'miniapp_secret'].includes(key)) {
       return false;
     }
+    if (channel.type === 'phone' && key === 'provider') return !['twilio', 'aliyun'].includes(smsProvider(channel, values));
     const currentValue = values[key] ?? (channel.config?.[key] as string | undefined) ?? '';
     return !String(currentValue).trim();
   });
@@ -1487,9 +1580,15 @@ function ChannelOnboardingModal({
                       单独配置
                     </button>
                   </div>
+                  {channel.type === 'phone' && (
+                    <p className="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-800">{phoneConfigNotice(channel, values)}</p>
+                  )}
+                  {channel.type === 'wechat' && (
+                    <p className="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-800">当前公众号回调仅支持明文模式，AES 安全模式尚未接入。</p>
+                  )}
                   <div className="mt-4 grid gap-3 sm:grid-cols-2">
                     {fields.map((field) => {
-                      const required = profile.required_fields.includes(field.key);
+                      const required = liveRequiredFields.includes(field.key);
                       return (
                         <div key={field.key} className={field.type === 'password' ? 'sm:col-span-2' : undefined}>
                           <label className="mb-1 flex items-center gap-1 text-xs font-medium text-slate-700">
@@ -1518,6 +1617,7 @@ function ChannelOnboardingModal({
                               className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900 placeholder-slate-400 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
                             />
                           )}
+                          {field.description && <p className="mt-1 text-xs leading-relaxed text-slate-500">{field.description}</p>}
                         </div>
                       );
                     })}
@@ -1552,11 +1652,12 @@ function ChannelOnboardingModal({
                 <button
                   type="button"
                   onClick={() => onSync(channel.type)}
-                  disabled={syncing}
+                  disabled={syncing || channel.type === 'phone'}
+                  title={channel.type === 'phone' ? '原生上行短信尚未接入，双向短信可使用 Chatwoot 收件箱' : undefined}
                   className="inline-flex items-center justify-center gap-2 rounded-lg border border-slate-200 px-4 py-2 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 disabled:opacity-60"
                 >
                   {syncing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-                  {syncing ? '同步中...' : '同步收件箱'}
+                  {channel.type === 'phone' ? '需网关接收' : syncing ? '同步中...' : '同步收件箱'}
                 </button>
               </div>
 
@@ -1610,11 +1711,12 @@ function ChannelConfigModal({
   onClose: () => void;
   onSave: (channelType: string, values: Record<string, string>) => Promise<void>;
 }) {
-  const fields = channelConfigFieldsMap[channel.type] ?? [];
+  const fields = fieldsFor(channel, values);
+  const requiredFields = requiredFieldsFor(channel, values);
 
   return (
     <div data-tour="channel-config-modal" className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose}>
-      <div data-tour="channel-config-modal-body" className="w-full max-w-md rounded-xl bg-white p-6 shadow-xl" onClick={(e) => e.stopPropagation()}>
+      <div data-tour="channel-config-modal-body" className="max-h-[92vh] w-full max-w-md overflow-y-auto rounded-xl bg-white p-6 shadow-xl" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between">
           <h3 className="text-base font-semibold text-gray-900">
             配置 - {channelNameMap[channel.type] ?? channel.name}
@@ -1624,6 +1726,12 @@ function ChannelConfigModal({
           </button>
         </div>
 
+        {channel.type === 'phone' && (
+          <p className="mt-4 rounded-lg bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-800">{phoneConfigNotice(channel, values)}</p>
+        )}
+        {channel.type === 'wechat' && (
+          <p className="mt-4 rounded-lg bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-800">当前公众号回调仅支持明文模式，AES 安全模式尚未接入。</p>
+        )}
         <div className="mt-5 space-y-4">
           {fields.length === 0 ? (
             <div className="rounded-lg bg-gray-50 p-4 text-sm text-gray-500">
@@ -1632,7 +1740,9 @@ function ChannelConfigModal({
           ) : (
             fields.map((field) => (
               <div key={field.key}>
-                <label className="mb-1 block text-sm font-medium text-gray-700">{field.label}</label>
+                <label className="mb-1 block text-sm font-medium text-gray-700">
+                  {field.label}{requiredFields.includes(field.key) && <span className="ml-1 text-amber-600">*</span>}
+                </label>
                 {field.type === 'select' ? (
                   <select
                     value={values[field.key] ?? ''}
@@ -1655,6 +1765,7 @@ function ChannelConfigModal({
                     className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm text-black placeholder-gray-400 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
                   />
                 )}
+                {field.description && <p className="mt-1 text-xs leading-relaxed text-gray-500">{field.description}</p>}
               </div>
             ))
           )}
@@ -3653,6 +3764,10 @@ function apiData<T>(response: any): T {
 function XcmaxIntegrationTab() {
   const [status, setStatus] = useState<XcmaxStatus>({ state: 'not_connected' });
   const [pending, setPending] = useState<XcmaxPending | null>(null);
+  const [allowSend, setAllowSend] = useState(false);
+  const approvingUser = useAuthStore((state) => state.user);
+  const canAuthorizeSend = ['owner', 'admin'].includes(String(approvingUser?.role || ''));
+  useEffect(() => setAllowSend(false), [pending?.request_id, approvingUser?.id]);
   const [loading, setLoading] = useState(true);
   const [working, setWorking] = useState(false);
   const [error, setError] = useState('');
@@ -3696,11 +3811,11 @@ function XcmaxIntegrationTab() {
       await approveXcmaxBinding({
         request_id: pending.request_id,
         authorization_secret: pending.authorization_secret,
-        accepted_scopes: pending.requested_scopes.map((scope) => scope.id),
+        accepted_scopes: pending.requested_scopes.filter((scope) => scope.id !== 'messages.send' || (allowSend && canAuthorizeSend)).map((scope) => scope.id),
       });
       setPending(null);
       await refresh();
-      toastStore.success('已授权 XCMAX AI 读取客来来客户数据');
+      toastStore.success(allowSend ? '已明确授权 XCMAX 读取与发送消息' : '已授权 XCMAX 读取客来来数据');
       void openXcmax();
     } catch (err: any) {
       setError(err?.response?.data?.error || err?.response?.data?.message || err?.message || '授权失败');
@@ -3728,7 +3843,7 @@ function XcmaxIntegrationTab() {
   };
 
   const disconnect = async () => {
-    if (!window.confirm('解除后，XCMAX 将不能读取客来来中的客户档案和会话。')) return;
+    if (!window.confirm('解除后，XCMAX 将不能读取客来来数据或调用已授权的发送接口。')) return;
     setWorking(true);
     setError('');
     try {
@@ -3749,16 +3864,16 @@ function XcmaxIntegrationTab() {
   return (
     <div className="mx-auto max-w-2xl space-y-5">
       <div>
-        <div className="text-sm font-medium text-blue-700">客户 IM 数据来源</div>
+        <div className="text-sm font-medium text-blue-700">客来来模块授权</div>
         <h2 className="mt-1 text-xl font-semibold text-gray-900">连接 XCMAX AI</h2>
-        <p className="mt-2 text-sm leading-6 text-gray-600">XCMAX 的 AI 工作台可基于客来来客户会话生成建议；客户沟通仍在客来来内完成。</p>
+        <p className="mt-2 text-sm leading-6 text-gray-600">XCMAX 的客来来模块复用这里的渠道、客户和会话。默认只读；发送客户消息需要管理员另行勾选授权。</p>
       </div>
 
       {connected ? (
         <div className="border border-emerald-200 bg-emerald-50 p-5">
           <div className="flex items-center gap-2 text-sm font-semibold text-emerald-800"><CheckCircle2 className="h-5 w-5" />已连接</div>
           <p className="mt-2 text-sm text-emerald-700">当前客来来登录账号已完成授权，XCMAX 会立即识别为已连接。</p>
-          <div className="mt-3 text-xs text-emerald-700">已允许：{status.connection?.authorized_scopes?.length || 0} 项只读权限</div>
+          <div className="mt-3 text-xs text-emerald-700">已允许：{status.connection?.authorized_scopes?.length || 0} 项权限{status.connection?.authorized_scopes?.includes('messages.send') ? '（包含消息发送）' : '（只读）'}</div>
           <div className="mt-5 flex gap-3">
             <button type="button" onClick={openXcmax} className="rounded-lg bg-emerald-700 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-800">打开 XCMAX AI</button>
             <button type="button" disabled={working} onClick={disconnect} className="rounded-lg border border-emerald-300 bg-white px-4 py-2 text-sm font-medium text-emerald-800 hover:bg-emerald-100">解除绑定</button>
@@ -3767,11 +3882,11 @@ function XcmaxIntegrationTab() {
       ) : pending ? (
         <div className="border border-blue-200 bg-white p-5 shadow-sm">
           <div className="flex items-center gap-2 text-sm font-semibold text-gray-900"><ShieldCheck className="h-5 w-5 text-blue-600" />授权 XCMAX AI</div>
-          <p className="mt-2 text-sm leading-6 text-gray-600">将以当前登录的客来来账号完成授权。XCMAX 不会获得发送客户消息的权限。</p>
+          <p className="mt-2 text-sm leading-6 text-gray-600">将以当前登录的客来来账号完成授权。请逐项查看；消息发送默认不勾选。</p>
           <div className="mt-4 divide-y divide-gray-100 border-y border-gray-100">
             {pending.requested_scopes.map((scope) => (
               <div key={scope.id} className="flex items-start gap-3 py-3">
-                <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-blue-600" />
+                {scope.id === 'messages.send' ? <input type="checkbox" aria-label="允许 XCMAX 发送客户消息" checked={allowSend} disabled={!canAuthorizeSend} onChange={(event) => setAllowSend(event.target.checked)} className="mt-1" /> : <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-blue-600" />}
                 <div><div className="text-sm font-medium text-gray-900">{scope.label}</div><div className="mt-1 text-xs leading-5 text-gray-500">{scope.description}</div></div>
               </div>
             ))}
@@ -3784,7 +3899,7 @@ function XcmaxIntegrationTab() {
       ) : (
         <div className="border border-gray-200 bg-white p-5">
           <div className="flex items-center gap-2 text-sm font-semibold text-gray-900"><ShieldCheck className="h-5 w-5 text-gray-500" />等待 XCMAX 发起绑定</div>
-          <p className="mt-2 text-sm leading-6 text-gray-600">请在 XCMAX 的“信息”中打开“客户消息 · 客来来”并点击绑定；客来来会自动进入此授权页。</p>
+          <p className="mt-2 text-sm leading-6 text-gray-600">请在 XCMAX 的“智能生态 / 客来来”中打开“连接与账号”并点击绑定；客来来会自动进入此授权页。</p>
           <button type="button" onClick={openXcmax} className="mt-5 rounded-lg bg-gray-900 px-4 py-2 text-sm font-medium text-white hover:bg-gray-800">打开 XCMAX AI</button>
         </div>
       )}

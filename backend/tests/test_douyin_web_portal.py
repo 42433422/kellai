@@ -291,3 +291,118 @@ def test_synced_outbound_replaces_desktop_provisional(portal):
     assert rows[0][0] == "douyin:web:remote-outbound-1"
     assert rows[0][1] == 88
     assert json.loads(rows[0][2])["source"] == "douyin_web_portal"
+
+
+def _portal_live_input(message_id="live-message"):
+    from datetime import datetime, timezone
+    return {
+        "team_id": 3,
+        "account": {"id": 8, "name": "抖音账号 A"},
+        "session": {"from_open_id": "live-contact", "conversation_short_id": "live-conversation", "nick_name": "真实客户"},
+        "item": {"server_message_id": message_id, "from_open_id": "live-contact", "content": "实时咨询",
+                 "message_type": "text", "createtime": int(datetime.now(timezone.utc).timestamp())},
+    }
+
+
+def _enable_portal_auto_reply(monkeypatch):
+    from app.services import auto_reply_runtime
+    monkeypatch.setattr(auto_reply_runtime, "_enabled_config", lambda: {
+        "autoReplyEnabled": True, "autoReplyStages": [], "confirmScenarios": []})
+
+
+@pytest.mark.parametrize("recovery", ["duplicate", "history_duplicate", "periodic_replay", "common_consumer"])
+def test_queue_failure_is_replayed_without_replacing_saved_message(portal, monkeypatch, recovery):
+    import sqlite3
+    from app.services import auto_reply_runtime, channel_ingest, douyin_channel
+    from app.channels import douyin
+
+    _enable_portal_auto_reply(monkeypatch)
+    original_enqueue = auto_reply_runtime.enqueue_message
+    monkeypatch.setattr(auto_reply_runtime, "enqueue_message", lambda _: (_ for _ in ()).throw(RuntimeError("queue unavailable")))
+    payload = _portal_live_input()
+    with pytest.raises(RuntimeError, match="queue unavailable"):
+        portal._ingest_message(**payload)
+    with sqlite3.connect(str(portal._crm_db_path())) as conn:
+        assert conn.execute("SELECT consumed FROM kellai_channel_inbox WHERE team_id=3").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM kellai_messages WHERE team_id=3").fetchone()[0] == 1
+        conn.execute("UPDATE kellai_messages SET is_read=1 WHERE team_id=3")
+    monkeypatch.setattr(auto_reply_runtime, "enqueue_message", original_enqueue)
+    if recovery in {"duplicate", "history_duplicate"}:
+        assert portal._ingest_message(**payload, historical=recovery == "history_duplicate")
+    elif recovery == "periodic_replay":
+        assert portal._replay_pending_portal_inbox(3) == (1, 0)
+    else:
+        monkeypatch.setattr(douyin_channel, "remote_bridge_enabled", lambda: False)
+        monkeypatch.setattr(douyin, "remote_bridge_enabled", lambda: False)
+        result = portal.asyncio.run(channel_ingest.sync_inbox(team_id=3, channel_type="douyin"))
+        assert result["success"] and result["data"]["auto_reply_queued"] == 1
+    with sqlite3.connect(str(portal._crm_db_path())) as conn:
+        assert conn.execute("SELECT consumed FROM kellai_channel_inbox WHERE team_id=3").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*), MIN(is_read) FROM kellai_messages WHERE team_id=3").fetchone() == (1, 1)
+        assert conn.execute("SELECT COUNT(*) FROM kellai_auto_reply_jobs WHERE team_id=3").fetchone()[0] == 1
+    assert not portal._ingest_message(**payload)
+
+
+def test_save_failure_leaves_durable_original_payload_for_recovery(portal, monkeypatch):
+    from app.services import auto_reply_runtime
+    _enable_portal_auto_reply(monkeypatch)
+    original_save = portal.save_message
+    payload = _portal_live_input("failed-before-save")
+    monkeypatch.setattr(portal, "save_message", lambda _: (_ for _ in ()).throw(RuntimeError("save unavailable")))
+    with pytest.raises(RuntimeError, match="save unavailable"):
+        portal._ingest_message(**payload)
+    monkeypatch.setattr(portal, "save_message", original_save)
+    assert portal._replay_pending_portal_inbox(3) == (1, 0)
+    assert auto_reply_runtime.runtime_status(team_id=3)["counts"] == {"pending": 1}
+
+
+def test_recent_poll_history_is_explicitly_historical_but_new_websocket_is_live(portal, monkeypatch):
+    import sqlite3
+    from app.services import auto_reply_runtime
+    _enable_portal_auto_reply(monkeypatch)
+    payload = _portal_live_input("history-message")
+    monkeypatch.setattr(portal, "_stored_token", lambda _: "test-token")
+
+    async def respond(_token, endpoint, body=None):
+        if endpoint.endswith("/index"):
+            return [payload["account"]]
+        if endpoint.endswith("/getSessionList"):
+            return [payload["session"]]
+        if endpoint.endswith("/getMsgLog"):
+            assert body["limit"] == 20
+            return {"data": [payload["item"]]}
+        raise AssertionError(endpoint)
+
+    monkeypatch.setattr(portal, "_post", respond)
+    summary = portal.asyncio.run(portal.sync_messages(3))
+    assert summary["messages"] == 1 and summary["history_errors"] == 0
+    assert auto_reply_runtime.runtime_status(team_id=3)["counts"] == {}
+    with sqlite3.connect(str(portal._crm_db_path())) as conn:
+        saved = json.loads(conn.execute("SELECT metadata_json FROM kellai_messages WHERE team_id=3").fetchone()[0])
+        assert saved["historical"] is True
+        assert saved["provider_created_at"] == payload["item"]["createtime"]
+    item = {**payload["item"], "server_message_id": "new-websocket-message", "createtime": payload["item"]["createtime"] + 1}
+    websocket_payload = {"type": "webhooks", "data": {
+        "msg_type": "private_msg", "memberInfo": payload["account"], "userInfo": payload["session"], "msgData": item}}
+    assert portal.asyncio.run(portal._handle_websocket_payload(3, websocket_payload))
+    assert auto_reply_runtime.runtime_status(team_id=3)["counts"] == {"pending": 1}
+
+
+def test_portal_media_is_not_relabelled_text_for_auto_reply(portal, monkeypatch):
+    from app.services import auto_reply_runtime, message_store
+    _enable_portal_auto_reply(monkeypatch)
+    payload = _portal_live_input("image-message")
+    payload["item"].update(message_type="image", content="")
+    assert portal._ingest_message(**payload)
+    rows = message_store.list_inbox("douyin", team_id=3, include_consumed=True)
+    assert rows[0]["content_type"] == "image"
+    assert auto_reply_runtime.runtime_status(team_id=3)["counts"] == {}
+
+
+def test_websocket_without_provider_time_cannot_auto_reply(portal, monkeypatch):
+    from app.services import auto_reply_runtime
+    _enable_portal_auto_reply(monkeypatch)
+    payload = _portal_live_input("missing-provider-time")
+    payload["item"].pop("createtime")
+    assert portal._ingest_message(**payload)
+    assert auto_reply_runtime.runtime_status(team_id=3)["counts"] == {}

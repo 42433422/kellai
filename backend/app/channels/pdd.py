@@ -1,14 +1,7 @@
-"""拼多多渠道适配器（真实 HTTP API 实现 · 拼多多开放平台）。
+"""拼多多历史接入骨架。
 
-参考：https://open.pinduoduo.com
-- 鉴权：client_id / client_secret → access_token（OAuth2 client_credentials 风格）
-- 发送：拼多多 IM 消息（依赖店铺授权，演示为商户通知）
-- 接收：依赖 webhook 回调 → 写入 kellai_channel_inbox，本接口消费
-
-环境变量（或通过前端"配置"保存到 channel_configs.json）：
-- KELLAI_PDD_CLIENT_ID
-- KELLAI_PDD_CLIENT_SECRET
-- KELLAI_PDD_BASE_URL（默认 https://open-api.pinduoduo.com）
+原发送请求缺少完整开放平台方法和授权。本轮停止客户消息外发，
+保留历史inbox消费；能力以capabilities.py为准。
 """
 from __future__ import annotations
 
@@ -29,11 +22,11 @@ _UNCONFIGURED_MSG = "拼多多渠道未配置（缺少 client_id / client_secret
 
 
 def _client_id() -> str:
-    return get_field("pdd", "client_id", read_env("KELLAI_PDD_CLIENT_ID"))
+    return get_field("pdd", "client_id")
 
 
 def _client_secret() -> str:
-    return get_field("pdd", "client_secret", read_env("KELLAI_PDD_CLIENT_SECRET"))
+    return get_field("pdd", "client_secret")
 
 
 class PddAdapter(ChannelAdapter):
@@ -91,41 +84,11 @@ class PddAdapter(ChannelAdapter):
     # ----------------- send_message -----------------
 
     async def send_message(self, contact_id: str, content: str, **kwargs: Any) -> dict:
-        """发送拼多多 IM 通知。
-
-        contact_id: 拼多多用户 open_id
-        content: 文本内容
-        """
-        if not self._is_configured():
-            return {"success": False, "message_id": "", "error": _UNCONFIGURED_MSG}
-        if not contact_id or not (content or "").strip():
-            return {"success": False, "message_id": "", "error": "参数不完整"}
-        try:
-            token = await self._ensure_token_cache().get()
-            client = await self._get_client()
-            # 拼多多 IM 推送标准参数
-            payload = {
-                "access_token": token,
-                "to_user_id": contact_id,
-                "message_type": "text",
-                "text": {"content": content},
-            }
-            resp = await client.post("/routerjson", json=payload)
-            try:
-                body = resp.json()
-            except Exception:
-                body = {"raw": resp.text}
-            errcode = int(body.get("error_response", {}).get("code", 0) or 0)
-            if errcode:
-                return {"success": False, "message_id": "", "error": f"errcode={errcode} {body}"}
-            return {
-                "success": True,
-                "message_id": str(body.get("message_id", "")),
-                "error": "",
-            }
-        except Exception as exc:
-            logger.warning("拼多多 send_message 异常: %s", exc)
-            return {"success": False, "message_id": "", "error": str(exc)}
+        """The historical request is not an authorized customer chat protocol."""
+        from app.channels.capabilities import CAPABILITIES
+        return {"success": False, "message_id": "", "delivery_state": "failed",
+                "definitely_not_sent": True, "retryable": False,
+                "error": CAPABILITIES[self.channel_type]["limitations"][0]}
 
     # ----------------- receive_messages -----------------
 
@@ -184,13 +147,7 @@ class PddAdapter(ChannelAdapter):
 
     # ----------------- test_connection -----------------
 
-    async def test_connection(self) -> dict:
-        if not self._is_configured():
-            return {"connected": False, "message": _UNCONFIGURED_MSG}
-        try:
-            token, _ = await self._fetch_token()
-            if token:
-                return {"connected": True, "message": "拼多多 access_token 拉取成功"}
-            return {"connected": False, "message": "拼多多 token 为空"}
-        except Exception as exc:
-            return {"connected": False, "message": f"拼多多连接失败: {exc}"}
+    async def test_connection(self, **kwargs) -> dict:
+        from app.channels.capabilities import CAPABILITIES
+        return {"connected": False, "verification_level": "unverified",
+                "message": CAPABILITIES[self.channel_type]["limitations"][0]}

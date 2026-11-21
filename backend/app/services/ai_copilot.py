@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -42,35 +41,6 @@ INTENT_LABELS = {
 
 # 高意向意图（触发桌面通知）
 HIGH_INTENT_TYPES = {"inquiry", "interest", "urgent", "negotiation"}
-
-# ── LLM Provider 配置 ────────────────────────────────────────────────────
-_LLM_PROVIDERS: list[dict[str, str]] = [
-    {
-        "key_env": "DEEPSEEK_API_KEY",
-        "base_url": "https://api.deepseek.com/v1",
-        "model": "deepseek-chat",
-    },
-    {
-        "key_env": "OPENAI_API_KEY",
-        "base_url": os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-        "model": os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
-    },
-    {
-        "key_env": "DASHSCOPE_API_KEY",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "model": os.environ.get("DASHSCOPE_MODEL", "qwen-plus"),
-    },
-    {
-        "key_env": "MOONSHOT_API_KEY",
-        "base_url": "https://api.moonshot.cn/v1",
-        "model": "moonshot-v1-8k",
-    },
-    {
-        "key_env": "SILICONFLOW_API_KEY",
-        "base_url": "https://api.siliconflow.cn/v1",
-        "model": os.environ.get("SILICONFLOW_MODEL", "deepseek-ai/DeepSeek-V3"),
-    },
-]
 
 # ── 关键词规则（LLM 未配置时的 fallback）──────────────────────────────────
 _INTENT_KEYWORDS: dict[str, list[str]] = {
@@ -135,7 +105,7 @@ def _get_llm_client() -> tuple[str, Any]:
     """获取 LLM 客户端配置，返回 (provider_name, config_dict)。
 
     支持 deepseek, openai, dashscope, moonshot, siliconflow。
-    优先使用环境变量，其次使用设置页保存的本地配置。
+    配置仅由 llm_config.effective_config 解析，保持密钥与服务地址绑定。
     """
     try:
         from app.services.llm_config import effective_config
@@ -148,20 +118,7 @@ def _get_llm_client() -> tuple[str, Any]:
                 "model": str(cfg.get("model") or ""),
             }
     except Exception:
-        logger.debug("读取本地 LLM 配置失败，回退到环境变量", exc_info=True)
-
-    # 兜底兼容旧部署：直接扫描历史环境变量。
-    for prov in _LLM_PROVIDERS:
-        api_key = (os.environ.get(prov["key_env"]) or "").strip()
-        if api_key:
-            provider_name = prov["key_env"].replace("_API_KEY", "").lower()
-            if provider_name == "dashscope":
-                provider_name = "qwen"
-            return provider_name, {
-                "api_key": api_key,
-                "base_url": prov["base_url"],
-                "model": prov["model"],
-            }
+        logger.debug("读取 LLM 配置失败，停止模型调用", exc_info=True)
     return "", {}
 
 
@@ -501,6 +458,7 @@ def generate_auto_reply(
                     "draft": draft,
                     "can_auto_send": can_auto_send,
                     "reason": reason,
+                    "generation_source": "llm",
                 }
         except Exception:
             logger.debug("LLM 自动回复生成失败，fallback 到模板", exc_info=True)
@@ -512,6 +470,8 @@ def generate_auto_reply(
         "draft": draft,
         "can_auto_send": can_auto_send,
         "reason": reason,
+        "generation_source": "template",
+        "generation_error": "model_unavailable" if provider_name else "no_model",
     }
 
 

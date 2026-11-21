@@ -213,6 +213,21 @@ def _connect():
         conn.close()
 
 
+def _existing_message(conn, msg: UnifiedMessage, team_id: int) -> UnifiedMessage | None:
+    row = conn.execute("SELECT * FROM kellai_messages WHERE team_id=? AND id=?", (team_id, msg.id)).fetchone()
+    if row is None:
+        return None
+    for field in ("channel_type", "contact_id", "direction", "content", "content_type"):
+        if str(row[field]) != str(getattr(msg, field)):
+            raise ValueError("同一消息标识已绑定其他消息内容或联系人")
+    if msg.customer_id > 0 and int(row["customer_id"]) != msg.customer_id:
+        raise ValueError("同一消息标识已绑定其他客户")
+    return UnifiedMessage(
+        **{key: row[key] for key in UnifiedMessage.model_fields if key != "metadata"},
+        metadata=json.loads(row["metadata_json"] or "{}"),
+    )
+
+
 def save_message(msg: UnifiedMessage) -> UnifiedMessage:
     """保存一条消息到数据库。"""
     ensure_messages_schema()
@@ -223,24 +238,34 @@ def save_message(msg: UnifiedMessage) -> UnifiedMessage:
         msg = msg.model_copy(update={"metadata": metadata})
     scope = tenant_scope(team_id) if team_id > 0 else nullcontext()
     with scope:
+        with _connect() as conn:
+            previous = _existing_message(conn, msg, team_id)
+            if previous is not None:
+                # Inbox replay must not reset a read marker or reapply an older
+                # CRM preview/assignment. The downstream queue can still retry.
+                return previous
         if int(msg.customer_id or 0) <= 0:
             try:
                 from app.services.growth_loop import resolve_customer_for_message
-                from app.services.pipeline import _customer_id_from_doc
+                from app.services.pipeline import _customer_id_from_doc, save_pipeline
 
                 doc = resolve_customer_for_message(msg)
                 uid = _customer_id_from_doc(doc)
                 if uid > 0:
+                    save_pipeline(doc)
                     msg = msg.model_copy(update={"customer_id": uid})
             except Exception:
                 logger.warning(
                     "保存消息前解析客户失败: message_id=%s", msg.id, exc_info=True
                 )
+                raise
+            if int(msg.customer_id or 0) <= 0:
+                raise ValueError("入站消息尚未绑定有效客户，保留收件箱待重试")
         is_read = 0 if str(msg.direction or "").lower() == "inbound" else 1
         with _connect() as conn:
-            conn.execute(
+            inserted = conn.execute(
                 """
-                INSERT OR REPLACE INTO kellai_messages
+                INSERT OR IGNORE INTO kellai_messages
                     (team_id, id, customer_id, channel_type, contact_id, contact_name,
                      direction, content, content_type, metadata_json, created_at, is_read)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -260,6 +285,10 @@ def save_message(msg: UnifiedMessage) -> UnifiedMessage:
                     is_read,
                 ),
             )
+            if not inserted.rowcount:
+                previous = _existing_message(conn, msg, team_id)
+                if previous is not None:
+                    return previous
         try:
             from app.services.growth_loop import apply_message_to_growth_loop
 

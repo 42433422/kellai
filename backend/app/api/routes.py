@@ -178,14 +178,18 @@ class ChannelSendMessageBody(BaseModel):
     channel_type: str = Field(..., min_length=1, max_length=32)
     contact_id: str = Field(..., min_length=1, max_length=256)
     content: str = Field(..., min_length=1, max_length=8000)
+    client_request_id: str = Field(..., min_length=1, max_length=200)
     desktop_result: Optional[dict[str, Any]] = None
+    delivery_token: str = Field(default="", max_length=256)
     auto_reply_inbound_id: str = Field(default="", max_length=512)
+    auto_reply_lease_token: str = Field(default="", max_length=256)
 
 
 class DouyinBridgeSendBody(BaseModel):
     team_id: int = Field(..., gt=0)
     contact_id: str = Field(..., min_length=1, max_length=256)
     content: str = Field(..., min_length=1, max_length=8000)
+    client_request_id: str = Field(..., min_length=1, max_length=200)
     persona_id: str = Field(default="", max_length=128)
     customer_id: int = Field(default=0, ge=0)
     reply_context: dict[str, Any] = Field(default_factory=dict)
@@ -436,6 +440,8 @@ class AutoReplyResultBody(BaseModel):
     success: bool
     error: str = Field(default="", max_length=2000)
     outbound_message_id: str = Field(default="", max_length=512)
+    lease_token: str = Field(..., min_length=1, max_length=256)
+    delivery_key: str = Field(..., min_length=1, max_length=512)
 
 
 class ScoreBody(BaseModel):
@@ -564,13 +570,13 @@ CHANNEL_ONBOARDING_GUIDES: dict[str, dict[str, Any]] = {
         "success_criteria": ["测试连接通过", "LINE 消息能进入统一收件箱"],
     },
     "phone": {
-        "recommended_mode": "select",
-        "auth_modes": ["select"],
-        "required_fields": ["line"],
+        "recommended_mode": "form",
+        "auth_modes": ["form"],
+        "required_fields": ["provider"],
         "optional_fields": [],
-        "materials": ["可用外呼线路"],
-        "external_steps": ["选择外呼线路", "保存后测试外呼线路", "后续由 AI 外呼任务调用"],
-        "success_criteria": ["测试连接通过", "外呼记录能回写客户时间线"],
+        "materials": ["Twilio 短信账号或阿里云短信账号", "具备发送权限的短信号码，或已审核的签名和模板"],
+        "external_steps": ["选择短信服务商", "保存对应服务商凭据", "按服务商能力完成鉴权及真实短信验收"],
+        "success_criteria": ["发送返回真实平台消息标识", "核验接收手机实际收到短信；API 受理不等于最终送达"],
     },
     "email": {
         "recommended_mode": "none",
@@ -610,9 +616,34 @@ def _channel_onboarding_profile(
     enabled: bool,
 ) -> dict[str, Any]:
     guide = CHANNEL_ONBOARDING_GUIDES.get(channel_type, {})
+    if not guide:
+        from app.channels import ChannelRegistry
+        schema = next((row.get("config_schema", {}) for row in ChannelRegistry().list_channels()
+                       if row["channel_type"] == channel_type), {})
+        guide = {"required_fields": schema.get("required", []), "recommended_mode": "form",
+                 "auth_modes": ["form"], "materials": ["渠道账号、API 凭据和签名回调配置"],
+                 "success_criteria": ["收到真实入站并在同一会话回复，核验渠道回执"]}
     required_fields = [str(x) for x in guide.get("required_fields", [])]
     optional_fields = [str(x) for x in guide.get("optional_fields", [])]
+    if channel_type == "phone":
+        from app.channels.phone import phone_required_fields
+        provider = str(config.get("provider", "twilio")).strip().lower()
+        required_fields = phone_required_fields(provider)
+        if provider == "aliyun":
+            guide = {**guide,
+                     "materials": ["阿里云 AccessKey ID / Secret", "已审核的短信签名和模板 CODE"],
+                     "external_steps": ["为凭据授予短信服务权限", "填写已审核签名和模板 CODE", "每次发送必须明确提供与模板匹配的 template_param"],
+                     "success_criteria": ["模板变量按 JSON 对象明确提供，不能由自由文本猜测", "当前通用文本界面尚未实现模板发送；仅保存凭据不代表已接通"]}
+        else:
+            guide = {**guide,
+                     "materials": ["Twilio Account SID / Auth Token", "已开通短信能力的 Twilio 发送号码"],
+                     "external_steps": ["确认号码具备短信发送权限", "填写 Account SID、Auth Token 与发送号码", "测试账号鉴权后，使用已绑定客户手机号验收真实短信"]}
     missing_required = [key for key in required_fields if not str(config.get(key) or "").strip()]
+    if channel_type == "phone":
+        if "provider" not in config:
+            missing_required = [key for key in missing_required if key != "provider"]
+        elif provider not in {"twilio", "aliyun"} and "provider" not in missing_required:
+            missing_required.append("provider")
     if channel_type == "douyin" and str(config.get("remote_credentials_configured") or "").lower() == "true":
         missing_required = [
             key
@@ -654,6 +685,12 @@ def _channel_onboarding_profile(
         {"key": "test", "label": "测试连接", "status": "done" if connected else ("current" if saved_fields and required_complete else "pending")},
         {"key": "sync", "label": "同步收件箱", "status": "current" if connected else "pending"},
     ]
+    if channel_type == "phone":
+        stages[-1] = {"key": "verify_sms", "label": "真实短信验收", "status": "current" if connected else "pending"}
+        if not missing_required and provider == "aliyun":
+            next_action = "阿里云模板凭据已保存；模板发送界面尚未实现，不能通过通用文本入口发送。"
+        elif connected:
+            next_action = "Twilio 账号鉴权通过。发送真实短信并核验接收手机；原生上行与送达回调尚未接通。"
     return {
         "status": status,
         "recommended_mode": str(guide.get("recommended_mode") or "form"),
@@ -679,11 +716,17 @@ async def list_channels(request: Request = None):
     from app.channels import ChannelRegistry
     from app.channels.config_store import get_all
     from app.channels.config_store import save as save_config
+    from app.channels.config_store import redact_config
+
+    if request is not None:
+        from app.services.messaging import request_actor
+        request_actor(request, read=True)
 
     reg = ChannelRegistry()
     channels = reg.list_channels()
     user = get_request_user(request) if request is not None else None
-    team_id = int((user or {}).get("team_id") or 0)
+    from app.services.tenant_context import current_team_id
+    team_id = int((user or {}).get("team_id") or current_team_id())
     result = []
     for ch in channels:
         cfg = get_all(ch["channel_type"])
@@ -779,13 +822,15 @@ async def list_channels(request: Request = None):
             "name": cfg.get("name") or ch["channel_type"],
             "type": ch["channel_type"],
             "adapter_class": ch["adapter_class"],
+            "connection_id": f"{team_id}:{ch['channel_type']}:primary",
+            "capabilities": ch.get("capabilities") or {},
             "enabled": enabled,
             "connected": connected,
             "message": (
                 connection_message
                 or ("已连接" if connected else ("已保存配置，点击测试连接验证" if has_config else "未配置"))
             ),
-            "config": merged_config,
+            "config": redact_config(merged_config),
             "config_schema": ch.get("config_schema") or {},
             "onboarding": _channel_onboarding_profile(
                 ch["channel_type"],
@@ -804,6 +849,10 @@ async def test_channel(channel_type: str, request: Request = None):
     from app.channels import ChannelRegistry
     from app.channels.config_store import get as get_config
     from app.channels.config_store import save as save_config
+
+    if request is not None:
+        from app.services.messaging import request_actor
+        request_actor(request, manage=True)
 
     reg = ChannelRegistry()
     try:
@@ -858,10 +907,15 @@ class ChannelConfigUpdate(BaseModel):
 
 
 @router.put("/channels/{channel_type}/config")
-async def update_channel_config(channel_type: str, body: ChannelConfigUpdate):
+async def update_channel_config(channel_type: str, body: ChannelConfigUpdate, request: Request = None):
     """保存渠道配置。"""
     from app.channels import ChannelRegistry
     from app.channels.config_store import save as save_config
+    from app.channels.config_store import redact_config
+
+    if request is not None:
+        from app.services.messaging import request_actor
+        request_actor(request, manage=True)
 
     reg = ChannelRegistry()
     try:
@@ -876,6 +930,15 @@ async def update_channel_config(channel_type: str, body: ChannelConfigUpdate):
             remote_bridge_enabled,
             remote_save_app_config,
         )
+
+        from app.channels.config_store import REDACTED_VALUE, get_field
+        remote = remote_bridge_enabled()
+        for key, value in list(config_to_save.items()):
+            if value == REDACTED_VALUE:
+                if remote:
+                    config_to_save[key] = ""
+                else:
+                    config_to_save.pop(key)  # keep the existing per-tenant secret
 
         next_client_key = str(
             config_to_save.get("client_key")
@@ -897,7 +960,7 @@ async def update_channel_config(channel_type: str, body: ChannelConfigUpdate):
             or config_to_save.get("miniapp_app_secret")
             or ""
         ).strip()
-        if remote_bridge_enabled():
+        if remote:
             try:
                 remote_state = await remote_save_app_config(
                     next_client_key=next_client_key,
@@ -922,31 +985,19 @@ async def update_channel_config(channel_type: str, body: ChannelConfigUpdate):
                 ),
             }
         else:
-            try:
-                from app.services.douyin_channel import save_app_config_verified
-
-                local_state = await save_app_config_verified(
-                    next_client_key=next_client_key,
-                    next_client_secret=next_client_secret,
-                    next_miniapp_app_id=next_miniapp_app_id,
-                    next_miniapp_secret=next_miniapp_secret,
-                )
-            except DouyinChannelError as exc:
-                raise HTTPException(status_code=400, detail={"message": str(exc)}) from exc
-            config_to_save = {
-                "app_id": str(local_state.get("client_key") or next_client_key),
-                "app_secret": "",
-                "client_key": str(local_state.get("client_key") or next_client_key),
-                "client_secret": "",
-                "miniapp_app_id": str(
-                    local_state.get("miniapp_app_id") or next_miniapp_app_id
-                ),
-                "miniapp_secret": "",
-                "remote_credentials_configured": "true",
-                "remote_miniapp_configured": (
-                    "true" if local_state.get("miniapp_secret_configured") else "false"
-                ),
-            }
+            # Account configuration belongs to this tenant. The global app
+            # table is reserved for the independently authenticated bridge.
+            candidate_key = next_client_key or get_field("douyin", "client_key")
+            candidate_secret = next_client_secret or get_field("douyin", "client_secret")
+            explicitly_cleared = any(key in config_to_save and not config_to_save[key]
+                                     for key in ("client_key", "app_id", "client_secret", "app_secret"))
+            if candidate_key and candidate_secret and not explicitly_cleared:
+                from app.services.douyin_channel import validate_app_credentials
+                try:
+                    await validate_app_credentials(next_client_key=candidate_key, next_client_secret=candidate_secret)
+                except DouyinChannelError as exc:
+                    raise HTTPException(status_code=400, detail={"message": str(exc)}) from exc
+            config_to_save.update(remote_credentials_configured="false", remote_miniapp_configured="false")
 
     saved = save_config(
         channel_type,
@@ -956,6 +1007,7 @@ async def update_channel_config(channel_type: str, body: ChannelConfigUpdate):
         connected=False,
     )
     logger.info("渠道配置已保存: %s (enabled=%s)", channel_type, saved.get("enabled"))
+    await reg.invalidate(channel_type)
     return {
         "success": True,
         "data": {
@@ -964,7 +1016,7 @@ async def update_channel_config(channel_type: str, body: ChannelConfigUpdate):
             "type": channel_type,
             "enabled": bool(saved.get("enabled")),
             "connected": bool(saved.get("connected")),
-            "config": saved.get("config", {}),
+            "config": redact_config(saved.get("config", {})),
             "onboarding": _channel_onboarding_profile(
                 channel_type,
                 dict(saved.get("config") or {}),
@@ -976,10 +1028,14 @@ async def update_channel_config(channel_type: str, body: ChannelConfigUpdate):
 
 
 @router.delete("/channels/{channel_type}")
-async def delete_channel(channel_type: str):
+async def delete_channel(channel_type: str, request: Request = None):
     """断开 / 删除渠道配置。"""
     from app.channels import ChannelRegistry
     from app.channels.config_store import delete as delete_config
+
+    if request is not None:
+        from app.services.messaging import request_actor
+        request_actor(request, manage=True)
 
     reg = ChannelRegistry()
     try:
@@ -988,114 +1044,25 @@ async def delete_channel(channel_type: str):
         raise HTTPException(status_code=404, detail={"message": f"未注册的渠道类型: {channel_type}"})
 
     deleted = delete_config(channel_type)
+    await reg.invalidate(channel_type)
     return {"success": True, "data": {"type": channel_type, "deleted": deleted}}
 
 
 @router.post("/channels/sync-inbox")
 async def sync_channel_inbox(body: ChannelSyncInboxBody, request: Request = None):
-    """消费渠道收件箱，落库为客户消息，并驱动客户/漏斗/待办闭环。"""
-    from app.channels import ChannelRegistry
-    from app.services.message_store import mark_inbox_consumed, save_message
-
-    reg = ChannelRegistry()
-    if body.channel_type.strip():
-        channel_types = [body.channel_type.strip()]
-    else:
-        channel_types = [c["channel_type"] for c in reg.list_channels()]
-
-    saved_messages: list[dict[str, Any]] = []
-    local_consumed_ids: list[str] = []
-    remote_douyin_ids: list[str] = []
-    auto_reply_queued = 0
-    seen_ids: set[str] = set()
-    errors: list[dict[str, str]] = []
-    user = get_request_user(request) if request is not None else None
+    """Consume only this authenticated tenant's inbox; callbacks use explicit context."""
+    from app.services.channel_ingest import sync_inbox
+    from app.services.messaging import request_actor
     from app.services.tenant_context import resolve_team_id
 
-    team_id = resolve_team_id(
-        int((user or {}).get("team_id") or body.team_id or 0)
-    )
-
-    for channel_type in channel_types:
-        remote_douyin = False
-        try:
-            adapter = reg.get(channel_type)
-        except KeyError as exc:
-            errors.append({"channel_type": channel_type, "error": str(exc)})
-            continue
-        try:
-            if channel_type == "douyin":
-                from app.services.douyin_channel import remote_bridge_enabled
-
-                remote_douyin = remote_bridge_enabled()
-                messages = await adapter.receive_messages(limit=body.limit, team_id=team_id)
-            else:
-                messages = await adapter.receive_messages(limit=body.limit)
-        except Exception as exc:
-            logger.warning("同步渠道收件箱失败: channel=%s", channel_type, exc_info=True)
-            errors.append({"channel_type": channel_type, "error": str(exc)})
-            continue
-        for msg in messages:
-            if msg.id in seen_ids:
-                continue
-            seen_ids.add(msg.id)
-            try:
-                saved = save_message(msg)
-            except Exception as exc:
-                logger.warning(
-                    "渠道消息落库失败: channel=%s message_id=%s",
-                    channel_type,
-                    msg.id,
-                    exc_info=True,
-                )
-                errors.append(
-                    {
-                        "channel_type": channel_type,
-                        "error": f"消息 {msg.id} 落库失败: {exc}",
-                    }
-                )
-                continue
-            if remote_douyin:
-                remote_douyin_ids.append(msg.id)
-            else:
-                local_consumed_ids.append(msg.id)
-            saved_messages.append(saved.model_dump())
-            try:
-                from app.services.auto_reply_runtime import enqueue_message
-
-                if enqueue_message(saved):
-                    auto_reply_queued += 1
-            except Exception:
-                logger.warning(
-                    "入站消息已保存但自动回复任务入队失败: message_id=%s",
-                    msg.id,
-                    exc_info=True,
-                )
-
-    consumed = mark_inbox_consumed(local_consumed_ids, team_id=team_id)
-    if remote_douyin_ids:
-        try:
-            from app.services.douyin_channel import remote_ack_inbox
-
-            consumed += await remote_ack_inbox(team_id, remote_douyin_ids)
-        except Exception as exc:
-            logger.warning("确认远端抖音收件箱消费状态失败", exc_info=True)
-            errors.append(
-                {
-                    "channel_type": "douyin",
-                    "error": f"消息已落库，但远端消费确认失败，将在下次同步时重试: {exc}",
-                }
-            )
-    return {
-        "success": True,
-        "data": {
-            "synced": len(saved_messages),
-            "consumed": consumed,
-            "messages": saved_messages,
-            "auto_reply_queued": auto_reply_queued,
-            "errors": errors,
-        },
-    }
+    if request is not None:
+        user = request_actor(request)
+        if body.team_id and body.team_id != int(user["team_id"]):
+            raise HTTPException(status_code=403, detail="不能同步其他租户的收件箱")
+        team_id = int(user["team_id"])
+    else:
+        team_id = resolve_team_id(body.team_id)
+    return await sync_inbox(team_id=team_id, channel_type=body.channel_type.strip(), limit=body.limit)
 
 
 # ---------------------------------------------------------------------------
@@ -1425,20 +1392,9 @@ async def internal_douyin_connection(request: Request, team_id: int):
 
 @router.post("/internal/douyin/messages/send")
 async def internal_douyin_send(request: Request, body: DouyinBridgeSendBody):
-    from app.channels.douyin import DouyinAdapter
-
+    from app.services.messaging import send_douyin_bridge
     _verify_douyin_bridge(request)
-    result = await DouyinAdapter().send_message(
-        body.contact_id,
-        body.content,
-        team_id=body.team_id,
-        persona_id=body.persona_id,
-        customer_id=body.customer_id,
-        reply_context=body.reply_context,
-    )
-    if not result.get("success"):
-        return {"success": False, "error": result.get("error") or "抖音消息发送失败"}
-    return {"success": True, "data": result}
+    return await send_douyin_bridge(body)
 
 
 @router.get("/internal/douyin/inbox")
@@ -2842,162 +2798,20 @@ def get_messages(
 
 @router.post("/messages/send")
 async def send_message(body: ChannelSendMessageBody, request: Request = None):
-    """统一发送消息。"""
-    import uuid
-    from datetime import datetime, timezone
+    from app.services.messaging import request_actor, send
+    return await send(body, user=request_actor(request, read=body.desktop_result is not None), request=request)
 
-    from app.channels import ChannelRegistry
-    from app.channels.base import UnifiedMessage
-    from app.services.message_store import get_messages, save_message
 
-    reg = ChannelRegistry()
-    try:
-        adapter = reg.get(body.channel_type)
-    except KeyError:
-        return {"success": False, "error": f"未注册的渠道类型: {body.channel_type}"}
-    user = get_request_user(request) if request is not None else None
-    team_id = int((user or {}).get("team_id") or 0)
-    logger.info(
-        "渠道发送开始: team_id=%s customer_id=%s channel=%s contact_id=%s",
-        team_id,
-        body.customer_id,
-        body.channel_type,
-        body.contact_id,
-    )
-    contact_name = ""
-    try:
-        for stored_message in get_messages(
-            body.customer_id,
-            body.channel_type,
-            limit=100,
-        ):
-            if str(stored_message.contact_id or "") != str(body.contact_id or ""):
-                continue
-            contact_name = str(stored_message.contact_name or "").strip()
-            if contact_name:
-                break
-    except Exception:
-        logger.debug(
-            "发送前解析联系人名称失败: customer_id=%s channel=%s",
-            body.customer_id,
-            body.channel_type,
-            exc_info=True,
-        )
-    if body.desktop_result is not None:
-        client_host = str(getattr(getattr(request, "client", None), "host", "") or "")
-        desktop_header = str(request.headers.get("X-Kellai-Desktop-Delivery", ""))
-        supplied = dict(body.desktop_result)
-        valid_desktop_receipt = (
-            body.channel_type == "douyin"
-            and client_host in {"127.0.0.1", "::1", "localhost"}
-            and desktop_header == "1"
-            and supplied.get("success") is True
-            and supplied.get("message_sent") is True
-            and supplied.get("source") == "douyin_desktop_automation"
-            and str(supplied.get("contact_id") or "") == str(body.contact_id)
-        )
-        if not valid_desktop_receipt:
-            logger.warning(
-                "拒绝无效桌面发送回执: client=%s channel=%s customer_id=%s",
-                client_host,
-                body.channel_type,
-                body.customer_id,
-            )
-            return {"success": False, "error": "无效的客来来桌面发送回执"}
-        result = {
-            "success": True,
-            "message_id": str(supplied.get("message_id") or ""),
-            "error": "",
-            "source": "douyin_desktop_automation",
-            "message_sent": True,
-            "contact_name": str(supplied.get("contact_name") or contact_name),
-            "contact_id": str(body.contact_id),
-            "reused_conversation": bool(supplied.get("reused_conversation")),
-            "pending_portal_sync": bool(supplied.get("pending_portal_sync", True)),
-        }
-    else:
-        result = await adapter.send_message(
-            body.contact_id,
-            body.content,
-            team_id=team_id,
-            customer_id=body.customer_id,
-            contact_name=contact_name,
-        )
-    if not result.get("success", False):
-        logger.warning(
-            "渠道发送失败: team_id=%s customer_id=%s channel=%s error=%s",
-            team_id,
-            body.customer_id,
-            body.channel_type,
-            result.get("error") or result.get("message") or "未知错误",
-        )
-        return {
-            "success": False,
-            "error": result.get("error") or result.get("message") or "渠道发送失败",
-            "data": {"message_id": "", "channel_result": result},
-        }
+@router.post("/messages/prepare")
+def prepare_message(body: ChannelSendMessageBody, request: Request):
+    from app.services.messaging import prepare_desktop
+    return prepare_desktop(body, request)
 
-    now = datetime.now(timezone.utc).isoformat()
-    msg = UnifiedMessage(
-        id=str(uuid.uuid4()),
-        customer_id=body.customer_id,
-        channel_type=body.channel_type,
-        contact_id=body.contact_id,
-        contact_name=contact_name,
-        direction="outbound",
-        content=body.content,
-        content_type="text",
-        metadata={
-            **result,
-            "team_id": team_id,
-            "agent_user_id": int((user or {}).get("id") or 0),
-            "auto_reply_inbound_id": str(body.auto_reply_inbound_id or ""),
-        },
-        created_at=now,
-    )
-    try:
-        save_message(msg)
-        persisted = True
-        persist_error = ""
-    except Exception as exc:
-        logger.warning("发送成功但消息落库失败: %s", exc)
-        persisted = False
-        persist_error = str(exc)
-    if body.auto_reply_inbound_id:
-        try:
-            from app.services.auto_reply_runtime import complete_job
 
-            complete_job(
-                body.auto_reply_inbound_id,
-                success=True,
-                outbound_message_id=(
-                    msg.id if persisted else str(result.get("message_id") or "")
-                ),
-                team_id=team_id,
-            )
-        except Exception:
-            logger.warning(
-                "自动回复已发送但任务完成状态更新失败: inbound_message_id=%s",
-                body.auto_reply_inbound_id,
-                exc_info=True,
-            )
-    logger.info(
-        "渠道发送完成: team_id=%s customer_id=%s channel=%s source=%s persisted=%s",
-        team_id,
-        body.customer_id,
-        body.channel_type,
-        result.get("source") or "api",
-        persisted,
-    )
-    return {
-        "success": True,
-        "data": {
-            "message_id": msg.id if persisted else "",
-            "channel_result": result,
-            "persisted": persisted,
-            "persist_error": persist_error,
-        },
-    }
+@router.get("/messages/requests/{client_request_id}")
+def message_delivery_receipt(client_request_id: str, request: Request):
+    from app.services.messaging import receipt, request_actor
+    return receipt(client_request_id, user=request_actor(request, read=True))
 
 
 @router.get("/messages/unread-count")
@@ -3964,11 +3778,7 @@ async def analyze(body: AnalyzeBody):
     if texts:
         doc["last_message_preview"] = texts[0][:500]
         doc = save_pipeline(doc)
-    connected_welcome = None
-    if str(doc.get("stage")) == "connected" and has_binding:
-        from app.services.intake_notice import maybe_send_connected_welcome
-
-        connected_welcome = maybe_send_connected_welcome(uid, username=body.username)
+    connected_welcome = {"sent": False, "reason": "use_scoped_message_send"}
     return {
         "success": True,
         "data": {
@@ -4010,7 +3820,7 @@ async def demand_form_finalize(body: PipelineBody):
     doc = load_pipeline(uid, username=body.username)
     if not doc.get("intake_submitted_at"):
         return {"success": False, "error": "尚未同步到需求提交记录"}
-    doc, meta = finalize_intake_submission(uid, doc, username=body.username, notify_wechat=True)
+    doc, meta = finalize_intake_submission(uid, doc, username=body.username, notify_wechat=False)
     return {"success": True, "data": {"pipeline": doc, "finalize": meta}}
 
 
@@ -4059,70 +3869,17 @@ def wechat_bindings_put(customer_id: int, body: BindingsBody):
 
 @router.post("/wechat/send")
 async def wechat_send(body: WechatSendBody):
-    from app.desktop_automation.service import get_desktop_automation_service
-    from app.services.pipeline import load_pipeline, save_pipeline
-    from app.services.wechat_bridge import get_bindings_for_user
-
-    uid = _cid(body)
-    contact = body.contact_name.strip()
-    bindings = get_bindings_for_user(uid) if uid > 0 else []
-    if not contact and bindings:
-        first = bindings[0]
-        contact = str(first.get("contact_name") or first.get("name") or "").strip()
-    if not contact:
-        return {"success": False, "error": "请先保存群聊绑定，或确认群名称"}
-    result = get_desktop_automation_service().send_wechat_message(contact, body.message.strip())
-    sent = bool(result.get("success")) and bool(result.get("message_sent", result.get("success")))
-    if sent and uid > 0:
-        doc = load_pipeline(uid, username=body.username)
-        if doc.get("stage") in ("idle", "connected"):
-            doc["stage"] = "connected"
-            save_pipeline(doc)
-    return {"success": sent, "data": result}
+    raise HTTPException(status_code=409, detail="按名称发送的旧接口已停用，请使用 /messages/send 的稳定联系人和请求编号")
 
 
 @router.post("/wechat/send-connected-welcome")
 async def send_connected_welcome(body: WelcomeBody):
-    from app.services.intake_notice import maybe_send_connected_welcome
-    from app.services.pipeline import load_pipeline, save_pipeline
-
-    uid = _cid(body)
-    if uid <= 0:
-        return {"success": False, "error": "customer_id required"}
-    doc = load_pipeline(uid, username=body.username)
-    if str(doc.get("stage") or "idle") == "idle":
-        doc["stage"] = "connected"
-        save_pipeline(doc)
-    out = maybe_send_connected_welcome(
-        uid,
-        username=body.username,
-        contact_name=body.contact_name.strip(),
-        force=body.force,
-    )
-    return {"success": bool(out.get("sent")), "data": out}
+    raise HTTPException(status_code=409, detail="请在消息中心确认收件人，通过统一发送接口发送欢迎语")
 
 
 @router.post("/wechat/send-intake-notice")
 async def send_intake_notice(body: IntakeNoticeBody):
-    from app.services.intake_notice import maybe_send_intake_form_notice
-    from app.services.pipeline import load_pipeline, save_pipeline
-
-    uid = _cid(body)
-    if uid <= 0:
-        return {"success": False, "error": "customer_id required"}
-    doc = load_pipeline(uid, username=body.username)
-    stage = str(doc.get("stage") or "idle")
-    if stage in ("idle", "connected"):
-        doc["stage"] = "intake"
-        save_pipeline(doc)
-    out = maybe_send_intake_form_notice(
-        uid,
-        username=body.username,
-        contact_name=body.contact_name.strip(),
-        brief=body.brief.strip(),
-        force=body.force,
-    )
-    return {"success": bool(out.get("sent")), "data": out}
+    raise HTTPException(status_code=409, detail="请在消息中心确认收件人，通过统一发送接口发送通知")
 
 
 @router.get("/wechat/llm-status")
@@ -4141,7 +3898,10 @@ def ai_llm_status():
 
 
 @router.put("/ai/llm-config")
-def ai_save_llm_config(body: LLMConfigBody):
+def ai_save_llm_config(body: LLMConfigBody, request: Request = None):
+    if request is not None:
+        from app.services.messaging import request_actor
+        request_actor(request, manage=True)
     """保存真实 LLM 配置，并立即做一次真实连通探测。"""
     from app.services.llm_config import probe_llm_connection, public_config, save_config
 
@@ -4152,7 +3912,10 @@ def ai_save_llm_config(body: LLMConfigBody):
 
 
 @router.post("/ai/llm-probe")
-def ai_probe_llm_connection():
+def ai_probe_llm_connection(request: Request = None):
+    if request is not None:
+        from app.services.messaging import request_actor
+        request_actor(request, manage=True)
     """手动触发真实 LLM 连通测试，返回脱敏结果。"""
     from app.services.llm_config import probe_llm_connection, public_config
 
@@ -4172,6 +3935,8 @@ def ai_llm_diagnostics():
 
 @router.post("/wechat/passive-poll")
 async def passive_poll(body: PassivePollBody):
+    if not body.dry_run and body.auto_reply:
+        raise HTTPException(status_code=409, detail="旧轮询仅用于草稿；真实自动回复请使用已授权渠道任务队列")
     from app.services.passive_monitor import passive_poll_once
 
     uid = _cid(body)
@@ -4313,10 +4078,14 @@ async def ai_auto_reply(
 def ai_auto_reply_claim(body: AutoReplyClaimBody, current_user: CurrentUser):
     """桌面端领取已去重、带租约的真实自动回复任务。"""
     from app.services.auto_reply_runtime import claim_jobs
+    from app.services.messaging import require_actor
+    require_actor(current_user)
 
     jobs = claim_jobs(
         team_id=int(current_user.get("team_id") or 0),
         limit=body.limit,
+        channel_types=["douyin"],
+        transport="desktop",
     )
     return {"success": True, "data": {"jobs": jobs}}
 
@@ -4325,6 +4094,8 @@ def ai_auto_reply_claim(body: AutoReplyClaimBody, current_user: CurrentUser):
 def ai_auto_reply_result(body: AutoReplyResultBody, current_user: CurrentUser):
     """记录桌面端自动回复发送结果；失败任务按退避策略重试。"""
     from app.services.auto_reply_runtime import complete_job
+    from app.services.messaging import require_actor
+    require_actor(current_user)
 
     updated = complete_job(
         body.inbound_message_id,
@@ -4332,6 +4103,8 @@ def ai_auto_reply_result(body: AutoReplyResultBody, current_user: CurrentUser):
         error=body.error,
         outbound_message_id=body.outbound_message_id,
         team_id=int(current_user.get("team_id") or 0),
+        lease_token=body.lease_token,
+        delivery_key=body.delivery_key,
     )
     return {"success": True, "data": {"updated": updated}}
 
@@ -5037,182 +4810,8 @@ def join_team(body: JoinBody, current_user: CurrentUser):
     return join_team_by_invite_code(body.invite_code, current_user["id"])
 
 
-# ---------------------------------------------------------------------------
-# 微信开放平台 / 公众号 Webhook 回调
-# ---------------------------------------------------------------------------
-
-
-def _wechat_webhook_token() -> str:
-    return _wechat_cfg("token") or _wechat_cfg("server_token") or _wechat_cfg("webhook_token")
-
-
-def _wechat_signature_ok(signature: str, timestamp: str, nonce: str, token: str) -> bool:
-    if not token:
-        return True
-    if not signature or not timestamp or not nonce:
-        return False
-    raw = "".join(sorted([token, timestamp, nonce]))
-    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
-    return secrets.compare_digest(digest, signature)
-
-
-@router.get("/webhook/wechat")
-async def wechat_webhook_verify(
-    signature: str = "",
-    timestamp: str = "",
-    nonce: str = "",
-    echostr: str = "",
-):
-    """微信服务器回调 URL 验证（GET）。"""
-    token = _wechat_webhook_token()
-    if token and not _wechat_signature_ok(signature, timestamp, nonce, token):
-        raise HTTPException(status_code=403, detail={"message": "微信回调签名校验失败"})
-    if echostr:
-        return Response(content=echostr, media_type="text/plain")
-    return {"success": True, "message": "wechat webhook endpoint active"}
-
-
-@router.post("/webhook/wechat")
-async def wechat_webhook_receive(
-    request: Request,
-    signature: str = "",
-    timestamp: str = "",
-    nonce: str = "",
-):
-    """接收微信/公众号推送消息，写入统一收件箱。"""
-    from app.services.message_store import push_inbox
-
-    token = _wechat_webhook_token()
-    if token and not _wechat_signature_ok(signature, timestamp, nonce, token):
-        logger.warning("微信 webhook 签名校验失败: signature=%s timestamp=%s nonce=%s", signature, timestamp, nonce)
-        raise HTTPException(status_code=403, detail={"message": "微信回调签名校验失败"})
-
-    content_type = request.headers.get("content-type", "")
-    try:
-        if "json" in content_type:
-            body = await request.json()
-        else:
-            raw = await request.body()
-            raw_text = raw.decode("utf-8", errors="replace")
-            body = _parse_wecom_xml(raw_text) if "<xml" in raw_text else {}
-    except Exception as exc:
-        logger.warning("微信 webhook 解析失败: %s", exc)
-        return Response(content="success", media_type="text/plain")
-
-    msg_type = str(body.get("MsgType", body.get("msgtype", "")))
-    from_user = str(body.get("FromUserName", body.get("from_user_name", body.get("openid", ""))))
-    to_user = str(body.get("ToUserName", body.get("to_user_name", "")))
-    msg_id = str(body.get("MsgId", body.get("msg_id", "")))
-    content = str(body.get("Content", body.get("content", "")))
-    content_kind = "text"
-
-    if not content:
-        if msg_type == "event":
-            event = str(body.get("Event", body.get("event", "")))
-            event_key = str(body.get("EventKey", body.get("event_key", "")))
-            content = f"[事件: {event}]" + (f" {event_key}" if event_key else "")
-        elif msg_type == "image":
-            content = str(body.get("PicUrl", body.get("MediaId", ""))) or "[图片消息]"
-            content_kind = "image"
-        elif msg_type == "voice":
-            content = str(body.get("Recognition", body.get("MediaId", ""))) or "[语音消息]"
-            content_kind = "audio"
-        elif msg_type == "video":
-            content = str(body.get("MediaId", "")) or "[视频消息]"
-            content_kind = "video"
-        elif msg_type:
-            content = f"[微信消息: {msg_type}]"
-
-    if content and from_user:
-        push_inbox(
-            "wechat",
-            contact_id=from_user,
-            contact_name=from_user,
-            direction="inbound",
-            content=content,
-            content_type=content_kind,
-            metadata={
-                "msg_type": msg_type,
-                "to_user": to_user,
-                "msg_id": msg_id,
-                "raw": body,
-            },
-            msg_id=f"wechat:{msg_id}" if msg_id else None,
-        )
-        logger.info("微信 webhook 收到消息: from=%s, type=%s, content=%.100s", from_user, msg_type, content)
-
-    return Response(content="success", media_type="text/plain")
-
-
-# ---------------------------------------------------------------------------
-# 企微 Webhook 回调
-# ---------------------------------------------------------------------------
-
-
-@router.api_route("/webhook/wework", methods=["GET", "POST"])
-async def wecom_webhook_receive(
-    request: Request,
-    msg_signature: str = "",
-    timestamp: str = "",
-    nonce: str = "",
-    echostr: str = "",
-):
-    """企业微信数据回调：验签、AES 解密并写入统一收件箱。"""
-    from fastapi.responses import PlainTextResponse
-
-    from app.services.message_store import push_inbox
-    from app.services.wework_suite import (
-        WeWorkSuiteError,
-        decrypt_callback,
-        parse_encrypted_xml,
-        parse_plain_event,
-        verify_signature,
-    )
-
-    try:
-        if request.method == "GET":
-            verify_signature(msg_signature, timestamp, nonce, echostr)
-            return PlainTextResponse(decrypt_callback(echostr, validate_suite_id=False))
-
-        raw = await request.body()
-        encrypted = parse_encrypted_xml(raw)
-        verify_signature(msg_signature, timestamp, nonce, encrypted)
-        body = parse_plain_event(decrypt_callback(encrypted, validate_suite_id=False))
-    except WeWorkSuiteError as exc:
-        logger.warning("企微数据回调验签/解密失败: %s", exc)
-        return PlainTextResponse(str(exc), status_code=400)
-
-    msg_type = body.get("MsgType", body.get("msgtype", ""))
-    from_user = str(body.get("FromUserName", body.get("from_user_name", "")))
-    content = str(body.get("Content", body.get("content", "")))
-    agent_id = str(body.get("AgentID", body.get("agent_id", "")))
-
-    if not content and msg_type == "event":
-        # 事件消息，记录事件类型
-        event = body.get("Event", body.get("event", ""))
-        content = f"[事件: {event}]"
-
-    if not content:
-        return PlainTextResponse("success")
-
-    # 写入 inbox
-    push_inbox(
-        channel_type="wework",
-        contact_id=from_user,
-        contact_name=from_user,
-        direction="inbound",
-        content=content,
-        content_type="text",
-        metadata={
-            "msg_type": msg_type,
-            "agent_id": agent_id,
-            "msg_id": str(body.get("MsgId", body.get("msg_id", ""))),
-        },
-    )
-    logger.info("企微 webhook 收到消息: from=%s, type=%s, content=%.100s", from_user, msg_type, content)
-
-    # 企微要求返回 "success" 字符串
-    return PlainTextResponse("success")
+# Callback routes live in app.api.wechat_callbacks; this legacy parser remains
+# for offline import compatibility only.
 
 
 def _parse_wecom_xml(xml_text: str) -> dict:

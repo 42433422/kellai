@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 from app.channels.base import UnifiedMessage
@@ -70,7 +71,10 @@ def resolve_customer_for_message(msg: UnifiedMessage) -> dict[str, Any]:
             if channel_type and contact_id and contacts.get(channel_type) == contact_id:
                 doc = candidate
                 break
-            if contact_id and str(candidate.get("contact_id") or "") == contact_id:
+            legacy_channel = str(candidate.get("channel_type") or candidate.get("source") or "").strip()
+            if (channel_type and legacy_channel == channel_type and contact_id
+                and not contacts.get(channel_type)
+                and str(candidate.get("contact_id") or "") == contact_id):
                 doc = candidate
                 break
         if not doc:
@@ -235,6 +239,29 @@ def apply_message_to_growth_loop(msg: UnifiedMessage) -> dict[str, Any]:
         if channel_type not in sources:
             sources.append(channel_type)
         doc["channel_sources"] = sources
+
+    # A newly imported historical event belongs in the conversation, but must
+    # not replace the latest preview, reopen a handled lead or advance its stage.
+    def timestamp(value: str) -> datetime | None:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
+        except (TypeError, ValueError):
+            return None
+
+    incoming_at = timestamp(created_at)
+    latest_at = timestamp(str(doc.get("last_message_at") or ""))
+    if latest_at is not None and (incoming_at is None or incoming_at < latest_at):
+        saved = save_pipeline(doc)
+        return {
+            "customer_id": uid, "customer_name": _display_name_from_doc(saved),
+            "stage": str(saved.get("stage") or "idle"),
+            "stage_label": _stage_label(str(saved.get("stage") or "idle")),
+            "ai_score": float(saved.get("ai_score") or 0.0),
+            "ai_intent": str(saved.get("last_intent_label") or "其他"),
+            "pending_follow_up": bool(saved.get("pending_follow_up")),
+            "next_action": str(saved.get("next_action") or ""),
+        }
 
     if content:
         doc["last_message_preview"] = content[:500]

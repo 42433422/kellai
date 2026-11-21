@@ -3,7 +3,7 @@
 参考：https://developers.facebook.com/docs/whatsapp/cloud-api
 - 鉴权：永久 access_token（System User 或 Business App）
 - 发送：POST /{phone_number_id}/messages
-- 接收：webhook → kellai_channel_inbox
+- 接收：仅消费本地 inbox；本适配器尚未实现原生 webhook
 
 环境变量（或前端配置）：
 - KELLAI_WHATSAPP_PHONE_NUMBER_ID
@@ -21,7 +21,7 @@ import httpx
 
 from app.channels.base import ChannelAdapter, UnifiedMessage
 from app.channels.config_store import get_field
-from app.channels.http_client import read_env
+from app.channels.http_client import read_env, checked_json, send_error
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +30,11 @@ _UNCONFIGURED_MSG = "WhatsApp 渠道未配置（缺少 phone_number_id / access_
 
 
 def _phone_number_id() -> str:
-    return get_field("whatsapp", "phone_number_id", read_env("KELLAI_WHATSAPP_PHONE_NUMBER_ID"))
+    return get_field("whatsapp", "phone_number_id")
 
 
 def _access_token() -> str:
-    return get_field("whatsapp", "access_token", read_env("KELLAI_WHATSAPP_ACCESS_TOKEN"))
+    return get_field("whatsapp", "access_token")
 
 
 class WhatsAppAdapter(ChannelAdapter):
@@ -66,40 +66,37 @@ class WhatsAppAdapter(ChannelAdapter):
     async def send_message(self, contact_id: str, content: str, **kwargs: Any) -> dict:
         """通过 Cloud API 发送 text 消息。"""
         if not self._is_configured():
-            return {"success": False, "message_id": "", "error": _UNCONFIGURED_MSG}
+            return {"success": False, "message_id": "", "error": _UNCONFIGURED_MSG, "delivery_state": "failed", "definitely_not_sent": True}
         if not contact_id or not (content or "").strip():
-            return {"success": False, "message_id": "", "error": "参数不完整"}
+            return {"success": False, "message_id": "", "error": "参数不完整", "delivery_state": "failed", "definitely_not_sent": True}
+        if len(content) > 4096:
+            return send_error("消息超过平台文本长度限制", definitely_not_sent=True)
         try:
             client = await self._get_client()
             payload = {
                 "messaging_product": "whatsapp",
                 "to": contact_id,
                 "type": "text",
-                "text": {"body": content[:4096]},
+                "text": {"body": content},
             }
             resp = await client.post(
                 f"/{_phone_number_id()}/messages",
                 json=payload,
             )
-            try:
-                body = resp.json()
-            except Exception:
-                body = {"raw": resp.text}
-            if resp.status_code >= 400 or "error" in body:
+            body = checked_json(resp)
+            if "error" in body:
                 err = body.get("error", {}) or {}
-                return {
-                    "success": False,
-                    "message_id": "",
-                    "error": f"errcode={err.get('code')} {err.get('message', '')}",
-                }
-            msg_id = ""
-            msgs = body.get("messages", []) or []
-            if msgs:
-                msg_id = str(msgs[0].get("id", ""))
-            return {"success": True, "message_id": msg_id, "error": ""}
+                return send_error(f"WhatsApp 拒绝请求: {err.get('code')} {err.get('message', '')}",
+                                  definitely_not_sent=True)
+            messages = body.get("messages")
+            if not isinstance(messages, list) or not messages or not messages[0].get("id"):
+                return send_error("WhatsApp 未返回消息ID，发送结果未知")
+            return {"success": True, "message_id": str(messages[0]["id"]),
+                    "delivery_state": "accepted", "error": ""}
+
         except Exception as exc:
             logger.warning("WhatsApp send_message 异常: %s", exc)
-            return {"success": False, "message_id": "", "error": str(exc)}
+            return send_error(exc)
 
     # ----------------- receive_messages -----------------
 
@@ -158,7 +155,7 @@ class WhatsAppAdapter(ChannelAdapter):
 
     # ----------------- test_connection -----------------
 
-    async def test_connection(self) -> dict:
+    async def test_connection(self, **kwargs) -> dict:
         if not self._is_configured():
             return {"connected": False, "message": _UNCONFIGURED_MSG}
         try:
@@ -172,6 +169,7 @@ class WhatsAppAdapter(ChannelAdapter):
             if resp.status_code == 200 and body.get("id"):
                 return {
                     "connected": True,
+                    "verification_level": "authenticated",
                     "message": f"WhatsApp phone_number {body.get('display_phone_number', _phone_number_id())} 鉴权通过",
                 }
             err = body.get("error", {}) or {}

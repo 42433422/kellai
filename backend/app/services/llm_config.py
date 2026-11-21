@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -268,9 +269,18 @@ def _read_disk() -> dict[str, Any]:
 def _write_disk(data: dict[str, Any]) -> dict[str, Any]:
     path = _config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=path.name + ".", delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(data, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     return data
 
 
@@ -483,16 +493,31 @@ def save_config(payload: dict[str, Any]) -> dict[str, Any]:
     if raw_model and _is_provider_name(raw_model):
         raw_model = ""
 
+    previous_provider = normalize_provider(str(current.get("provider") or "deepseek"))
+    provider_changed = previous_provider != provider
     next_cfg = dict(current)
     next_cfg["provider"] = provider
-    next_cfg["model"] = str(raw_model or current.get("model") or provider_defaults["model"]).strip()
-    next_cfg["base_url"] = str(payload.get("base_url") or current.get("base_url") or provider_defaults["base_url"]).strip()
+    next_cfg["model"] = str(raw_model or (current.get("model") if not provider_changed else "")
+                            or ("" if provider == "auto" else provider_defaults["model"])).strip()
+    next_cfg["base_url"] = str(payload.get("base_url") or (current.get("base_url") if not provider_changed else "")
+                               or ("" if provider == "auto" else provider_defaults["base_url"])).strip().rstrip("/")
 
     api_key = payload.get("api_key")
-    if api_key is not None:
-        key_value = str(api_key).strip()
-        if key_value:
-            next_cfg["api_key"] = key_value
+    key_value = str(api_key or "").strip()
+    endpoint_changed = str(current.get("base_url") or "").strip().rstrip("/") != next_cfg["base_url"]
+    if key_value:
+        next_cfg["api_key"] = key_value
+        next_cfg["api_key_provider"] = provider
+        next_cfg["api_key_base_url"] = next_cfg["base_url"]
+    elif provider_changed or endpoint_changed:
+        # An omitted key means keep credentials for the same destination; it
+        # cannot silently move a saved secret to a newly entered endpoint.
+        for key in ("api_key", "api_key_provider", "api_key_base_url"):
+            next_cfg.pop(key, None)
+
+    if any(next_cfg.get(key) != current.get(key) for key in ("provider", "model", "base_url", "api_key")):
+        next_cfg.pop("last_probe", None)
+        _LAST_PROBE_BY_TEAM.pop(current_team_id(), None)
 
     next_cfg["auto_reply_enabled"] = bool(payload.get("auto_reply_enabled", current.get("auto_reply_enabled", False)))
     if isinstance(payload.get("auto_reply_stages"), list):
@@ -575,9 +600,9 @@ def probe_llm_connection(*, update_disk: bool = True, timeout_sec: float = 15.0)
         except httpx.HTTPStatusError as exc:
             detail = ""
             try:
-                detail = str(exc.response.json())[:300]
+                detail = str(exc.response.json())
             except Exception:
-                detail = exc.response.text[:300]
+                detail = exc.response.text
             result = {
                 "success": False,
                 "connected": False,
@@ -595,9 +620,14 @@ def probe_llm_connection(*, update_disk: bool = True, timeout_sec: float = 15.0)
                 "provider": provider,
                 "model": model,
                 "latency_ms": int((time.perf_counter() - started) * 1000),
-                "error": str(exc)[:300],
+                "error": str(exc),
             }
 
+    # Some provider error bodies echo the Authorization value. Keep shared
+    # service credentials out of both API diagnostics and persisted reports.
+    if cfg.get("api_key"):
+        result["error"] = str(result.get("error") or "").replace(str(cfg["api_key"]), "[redacted]")
+    result["error"] = str(result.get("error") or "")[:300]
     _LAST_PROBE_BY_TEAM[current_team_id()] = result
     if update_disk:
         disk = _read_disk()
@@ -619,31 +649,41 @@ def effective_config() -> dict[str, Any]:
     saved = _read_disk()
     selected = normalize_provider(str(saved.get("provider") or "deepseek"))
     saved_key = str(saved.get("api_key") or "").strip()
+    saved_base = str(saved.get("base_url") or "").strip().rstrip("/")
+
+    if saved_key:
+        provider = selected if selected != "auto" else "deepseek"
+        defaults = _provider_defaults(provider)
+        key_provider = str(saved.get("api_key_provider") or selected)
+        key_base = str(saved.get("api_key_base_url") or saved_base).strip().rstrip("/")
+        if key_provider == selected and key_base == saved_base:
+            return {
+                "provider": provider,
+                "api_key": saved_key,
+                "base_url": saved_base or defaults["base_url"],
+                "model": str(saved.get("model") or defaults["model"]),
+                "source": "saved_config",
+                "key_prefix": f"{saved_key[:6]}...{saved_key[-4:]}" if len(saved_key) >= 12 else "已保存",
+            }
 
     for provider in _provider_candidates(selected):
         defaults = _provider_defaults(provider)
+        trusted_base = str(defaults["base_url"]).strip().rstrip("/")
+        # Shared environment credentials belong to their own provider endpoint
+        # (official default or a server-configured gateway). Tenant settings
+        # may select models there, but never redirect that secret elsewhere.
+        if saved_base and saved_base != trusted_base:
+            continue
         key_envs = _env_names(str(defaults.get("key_env") or ""))
         source, env_key = _env_key_value(*key_envs)
         if env_key:
             return {
                 "provider": provider,
                 "api_key": env_key,
-                "base_url": str(saved.get("base_url") or defaults["base_url"]),
-                "model": str(saved.get("model") or defaults["model"]),
+                "base_url": trusted_base,
+                "model": str(saved.get("model") or defaults["model"]) if selected in {provider, "auto"} else defaults["model"],
                 "source": source or defaults["key_env"],
                 "key_prefix": f"{source or defaults['key_env']} 环境变量",
             }
-
-    if saved_key:
-        provider = selected if selected != "auto" else "deepseek"
-        defaults = _provider_defaults(provider)
-        return {
-            "provider": provider,
-            "api_key": saved_key,
-            "base_url": str(saved.get("base_url") or defaults["base_url"]),
-            "model": str(saved.get("model") or defaults["model"]),
-            "source": "saved_config",
-            "key_prefix": f"{saved_key[:6]}...{saved_key[-4:]}" if len(saved_key) >= 12 else "已保存",
-        }
 
     return {}

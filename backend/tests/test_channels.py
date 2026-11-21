@@ -324,18 +324,13 @@ class TestWeComAdapter:
 
         monkeypatch.setattr(message_store, "save_message", fail_if_persisted)
 
-        out = await send_message(
-            ChannelSendMessageBody(
-                customer_id=1,
-                channel_type="wework",
-                contact_id="@all",
-                content="hello",
-            )
-        )
-
-        assert out["success"] is False
-        assert "未配置" in out["error"]
-        assert out["data"]["message_id"] == ""
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as denied:
+            await send_message(ChannelSendMessageBody(
+                customer_id=1, channel_type="wework", contact_id="@all",
+                content="hello", client_request_id="unauthenticated-attempt",
+            ))
+        assert denied.value.status_code == 401
 
     async def test_bot_webhook_configured_test_ok(self, monkeypatch):
         from app.channels.wecom import WeComAdapter
@@ -343,7 +338,8 @@ class TestWeComAdapter:
         monkeypatch.setenv("KELLAI_WECOM_BOT_WEBHOOK", "https://example.com/bot/abc")
         a = WeComAdapter()
         out = await a.test_connection()
-        assert out["connected"] is True
+        assert out["connected"] is False
+        assert out["verification_level"] == "configured"
         assert "Webhook" in out["message"]
 
     async def test_customer_service_url_configured_test_ok(self):
@@ -358,7 +354,8 @@ class TestWeComAdapter:
         a = WeComAdapter()
 
         out = await a.test_connection()
-        assert out["connected"] is True
+        assert out["connected"] is False
+        assert out["verification_level"] == "configured"
         assert "open_kfid=kfcfd8a26b4a56f24ee" in out["message"]
 
         send = await a.send_message("user_001", "hello")
@@ -854,6 +851,7 @@ class TestDouyinAdapter:
             result = await DouyinAdapter().send_message(
                 "customer-open-id",
                 "远端回复",
+                idempotency_key="remote-miniapp-request",
                 team_id=7,
                 customer_id=88,
                 reply_context=reply_context,
@@ -864,6 +862,7 @@ class TestDouyinAdapter:
             team_id=7,
             contact_id="customer-open-id",
             content="远端回复",
+            idempotency_key="remote-miniapp-request",
             persona_id="",
             customer_id=88,
             reply_context=reply_context,
@@ -1139,7 +1138,7 @@ class TestDouyinAdapter:
                 "path": "/api/kellai/channels",
                 "headers": [],
                 "query_string": b"",
-                "state": {"user": {"id": 22, "team_id": 11}},
+                "state": {"user": {"id": 22, "team_id": 11, "role": "owner"}},
             }
         )
 
@@ -1838,13 +1837,13 @@ class TestPhoneAdapter:
 
         a = PhoneAdapter()
         fake_resp = MagicMock(status_code=200)
-        fake_resp.json.return_value = {"Code": "OK", "RequestId": "AL-1", "Message": "OK"}
+        fake_resp.json.return_value = {"Code": "OK", "RequestId": "AL-1", "BizId": "SMS-BIZ-1", "Message": "OK"}
         fake_client = AsyncMock()
         fake_client.get = AsyncMock(return_value=fake_resp)
         with patch.object(a, "_get_client", AsyncMock(return_value=fake_client)):
-            out = await a.send_message("13800000000", "测试")
+            out = await a.send_message("13800000000", "测试", template_param={"content": "测试"})
         assert out["success"] is True
-        assert out["message_id"] == "AL-1"
+        assert out["message_id"] == "SMS-BIZ-1"
         call = fake_client.get.await_args
         params = call.kwargs["params"]
         assert params["Action"] == "SendSms"
@@ -2081,7 +2080,7 @@ class TestInboxEndToEnd:
                 "path": "/api/kellai/channels/sync-inbox",
                 "headers": [],
                 "query_string": b"",
-                "state": {"user": {"id": 22, "team_id": 11}},
+                "state": {"user": {"id": 22, "team_id": 11, "role": "owner"}},
             }
         )
         ack = AsyncMock(return_value=1)
@@ -2885,18 +2884,19 @@ class TestInboxEndToEnd:
         assert checks["agent_assist_autofill_loop"]["details"]["knowledge_count"] >= 1
         assert "image" in checks["multimodal_service_loop"]["details"]["content_types"]
         assert "audio" in checks["multimodal_service_loop"]["details"]["content_types"]
-        assert checks["sales_revenue_loop"]["passed"] is True
+        assert checks["sales_revenue_loop"]["passed"] is False
         assert checks["customer_management_loop"]["passed"] is True
         assert checks["llm_settings_loop"]["passed"] is True
         assert checks["knowledge_base_loop"]["passed"] is True
-        assert checks["content_growth_loop"]["passed"] is True
-        assert checks["scout_lead_loop"]["passed"] is True
-        assert checks["flow_automation_loop"]["passed"] is True
-        assert checks["finance_decision_loop"]["passed"] is True
-        assert checks["open_platform_loop"]["passed"] is True
+        assert checks["content_growth_loop"]["passed"] is False
+        assert checks["scout_lead_loop"]["passed"] is False
+        assert checks["flow_automation_loop"]["passed"] is False
+        assert checks["finance_decision_loop"]["passed"] is False
+        assert checks["open_platform_loop"]["passed"] is False
         assert checks["channel_onboarding_loop"]["passed"] is True
-        assert out["benchmark_profile"]["summary"]["failed_required"] == 1
-        assert out["benchmark_profile"]["failed_required_labels"] == ["真实大模型 Agent 成交链路"]
+        assert out["benchmark_profile"]["summary"]["failed_required"] == 5
+        assert "真实大模型 Agent 成交链路" in out["benchmark_profile"]["failed_required_labels"]
+        assert out["live_verified"] is False
         assert out["audit_customer_id"] > 0
         latest = latest_closed_loop_audit_report()
         assert latest is not None
@@ -2955,11 +2955,13 @@ class TestInboxEndToEnd:
         assert checks["llm_ready"]["details"]["probe_success"] is False
         assert "invalid api key" in checks["llm_ready"]["details"]["probe_error"]
         assert checks["llm_full_flow"]["passed"] is False
-        assert out["failure_reason"] == "真实 LLM 已连通；LLM 客户行为到签约闭环；红熊/黑熊 AI 对标能力覆盖"
+        assert "真实 LLM 已连通" in out["failure_reason"]
+        assert "LLM 客户行为到签约闭环" in out["failure_reason"]
+        assert "内容生成、投放、数据闭环" in out["failure_reason"]
         assert checks["redbear_benchmark_coverage"]["passed"] is False
-        assert out["benchmark_profile"]["failed_required_labels"] == ["真实大模型 Agent 成交链路"]
+        assert "真实大模型 Agent 成交链路" in out["benchmark_profile"]["failed_required_labels"]
 
-    async def test_closed_loop_audit_dev_mode_passes_without_required_llm(self, tmp_db, monkeypatch):
+    async def test_closed_loop_audit_dev_mode_does_not_promote_stubs(self, tmp_db, monkeypatch):
         from app.services.closed_loop_audit import run_closed_loop_audit
 
         for key in LLM_ENV_CANDIDATES:
@@ -2968,7 +2970,8 @@ class TestInboxEndToEnd:
         out = await run_closed_loop_audit(require_llm=False, target_stage="signed")
 
         checks = {item["key"]: item for item in out["checks"]}
-        assert out["passed"] is True
+        assert out["passed"] is False
+        assert out["live_verified"] is False
         assert checks["llm_ready"]["required"] is False
         assert checks["llm_full_flow"]["required"] is False
         assert checks["llm_full_flow"]["details"]["mode"] == "scripted_fallback"
@@ -2992,7 +2995,9 @@ class TestInboxEndToEnd:
             "open_platform_loop",
             "channel_onboarding_loop",
         ):
-            assert checks[key]["passed"] is True
+            implemented = key not in {"sales_revenue_loop", "content_growth_loop", "scout_lead_loop",
+                                      "flow_automation_loop", "finance_decision_loop", "open_platform_loop"}
+            assert checks[key]["passed"] is implemented
 
 
 # ---------------------------------------------------------------------------

@@ -22,7 +22,7 @@ import httpx
 
 from app.channels.base import ChannelAdapter, UnifiedMessage
 from app.channels.config_store import get_field
-from app.channels.http_client import CachedToken, read_env
+from app.channels.http_client import CachedToken, read_env, checked_json, send_error
 
 logger = logging.getLogger(__name__)
 
@@ -31,36 +31,15 @@ _UNCONFIGURED_MSG = "小程序渠道未配置（缺少 app_id/app_secret）"
 
 
 def _app_id() -> str:
-    return (
-        get_field("miniprogram", "app_id")
-        or get_field("miniapp", "app_id")
-        or read_env("KELLAI_MINIAPP_APPID")
-        or read_env("KELLAI_MINIAPP_APP_ID")
-        or read_env("KELLAI_MINIPROGRAM_APPID")
-        or read_env("KELLAI_MINIPROGRAM_APP_ID")
-    )
+    return get_field("miniprogram", "app_id")
 
 
 def _app_secret() -> str:
-    return (
-        get_field("miniprogram", "app_secret")
-        or get_field("miniapp", "app_secret")
-        or get_field("miniprogram", "secret")
-        or get_field("miniapp", "secret")
-        or read_env("KELLAI_MINIAPP_SECRET")
-        or read_env("KELLAI_MINIAPP_APP_SECRET")
-        or read_env("KELLAI_MINIPROGRAM_SECRET")
-        or read_env("KELLAI_MINIPROGRAM_APP_SECRET")
-    )
+    return get_field("miniprogram", "app_secret", default=get_field("miniprogram", "secret"))
 
 
 def _template_id() -> str:
-    return (
-        get_field("miniprogram", "template_id")
-        or get_field("miniapp", "template_id")
-        or read_env("KELLAI_MINIAPP_TEMPLATE_ID")
-        or read_env("KELLAI_MINIPROGRAM_TEMPLATE_ID")
-    )
+    return get_field("miniprogram", "template_id")
 
 
 def _inbox_channel_types() -> list[str]:
@@ -95,10 +74,7 @@ class MiniAppAdapter(ChannelAdapter):
             "/cgi-bin/token",
             params={"grant_type": "client_credential", "appid": _app_id(), "secret": _app_secret()},
         )
-        try:
-            body = resp.json()
-        except Exception:
-            body = {"raw": resp.text}
+        body = checked_json(resp)
         if int(body.get("errcode", 0)) != 0:
             raise RuntimeError(f"小程序 gettoken 失败: {body.get('errmsg')} (errcode={body.get('errcode')})")
         token = str(body.get("access_token", ""))
@@ -130,13 +106,13 @@ class MiniAppAdapter(ChannelAdapter):
           - page: 跳转页面
         """
         if not self._is_configured():
-            return {"success": False, "message_id": "", "error": _UNCONFIGURED_MSG}
+            return {"success": False, "message_id": "", "error": _UNCONFIGURED_MSG, "delivery_state": "failed", "definitely_not_sent": True}
         if not contact_id:
-            return {"success": False, "message_id": "", "error": "contact_id (openid) 不能为空"}
+            return {"success": False, "message_id": "", "error": "contact_id (openid) 不能为空", "delivery_state": "failed", "definitely_not_sent": True}
 
         template_id = str(kwargs.get("template_id") or _template_id())
         if not template_id:
-            return {"success": False, "message_id": "", "error": "缺少 template_id（设置渠道 template_id 或传 template_id）"}
+            return {"success": False, "message_id": "", "error": "缺少 template_id（设置渠道 template_id 或传 template_id）", "delivery_state": "failed", "definitely_not_sent": True}
 
         # 兼容两种调用：直接传 content 走默认 "thing" 字段；或传 data 走完整模板
         data: dict[str, dict[str, str]] = kwargs.get("data") or {}
@@ -147,7 +123,10 @@ class MiniAppAdapter(ChannelAdapter):
             }
 
         try:
-            token = await self._ensure_token_cache().get()
+            try:
+                token = await self._ensure_token_cache().get()
+            except Exception as exc:
+                return send_error(f"小程序发送前获取凭据失败: {type(exc).__name__}", definitely_not_sent=True)
             client = await self._get_client()
             payload = {
                 "touser": contact_id,
@@ -162,25 +141,20 @@ class MiniAppAdapter(ChannelAdapter):
                 params={"access_token": token},
                 json=payload,
             )
-            try:
-                body = resp.json()
-            except Exception:
-                body = {"raw": resp.text}
-            errcode = int(body.get("errcode", 0) or 0)
-            if errcode != 0 and errcode != 43101:  # 43101: 用户拒绝订阅，期望值
-                return {
-                    "success": False,
-                    "message_id": "",
-                    "error": f"errcode={errcode} errmsg={body.get('errmsg')}",
-                }
+            body = checked_json(resp)
+            if "errcode" not in body:
+                return send_error("小程序未返回成功确认，发送结果未知")
+            errcode = int(body["errcode"])
             return {
                 "success": errcode == 0,
+                "delivery_state": "accepted" if errcode == 0 else "failed",
+                "definitely_not_sent": errcode != 0,
                 "message_id": "",  # 订阅消息无 message_id
                 "error": "" if errcode == 0 else f"errcode={errcode} errmsg={body.get('errmsg')}",
             }
         except Exception as exc:
             logger.warning("小程序 send_message 异常: %s", exc)
-            return {"success": False, "message_id": "", "error": str(exc)}
+            return send_error(exc)
 
     # ----------------- receive_messages -----------------
 
@@ -247,7 +221,7 @@ class MiniAppAdapter(ChannelAdapter):
 
     # ----------------- test_connection -----------------
 
-    async def test_connection(self) -> dict:
+    async def test_connection(self, **kwargs) -> dict:
         if not self._is_configured():
             return {"connected": False, "message": _UNCONFIGURED_MSG}
         try:

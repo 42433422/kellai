@@ -1,12 +1,10 @@
-"""电话 / 短信渠道适配器（真实 HTTP API · 可插拔网关）。
+"""短信渠道适配器（沿用历史类型 phone；不提供语音外呼）。
 
 支持两种短信网关：
 - Twilio（KELLAI_SMS_PROVIDER=twilio）：account_sid + auth_token + from_number
 - 阿里云短信（KELLAI_SMS_PROVIDER=aliyun）：access_key_id + access_key_secret + sign_name + template_code
 
-接收：
-- 来电：依赖网关 webhook → 写入 kellai_channel_inbox
-- 上行短信：依赖网关 webhook → 写入 kellai_channel_inbox
+原生上行短信和送达回调尚未接入。双向短信可使用 Chatwoot 短信收件箱。
 
 环境变量：
 - KELLAI_SMS_PROVIDER：twilio | aliyun
@@ -18,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import logging
 import time
 import uuid
@@ -27,12 +26,61 @@ from typing import Any
 import httpx
 
 from app.channels.base import ChannelAdapter, UnifiedMessage
-from app.channels.http_client import read_env
+from app.channels.config_store import get_field
+from app.channels.http_client import read_env, checked_json, send_error
 
 logger = logging.getLogger(__name__)
 
 
-_UNCONFIGURED_MSG = "电话/短信渠道未配置（设置 KELLAI_SMS_PROVIDER + 对应凭据）"
+_UNCONFIGURED_MSG = "短信渠道未配置，请在渠道管理选择 Twilio 或阿里云并保存对应凭据"
+
+PHONE_CONFIG_SCHEMA = {
+    "type": "object",
+    "required": ["provider"],
+    "oneOf": [
+        {"properties": {"provider": {"const": "twilio"}},
+         "required": ["account_sid", "auth_token", "from_number"]},
+        {"properties": {"provider": {"const": "aliyun"}},
+         "required": ["access_key_id", "access_key_secret", "sign_name", "template_code"]},
+    ],
+    "properties": {
+        "provider": {"type": "string", "title": "短信服务商", "enum": ["twilio", "aliyun"],
+                     "default": "twilio", "x-enum-labels": {"twilio": "Twilio 文本短信", "aliyun": "阿里云模板短信"}},
+        "account_sid": {"type": "string", "title": "Twilio Account SID", "x-providers": ["twilio"]},
+        "auth_token": {"type": "string", "title": "Twilio Auth Token", "writeOnly": True, "x-providers": ["twilio"]},
+        "from_number": {"type": "string", "title": "Twilio 发送号码", "x-providers": ["twilio"],
+                        "description": "使用已开通短信能力的号码，按 E.164 格式填写，例如 +15551234567。"},
+        "access_key_id": {"type": "string", "title": "阿里云 AccessKey ID", "x-providers": ["aliyun"]},
+        "access_key_secret": {"type": "string", "title": "阿里云 AccessKey Secret", "writeOnly": True, "x-providers": ["aliyun"]},
+        "sign_name": {"type": "string", "title": "已审核短信签名", "x-providers": ["aliyun"]},
+        "template_code": {"type": "string", "title": "已审核模板 CODE", "x-providers": ["aliyun"],
+                          "description": "例如 SMS_123456789。发送需显式模板参数；当前消息界面只发送自由文本，尚未接入模板编辑。"},
+    },
+}
+
+
+def phone_required_fields(provider: str) -> list[str]:
+    fields = list(PHONE_CONFIG_SCHEMA["required"])
+    for branch in PHONE_CONFIG_SCHEMA["oneOf"]:
+        if branch["properties"]["provider"]["const"] == provider:
+            return fields + branch["required"]
+    return fields
+
+
+def phone_capabilities(base: dict[str, Any]) -> dict[str, Any]:
+    """A configured template gateway must not enter the generic text sender."""
+    provider = get_field("phone", "provider", "twilio").strip().lower()
+    capabilities = dict(base)
+    capabilities["provider"] = provider
+    capabilities["message_types"] = ["text"] if provider == "twilio" else ["template"]
+    if provider == "aliyun":
+        capabilities["limitations"] = [
+            "阿里云仅支持已审核签名和模板，发送必须提供匹配的 template_param；模板发送界面尚未实现。",
+            *base.get("limitations", []),
+        ]
+    elif provider != "twilio":
+        capabilities.update(send=False, readiness="blocked")
+    return capabilities
 
 
 def _now_ms() -> int:
@@ -40,21 +88,21 @@ def _now_ms() -> int:
 
 
 class PhoneAdapter(ChannelAdapter):
-    """电话/短信渠道适配器。"""
+    """Twilio 文本短信 / 阿里云显式模板短信。"""
 
     channel_type = "phone"
 
     def __init__(self) -> None:
-        self._provider: str = read_env("KELLAI_SMS_PROVIDER", "twilio").lower()
+        self._provider: str = get_field("phone", "provider", "twilio").strip().lower()
         # Twilio
-        self._account_sid: str = read_env("KELLAI_SMS_ACCOUNT_SID")
-        self._auth_token: str = read_env("KELLAI_SMS_AUTH_TOKEN")
-        self._from_number: str = read_env("KELLAI_SMS_FROM_NUMBER")
+        self._account_sid: str = get_field("phone", "account_sid")
+        self._auth_token: str = get_field("phone", "auth_token")
+        self._from_number: str = get_field("phone", "from_number")
         # 阿里云
-        self._access_key_id: str = read_env("KELLAI_SMS_ACCESS_KEY_ID")
-        self._access_key_secret: str = read_env("KELLAI_SMS_ACCESS_KEY_SECRET")
-        self._sign_name: str = read_env("KELLAI_SMS_SIGN_NAME")
-        self._template_code: str = read_env("KELLAI_SMS_TEMPLATE_CODE")
+        self._access_key_id: str = get_field("phone", "access_key_id")
+        self._access_key_secret: str = get_field("phone", "access_key_secret")
+        self._sign_name: str = get_field("phone", "sign_name")
+        self._template_code: str = get_field("phone", "template_code")
         self._client: httpx.AsyncClient | None = None
 
     def _is_configured(self) -> bool:
@@ -79,22 +127,22 @@ class PhoneAdapter(ChannelAdapter):
     async def send_message(self, contact_id: str, content: str, **kwargs: Any) -> dict:
         """发送短信到 contact_id（手机号）。"""
         if not self._is_configured():
-            return {"success": False, "message_id": "", "error": _UNCONFIGURED_MSG}
+            return {"success": False, "message_id": "", "error": _UNCONFIGURED_MSG, "delivery_state": "failed", "definitely_not_sent": True}
         content = (content or "").strip()
-        if not content:
-            return {"success": False, "message_id": "", "error": "消息内容为空"}
+        if not content and self._provider == "twilio":
+            return {"success": False, "message_id": "", "error": "消息内容为空", "delivery_state": "failed", "definitely_not_sent": True}
         if not contact_id:
-            return {"success": False, "message_id": "", "error": "contact_id (手机号) 不能为空"}
+            return {"success": False, "message_id": "", "error": "contact_id (手机号) 不能为空", "delivery_state": "failed", "definitely_not_sent": True}
 
         try:
             if self._provider == "twilio":
                 return await self._send_twilio(contact_id, content)
             if self._provider == "aliyun":
                 return await self._send_aliyun(contact_id, content, kwargs)
-            return {"success": False, "message_id": "", "error": f"不支持的 provider: {self._provider}"}
+            return {"success": False, "message_id": "", "error": f"不支持的 provider: {self._provider}", "delivery_state": "failed", "definitely_not_sent": True}
         except Exception as exc:
             logger.warning("短信发送异常: %s", exc)
-            return {"success": False, "message_id": "", "error": str(exc)}
+            return send_error(exc)
 
     async def _send_twilio(self, to: str, body: str) -> dict:
         """Twilio Programmable SMS API。"""
@@ -105,24 +153,31 @@ class PhoneAdapter(ChannelAdapter):
             auth=(self._account_sid, self._auth_token),
             data={"From": self._from_number, "To": to, "Body": body},
         )
-        try:
-            result = resp.json()
-        except Exception:
-            result = {"raw": resp.text}
-        if resp.status_code >= 400:
-            return {
-                "success": False,
-                "message_id": "",
-                "error": f"Twilio HTTP {resp.status_code}: {result.get('message', result)}",
-            }
-        return {
-            "success": True,
-            "message_id": str(result.get("sid", "")),
-            "error": "",
-        }
+        result = checked_json(resp)
+        if not result.get("sid"):
+            return send_error("Twilio 未返回消息SID，发送结果未知")
+        if result.get("status") in {"failed", "undelivered"}:
+            return send_error("Twilio 消息发送失败", definitely_not_sent=True)
+        return {"success": True, "message_id": str(result["sid"]),
+                "delivery_state": "accepted", "error": ""}
 
     async def _send_aliyun(self, to: str, body: str, kwargs: dict) -> dict:
         """阿里云短信 SendSms API（v1 简化签名版）。"""
+        template_param = kwargs.get("template_param")
+        if template_param is None:
+            return send_error("阿里云仅支持已审核模板，需显式 template_param；当前通用文本界面尚未接入模板发送",
+                              definitely_not_sent=True)
+        try:
+            if isinstance(template_param, str):
+                template_param = json.loads(template_param)
+            if not isinstance(template_param, dict) or not all(
+                isinstance(key, str) and isinstance(value, str) for key, value in template_param.items()
+            ):
+                raise ValueError("template variables must be strings")
+            encoded_template = json_dumps_safe(template_param)
+        except (TypeError, ValueError):
+            return send_error("template_param 必须是变量名和值均为字符串的 JSON 对象；无变量模板请显式传 {}",
+                              definitely_not_sent=True)
         params = {
             "AccessKeyId": self._access_key_id,
             "Action": "SendSms",
@@ -133,8 +188,8 @@ class PhoneAdapter(ChannelAdapter):
             "SignatureNonce": str(uuid.uuid4()),
             "SignatureVersion": "1.0",
             "TemplateCode": self._template_code,
-            "TemplateParam": str(kwargs.get("template_param", json_dumps_safe({"content": body}))),
-            "Timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "TemplateParam": encoded_template,
+            "Timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "Version": "2017-05-25",
         }
         # 拼接 + 签名
@@ -151,26 +206,23 @@ class PhoneAdapter(ChannelAdapter):
 
         client = await self._get_client()
         resp = await client.get("https://dysmsapi.aliyuncs.com/", params=params)
-        try:
-            result = resp.json()
-        except Exception:
-            result = {"raw": resp.text}
+        result = checked_json(resp)
         if str(result.get("Code", "")).upper() != "OK":
-            return {
-                "success": False,
-                "message_id": "",
-                "error": f"阿里云短信失败: {result.get('Code')} {result.get('Message')}",
-            }
+            return send_error(f"阿里云短信失败: {result.get('Code')} {result.get('Message')}",
+                              definitely_not_sent="Code" in result)
+        if not result.get("BizId"):
+            return send_error("阿里云未返回短信 BizId，发送结果未知")
         return {
             "success": True,
-            "message_id": str(result.get("RequestId", "")),
+            "message_id": str(result.get("BizId", "")),
+            "delivery_state": "accepted",
             "error": "",
         }
 
     # ----------------- receive_messages -----------------
 
     async def receive_messages(self, since: str = "", limit: int = 50) -> list[UnifiedMessage]:
-        """从收件箱表读取（webhook 已写入：来电/上行短信）。"""
+        """消费历史本地收件箱；此适配器尚无原生上行短信入口。"""
         try:
             from app.services.message_store import list_inbox
             rows = list_inbox(self.channel_type, limit=int(limit))
@@ -226,14 +278,25 @@ class PhoneAdapter(ChannelAdapter):
 
     # ----------------- test_connection -----------------
 
-    async def test_connection(self) -> dict:
+    async def test_connection(self, **kwargs) -> dict:
         if not self._is_configured():
             return {"connected": False, "message": _UNCONFIGURED_MSG}
         if self._provider == "twilio":
-            return {"connected": True, "message": f"Twilio 已配置（from={self._from_number}）"}
-        if self._provider == "aliyun":
-            return {"connected": True, "message": f"阿里云短信已配置（sign={self._sign_name}, template={self._template_code}）"}
-        return {"connected": False, "message": f"未知 provider: {self._provider}"}
+            try:
+                client = await self._get_client()
+                body = checked_json(await client.get(
+                    f"https://api.twilio.com/2010-04-01/Accounts/{self._account_sid}.json",
+                    auth=(self._account_sid, self._auth_token),
+                ))
+                if body.get("sid") != self._account_sid:
+                    raise ValueError("Twilio账号不匹配")
+                return {"connected": True, "verification_level": "authenticated",
+                        "message": "Twilio账号鉴权通过；尚未进行真实短信收发验收"}
+            except Exception as exc:
+                return {"connected": False, "message": f"Twilio鉴权失败: {exc}"}
+        return {"connected": False, "verification_level": "configured",
+                "message": "阿里云模板短信凭据已配置；尚未进行远端鉴权及真实发送验收"}
+
 
 
 # ---------------------------------------------------------------------------

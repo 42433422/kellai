@@ -3,7 +3,7 @@
 参考：https://core.telegram.org/bots/api
 - 鉴权：bot_token（URL 中携带）
 - 发送：sendMessage
-- 接收：getUpdates（长轮询）或 webhook
+- 接收：仅消费本地 inbox；原生 getUpdates/webhook 尚未实现，双向可使用 Chatwoot inbox
 
 环境变量（或前端配置）：
 - KELLAI_TELEGRAM_BOT_TOKEN
@@ -18,7 +18,7 @@ import httpx
 
 from app.channels.base import ChannelAdapter, UnifiedMessage
 from app.channels.config_store import get_field
-from app.channels.http_client import read_env
+from app.channels.http_client import read_env, checked_json, send_error
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ _UNCONFIGURED_MSG = "Telegram 渠道未配置（缺少 bot_token）"
 
 
 def _bot_token() -> str:
-    return get_field("telegram", "bot_token", read_env("KELLAI_TELEGRAM_BOT_TOKEN"))
+    return get_field("telegram", "bot_token")
 
 
 class TelegramAdapter(ChannelAdapter):
@@ -55,38 +55,38 @@ class TelegramAdapter(ChannelAdapter):
     async def send_message(self, contact_id: str, content: str, **kwargs: Any) -> dict:
         """contact_id: Telegram chat_id。content: 文本。"""
         if not self._is_configured():
-            return {"success": False, "message_id": "", "error": _UNCONFIGURED_MSG}
+            return {"success": False, "message_id": "", "error": _UNCONFIGURED_MSG, "delivery_state": "failed", "definitely_not_sent": True}
         if not contact_id or not (content or "").strip():
-            return {"success": False, "message_id": "", "error": "参数不完整"}
+            return {"success": False, "message_id": "", "error": "参数不完整", "delivery_state": "failed", "definitely_not_sent": True}
+        if len(content) > 4096:
+            return send_error("消息超过平台文本长度限制", definitely_not_sent=True)
         try:
             client = await self._get_client()
             payload: dict[str, Any] = {
                 "chat_id": contact_id,
-                "text": content[:4096],
+                "text": content,
             }
             if kwargs.get("parse_mode"):
                 payload["parse_mode"] = str(kwargs["parse_mode"])
             resp = await client.post("/sendMessage", json=payload)
-            try:
-                body = resp.json()
-            except Exception:
-                body = {"raw": resp.text}
-            if not body.get("ok"):
-                return {
-                    "success": False,
-                    "message_id": "",
-                    "error": f"errcode={body.get('error_code')} {body.get('description', '')}",
-                }
+            body = checked_json(resp)
+            if body.get("ok") is not True:
+                return send_error(f"Telegram 拒绝请求: {body.get('error_code')} {body.get('description', '')}",
+                                  definitely_not_sent=body.get("ok") is False)
             result = body.get("result", {}) or {}
-            return {"success": True, "message_id": str(result.get("message_id", "")), "error": ""}
+            if not isinstance(result, dict) or not result.get("message_id"):
+                return send_error("Telegram 未返回消息ID，发送结果未知")
+            return {"success": True, "message_id": str(result["message_id"]),
+                    "delivery_state": "accepted", "error": ""}
+
         except Exception as exc:
             logger.warning("Telegram send_message 异常: %s", exc)
-            return {"success": False, "message_id": "", "error": str(exc)}
+            return send_error(exc)
 
     # ----------------- receive_messages -----------------
 
     async def receive_messages(self, since: str = "", limit: int = 50) -> list[UnifiedMessage]:
-        """从收件箱读（webhook 入库）；同时可调 getUpdates 拉取一次。"""
+        """读取已有收件箱。此原生适配器尚未实现 getUpdates/webhook。"""
         try:
             from app.services.message_store import list_inbox
             rows = list_inbox(self.channel_type, limit=int(limit))
@@ -141,20 +141,18 @@ class TelegramAdapter(ChannelAdapter):
 
     # ----------------- test_connection -----------------
 
-    async def test_connection(self) -> dict:
+    async def test_connection(self, **kwargs) -> dict:
         if not self._is_configured():
             return {"connected": False, "message": _UNCONFIGURED_MSG}
         try:
             client = await self._get_client()
             resp = await client.get("/getMe")
-            try:
-                body = resp.json()
-            except Exception:
-                body = {"raw": resp.text}
+            body = checked_json(resp)
             if body.get("ok"):
                 result = body.get("result", {}) or {}
                 return {
                     "connected": True,
+                    "verification_level": "authenticated",
                     "message": f"Telegram Bot @{result.get('username', '?')} 鉴权通过",
                 }
             return {

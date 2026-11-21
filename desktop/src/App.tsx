@@ -15,11 +15,13 @@ import { Loader2 } from "lucide-react";
 import { sendWorkforceHeartbeat } from "./api/workforce";
 import {
   claimAutoReplyJobs,
+  flushNativeCompletions,
   reportAutoReplyResult,
   sendMessage,
   syncInboxMessages,
   type AutoReplyJob,
 } from "./api/messages";
+import { currentAccountKey } from "./api/client";
 import { ROUTER_BASENAME } from "./utils/routing";
 
 /* 路由级代码分割：除登录页外的页面按需懒加载，显著减小首屏 bundle。
@@ -168,12 +170,16 @@ function WorkforcePresenceBridge() {
 
 function AutoReplyBridge() {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
+  const actorId = useAuthStore((s) => s.user?.id);
+  const teamId = useAuthStore((s) => s.user?.team_id);
 
   useEffect(() => {
     const isDesktop = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-    if (!isAuthenticated || !isDesktop) return;
+    const accountKey = currentAccountKey();
+    if (!isAuthenticated || !isDesktop || !accountKey) return;
     let disposed = false;
     let running = false;
+    const isCurrent = () => !disposed && currentAccountKey() === accountKey;
 
     const unwrapJobs = (response: any): AutoReplyJob[] => {
       const payload = response?.data?.data ?? response?.data ?? response;
@@ -181,14 +187,17 @@ function AutoReplyBridge() {
     };
 
     const processQueue = async () => {
-      if (disposed || running) return;
+      if (!isCurrent() || running) return;
       running = true;
       try {
         // 新消息先落库并创建幂等任务；另一个全局未读轮询可并行运行。
-        await syncInboxMessages("douyin", 50).catch(() => undefined);
-        const jobs = unwrapJobs(await claimAutoReplyJobs(3));
+        await flushNativeCompletions(accountKey);
+        if (!isCurrent()) return;
+        await syncInboxMessages("douyin", 50, accountKey).catch(() => undefined);
+        if (!isCurrent()) return;
+        const jobs = unwrapJobs(await claimAutoReplyJobs(3, accountKey));
         for (const job of jobs) {
-          if (disposed) break;
+          if (!isCurrent()) break;
           try {
             const sent: any = await sendMessage(
               job.customer_id,
@@ -196,20 +205,27 @@ function AutoReplyBridge() {
               job.contact_id,
               job.reply_content,
               job.contact_name,
-              { autoReplyInboundId: job.inbound_message_id },
+              { autoReplyInboundId: job.inbound_message_id, leaseToken: job.lease_token,
+                clientRequestId: job.delivery_key, expectedAccount: accountKey },
             );
+            if (!isCurrent()) break;
             await reportAutoReplyResult({
               inbound_message_id: job.inbound_message_id,
+              lease_token: job.lease_token,
+              delivery_key: job.delivery_key,
               success: true,
               outbound_message_id: String(sent?.message_id || ""),
-            }).catch(() => undefined);
+            }, accountKey).catch(() => undefined);
           } catch (reason) {
+            if (!isCurrent()) break;
             const error = reason instanceof Error ? reason.message : String(reason || "自动回复发送失败");
             await reportAutoReplyResult({
               inbound_message_id: job.inbound_message_id,
+              lease_token: job.lease_token,
+              delivery_key: job.delivery_key,
               success: false,
               error,
-            }).catch(() => undefined);
+            }, accountKey).catch(() => undefined);
           }
         }
       } catch {
@@ -225,7 +241,7 @@ function AutoReplyBridge() {
       disposed = true;
       window.clearInterval(timer);
     };
-  }, [isAuthenticated]);
+  }, [isAuthenticated, actorId, teamId]);
 
   return null;
 }

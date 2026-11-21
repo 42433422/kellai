@@ -3,7 +3,7 @@
 为各渠道适配器（企微 / 微信 / 抖音 / 短信 / 小程序）提供：
 - 异步 HTTP 调用（httpx.AsyncClient）
 - access_token 缓存（线程安全，自动过期刷新）
-- 指数退避重试
+- 安全只读请求指数退避重试；发送请求不盲目重试
 - 统一错误码 → 异常
 """
 from __future__ import annotations
@@ -22,11 +22,36 @@ logger = logging.getLogger(__name__)
 class ChannelHTTPError(RuntimeError):
     """渠道 HTTP 调用错误。"""
 
-    def __init__(self, message: str, *, status_code: int = 0, errcode: int = 0, errmsg: str = "") -> None:
+    def __init__(self, message: str, *, status_code: int = 0, errcode: int = 0, errmsg: str = "",
+                 delivery_state: str | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.errcode = errcode
         self.errmsg = errmsg
+        self.delivery_state = delivery_state or ("unknown" if status_code == 0 or status_code >= 500 else "failed")
+
+
+def checked_json(response: httpx.Response) -> dict[str, Any]:
+    """Reject HTTP errors and malformed responses before interpreting provider fields."""
+    if not 200 <= response.status_code < 300:
+        raise ChannelHTTPError(f"渠道 HTTP {response.status_code}", status_code=response.status_code)
+    try:
+        body = response.json()
+    except (ValueError, TypeError) as exc:
+        raise ChannelHTTPError("渠道响应不是有效 JSON，发送结果未知", delivery_state="unknown") from exc
+    if not isinstance(body, dict):
+        raise ChannelHTTPError("渠道响应格式错误，发送结果未知", delivery_state="unknown")
+    return body
+
+
+def send_error(error: Exception | str, *, definitely_not_sent: bool = False) -> dict[str, Any]:
+    """Do not turn a transport failure into permission to automatically send again."""
+    if isinstance(error, ChannelHTTPError):
+        definitely_not_sent = error.delivery_state == "failed"
+    message = f"渠道网络异常 ({type(error).__name__})" if isinstance(error, httpx.TransportError) else str(error)
+    return {"success": False, "message_id": "", "error": message,
+            "delivery_state": "failed" if definitely_not_sent else "unknown",
+            "definitely_not_sent": definitely_not_sent, "retryable": False}
 
 
 class TokenBucket:
@@ -133,76 +158,41 @@ class BaseChannelClient:
         headers: Optional[Mapping[str, str]] = None,
         expect_json: bool = True,
     ) -> Any:
-        """发起 HTTP 请求，统一处理鉴权/重试/限流。"""
+        """Retry only safe reads; a timed-out mutation may already have been sent."""
         await self._bucket.acquire()
-        merged: dict[str, str] = dict(await self._auth_headers())
-        if headers:
-            merged.update({str(k): str(v) for k, v in headers.items()})
-
-        last_exc: Exception | None = None
-        for attempt in range(self._max_retries + 1):
+        retries = self._max_retries if method.upper() in {"GET", "HEAD", "OPTIONS"} else 0
+        for attempt in range(retries + 1):
             try:
+                merged = dict(await self._auth_headers())
+                merged.update({str(k): str(v) for k, v in (headers or {}).items()})
                 client = await self._get_client()
-                resp = await client.request(
-                    method,
-                    path,
-                    params=params,
-                    json=json,
-                    data=data,
-                    headers=merged,
-                )
-                if resp.status_code >= 500 and attempt < self._max_retries:
-                    logger.warning(
-                        "%s %s -> %s, retry %d/%d",
-                        method, path, resp.status_code, attempt + 1, self._max_retries,
-                    )
+                resp = await client.request(method, path, params=params, json=json, data=data, headers=merged)
+                if resp.status_code >= 500 and attempt < retries:
                     await asyncio.sleep(0.3 * (2 ** attempt))
                     continue
-
-                if expect_json:
-                    try:
-                        body = resp.json()
-                    except Exception:
-                        body = {"raw": resp.text}
-
-                    # 微信 / 企微风格 errcode 判断
-                    errcode = 0
-                    if isinstance(body, dict):
-                        errcode = int(body.get("errcode", 0) or 0)
-                    if errcode and errcode != 0:
-                        # 40001/42001: access_token 失效 → 重试一次（让 token 缓存失效后刷新）
-                        if errcode in (40001, 42001, 40014) and attempt < self._max_retries:
-                            await self._on_token_invalid()
-                            continue
-                        raise ChannelHTTPError(
-                            f"{method} {path} errcode={errcode}: {body.get('errmsg', '')}",
-                            status_code=resp.status_code,
-                            errcode=errcode,
-                            errmsg=str(body.get("errmsg", "")),
-                        )
-                    if resp.status_code >= 400:
-                        raise ChannelHTTPError(
-                            f"{method} {path} HTTP {resp.status_code}: {body}",
-                            status_code=resp.status_code,
-                        )
-                    return body
-                else:
-                    if resp.status_code >= 400:
-                        raise ChannelHTTPError(
-                            f"{method} {path} HTTP {resp.status_code}: {resp.text[:200]}",
-                            status_code=resp.status_code,
-                        )
+                if not expect_json:
+                    if not 200 <= resp.status_code < 300:
+                        raise ChannelHTTPError(f"HTTP {resp.status_code}", status_code=resp.status_code)
                     return resp.text
-            except (httpx.TimeoutException, httpx.NetworkError) as exc:
-                last_exc = exc
-                if attempt < self._max_retries:
-                    logger.warning("%s %s net error: %s, retry %d", method, path, exc, attempt + 1)
+                body = checked_json(resp)
+                errcode = int(body.get("errcode", 0) or 0)
+                if errcode:
+                    if errcode in (40001, 42001, 40014):
+                        # Clear for the next request. Retrying this request would reuse
+                        # the stale token already embedded in params.
+                        await self._on_token_invalid()
+                    raise ChannelHTTPError(
+                        f"渠道拒绝请求: errcode={errcode} {body.get('errmsg', '')}",
+                        status_code=resp.status_code, errcode=errcode,
+                        errmsg=str(body.get("errmsg", "")), delivery_state="failed",
+                    )
+                return body
+            except httpx.TransportError as exc:
+                if attempt < retries:
                     await asyncio.sleep(0.3 * (2 ** attempt))
                     continue
-                raise ChannelHTTPError(f"{method} {path} 网络异常: {exc}") from exc
-        if last_exc:
-            raise ChannelHTTPError(f"{method} {path} 重试耗尽: {last_exc}") from last_exc
-        raise ChannelHTTPError(f"{method} {path} 未知错误")  # pragma: no cover
+                raise ChannelHTTPError(f"渠道网络异常 ({type(exc).__name__})", delivery_state="unknown") from exc
+        raise ChannelHTTPError("渠道请求未完成", delivery_state="unknown")  # pragma: no cover
 
     async def _on_token_invalid(self) -> None:
         """token 失效时的回调（子类可重写以清缓存）。"""

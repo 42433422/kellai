@@ -39,6 +39,10 @@ DOUYIN_BRIDGE_KEYCHAIN_SERVICE = "com.kellai.douyin-bridge"
 class DouyinChannelError(RuntimeError):
     """可安全返回给客户端的抖音渠道错误。"""
 
+    def __init__(self, message: str, *, definitely_not_sent: bool = False):
+        super().__init__(message)
+        self.definitely_not_sent = definitely_not_sent
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -54,44 +58,49 @@ def _channel_field(key: str) -> str:
     return get_field("douyin", key)
 
 
+def _platform_application_allowed() -> bool:
+    """Shared OAuth app credentials are service-owned only on an enabled bridge."""
+    from app.channels.config_store import environment_config_allowed
+    return bridge_server_enabled() or environment_config_allowed()
+
+
+def _application_field(keys: tuple[str, ...], env_names: tuple[str, ...], stored_key: str,
+                       *, include_stored: bool = True) -> str:
+    from app.channels.config_store import get as get_channel_config
+    saved = get_channel_config("douyin")
+    config = {**saved, **(saved.get("config") or {})}
+    # An explicit empty alias revokes that tenant's override; never resurrect it
+    # from a server environment variable or the global application table.
+    for key in keys:
+        if key in config:
+            return str(config[key] or "")
+    if not _platform_application_allowed():
+        return ""
+    for name in env_names:
+        value = _env(name)
+        if value:
+            return value
+    return str(_stored_app_config().get(stored_key) or "") if include_stored else ""
+
+
 def client_key() -> str:
-    return (
-        _channel_field("client_key")
-        or _channel_field("app_id")
-        or _env("KELLAI_DOUYIN_CLIENT_KEY")
-        or _env("KELLAI_DOUYIN_APP_ID")
-        or str(_stored_app_config().get("client_key") or "")
-    )
+    return _application_field(("app_id", "client_key"),
+                              ("KELLAI_DOUYIN_CLIENT_KEY", "KELLAI_DOUYIN_APP_ID"), "client_key")
 
 
 def client_secret() -> str:
-    return (
-        _channel_field("client_secret")
-        or _channel_field("app_secret")
-        or _env("KELLAI_DOUYIN_CLIENT_SECRET")
-        or _env("KELLAI_DOUYIN_APP_SECRET")
-        or str(_stored_app_config().get("client_secret") or "")
-    )
+    return _application_field(("app_secret", "client_secret"),
+                              ("KELLAI_DOUYIN_CLIENT_SECRET", "KELLAI_DOUYIN_APP_SECRET"), "client_secret")
 
 
 def miniapp_app_id() -> str:
-    return (
-        _channel_field("miniapp_app_id")
-        or _channel_field("miniapp_appid")
-        or _env("KELLAI_DOUYIN_MINIAPP_APP_ID")
-        or _env("KELLAI_DOUYIN_MINIAPP_APPID")
-        or str(_stored_app_config().get("miniapp_app_id") or "")
-    )
+    return _application_field(("miniapp_app_id", "miniapp_appid"),
+                              ("KELLAI_DOUYIN_MINIAPP_APP_ID", "KELLAI_DOUYIN_MINIAPP_APPID"), "miniapp_app_id")
 
 
 def miniapp_secret() -> str:
-    return (
-        _channel_field("miniapp_secret")
-        or _channel_field("miniapp_app_secret")
-        or _env("KELLAI_DOUYIN_MINIAPP_SECRET")
-        or _env("KELLAI_DOUYIN_MINIAPP_APP_SECRET")
-        or str(_stored_app_config().get("miniapp_secret") or "")
-    )
+    return _application_field(("miniapp_secret", "miniapp_app_secret"),
+                              ("KELLAI_DOUYIN_MINIAPP_SECRET", "KELLAI_DOUYIN_MINIAPP_APP_SECRET"), "miniapp_secret")
 
 
 def oauth_scopes() -> str:
@@ -217,10 +226,11 @@ async def _remote_bridge_request(
     *,
     params: dict[str, Any] | None = None,
     payload: dict[str, Any] | None = None,
+    allow_failed_result: bool = False,
 ) -> dict[str, Any]:
     cfg = remote_bridge_config()
     if not cfg["base_url"] or not cfg["bridge_key"]:
-        raise DouyinChannelError("抖音远端服务未配置")
+        raise DouyinChannelError("抖音远端服务未配置", definitely_not_sent=True)
     url = f"{cfg['base_url']}/api/kellai/internal/douyin/{path.lstrip('/')}"
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
@@ -236,12 +246,18 @@ async def _remote_bridge_request(
     try:
         body = response.json()
     except Exception as exc:
-        raise DouyinChannelError(f"抖音远端服务返回非 JSON：HTTP {response.status_code}") from exc
-    if response.status_code >= 400 or body.get("success") is False:
+        raise DouyinChannelError(f"抖音远端服务返回非 JSON：HTTP {response.status_code}",
+                                 definitely_not_sent=400 <= response.status_code < 500) from exc
+    if not isinstance(body, dict):
+        raise DouyinChannelError("抖音远端服务响应格式无效")
+    if response.status_code >= 400 or (body.get("success") is False and not allow_failed_result):
         detail = body.get("detail") if isinstance(body.get("detail"), dict) else {}
         raise DouyinChannelError(
-            str(body.get("error") or body.get("message") or detail.get("message") or response.status_code)
+            str(body.get("error") or body.get("message") or detail.get("message") or response.status_code),
+            definitely_not_sent=400 <= response.status_code < 500,
         )
+    if not 200 <= response.status_code < 300:
+        raise DouyinChannelError("抖音远端服务没有返回成功 HTTP 确认")
     data = body.get("data", body)
     return data if isinstance(data, dict) else {"data": data}
 
@@ -300,22 +316,47 @@ async def remote_send_message(
     team_id: int,
     contact_id: str,
     content: str,
+    idempotency_key: str,
     persona_id: str = "",
     customer_id: int = 0,
     reply_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return await _remote_bridge_request(
-        "POST",
-        "messages/send",
-        payload={
-            "team_id": int(team_id),
-            "contact_id": contact_id,
-            "content": content,
-            "persona_id": persona_id,
-            "customer_id": int(customer_id or 0),
-            "reply_context": dict(reply_context or {}),
-        },
+    from app.channels.http_client import send_error
+    request_id = str(idempotency_key or "").strip()
+    if not request_id:
+        return send_error("抖音远端发送缺少幂等请求ID", definitely_not_sent=True)
+    try:
+        data = await _remote_bridge_request(
+            "POST", "messages/send", allow_failed_result=True,
+            payload={
+                "team_id": int(team_id), "contact_id": contact_id, "content": content,
+                "client_request_id": request_id, "persona_id": persona_id,
+                "customer_id": int(customer_id or 0), "reply_context": dict(reply_context or {}),
+            },
+        )
+    except DouyinChannelError as exc:
+        return send_error(exc, definitely_not_sent=exc.definitely_not_sent)
+    receipt = data.get("receipt")
+    if (not isinstance(receipt, dict) or receipt.get("request_id") != request_id
+            or receipt.get("status") not in {"accepted", "failed", "unknown", "sending"}):
+        return send_error("抖音远端未返回匹配的发送账本，结果未知")
+    if not isinstance(receipt.get("channel_result"), dict):
+        return send_error("抖音远端发送账本缺少平台结果，结果未知")
+    result = dict(receipt["channel_result"])
+    accepted = receipt.get("status") == "accepted" and receipt.get("success") is True
+    provider_state = str(receipt.get("provider_state") or "unknown")
+    if accepted and provider_state not in {"accepted", "sent", "delivered", "read"}:
+        return send_error("抖音远端发送状态不一致，结果未知")
+    if accepted and not receipt.get("provider_message_id"):
+        return send_error("抖音远端缺少平台消息ID，结果未知")
+    result.update(
+        success=accepted, message_id=str(receipt.get("provider_message_id") or ""),
+        delivery_state=provider_state if accepted else ("failed" if receipt["status"] == "failed" else "unknown"),
+        definitely_not_sent=not accepted and receipt["status"] == "failed",
+        error=str(receipt.get("error") or result.get("error") or ""), retryable=False,
+        remote_request_id=request_id,
     )
+    return result
 
 
 async def remote_pull_inbox(team_id: int, *, limit: int = 50) -> list[dict[str, Any]]:
@@ -362,10 +403,9 @@ def _fernet() -> Fernet:
         _env("KELLAI_DOUYIN_STORAGE_KEY")
         or _env("KELLAI_DOUYIN_BRIDGE_KEY")
         or _env("KELLAI_WECOM_BRIDGE_KEY")
-        or _channel_field("client_secret")
-        or _channel_field("app_secret")
-        or _env("KELLAI_DOUYIN_CLIENT_SECRET")
-        or _env("KELLAI_DOUYIN_APP_SECRET")
+        or _application_field(("app_secret", "client_secret"),
+                              ("KELLAI_DOUYIN_CLIENT_SECRET", "KELLAI_DOUYIN_APP_SECRET"),
+                              "client_secret", include_stored=False)
     )
     if not seed:
         raise DouyinChannelError("缺少 KELLAI_DOUYIN_STORAGE_KEY 或抖音 Client Secret")
@@ -476,6 +516,8 @@ def _conn() -> Iterator[sqlite3.Connection]:
 
 
 def _stored_app_config() -> dict[str, str]:
+    if not _platform_application_allowed():
+        return {}
     ensure_schema()
     with sqlite3.connect(str(_crm_db_path()), timeout=10.0) as conn:
         conn.row_factory = sqlite3.Row
@@ -503,6 +545,8 @@ def save_app_config(
     next_miniapp_app_id: str = "",
     next_miniapp_secret: str = "",
 ) -> dict[str, Any]:
+    if not _platform_application_allowed():
+        raise DouyinChannelError("当前团队无权使用或覆盖服务级抖音应用凭据")
     current = _stored_app_config()
     clean_key = str(next_client_key or current.get("client_key") or "").strip()
     clean_secret = str(next_client_secret or current.get("client_secret") or "").strip()
@@ -604,6 +648,8 @@ async def save_app_config_verified(
     next_miniapp_app_id: str = "",
     next_miniapp_secret: str = "",
 ) -> dict[str, Any]:
+    if not _platform_application_allowed():
+        raise DouyinChannelError("当前团队无权使用或覆盖服务级抖音应用凭据")
     current = _stored_app_config()
     candidate_key = str(next_client_key or current.get("client_key") or "").strip()
     candidate_secret = str(next_client_secret or current.get("client_secret") or "").strip()
