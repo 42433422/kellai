@@ -225,6 +225,80 @@ def test_xcmax_explicit_scope_uses_same_ledger_and_revocation(product):
     assert len(product.calls) == 1
 
 
+def test_xcmax_original_message_readback_survives_recent_history_window(product):
+    response = product.client.post("/api/kellai/messages/send", json=product.body, headers=product.headers[0])
+    assert response.status_code == 200, response.text
+    message_id = response.json()["data"]["message_id"]
+    headers = _binding(product, ["customer_conversations.read"])
+    team_id = int(product.accounts[0]["user"]["team_id"])
+    newer = datetime.now(timezone.utc)
+    # Seed a busy real message table without dispatching 101 more external sends.
+    with tenant_scope(team_id), message_store._connect() as conn:
+        conn.executemany(
+            "INSERT INTO kellai_messages "
+            "(team_id, id, customer_id, channel_type, contact_id, direction, content, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [(team_id, f"newer-{i}", product.customers[0], "telegram", "stable-chat", "inbound",
+              f"new message {i}", (newer + timedelta(seconds=i + 1)).isoformat()) for i in range(101)],
+        )
+    path = f"/api/kellai/integrations/xcmax/customers/{product.customers[0]}/conversations"
+    recent = product.client.get(path, params={"limit": 1000}, headers=headers).json()["data"]["messages"]
+    assert len(recent) == 100 and all(row["id"] != message_id for row in recent)
+    original = product.client.get(path, params={"message_id": message_id, "limit": 1}, headers=headers)
+    assert original.status_code == 200, original.text
+    rows = original.json()["data"]["messages"]
+    assert len(rows) == 1 and rows[0]["id"] == message_id
+    assert rows[0]["content"] == product.body["content"]
+    assert rows[0]["metadata"]["delivery_request_id"] == product.body["client_request_id"]
+    assert len(product.calls) == 1
+
+
+@pytest.mark.parametrize("other_scope", ["tenant", "customer"])
+def test_xcmax_message_identity_cannot_replace_tenant_or_customer_scope(product, other_scope):
+    from app.channels.base import UnifiedMessage
+    from app.services.pipeline import create_customer, save_pipeline
+
+    headers = _binding(product, ["customer_conversations.read"])
+    account = product.accounts[1 if other_scope == "tenant" else 0]
+    team_id = int(account["user"]["team_id"])
+    with tenant_scope(team_id):
+        customer_id = product.customers[1]
+        if other_scope == "tenant":
+            assert customer_id == product.customers[0]
+        else:
+            customer = create_customer({"name": "other customer"})
+            save_pipeline(customer)
+            customer_id = int(customer["customer_id"])
+            assert customer_id != product.customers[0]
+        message_store.save_message(UnifiedMessage(
+            id="scoped-original", customer_id=customer_id, channel_type="telegram",
+            contact_id="private-recipient", contact_name="other scope", direction="outbound",
+            content="private other scope",
+            metadata={"team_id": team_id}, created_at=datetime.now(timezone.utc).isoformat(),
+        ))
+    path = f"/api/kellai/integrations/xcmax/customers/{product.customers[0]}/conversations"
+    for message_id in ("scoped-original", "' OR 1=1 --"):
+        response = product.client.get(path, params={"message_id": message_id}, headers=headers)
+        assert response.status_code == 200, response.text
+        assert response.json()["data"]["messages"] == []
+    assert not product.calls
+
+
+def test_xcmax_exact_message_read_requires_original_scope_and_active_binding(product):
+    path = f"/api/kellai/integrations/xcmax/customers/{product.customers[0]}/conversations"
+    query = {"message_id": "scoped-original"}
+    headers = _binding(product, ["customer_profiles.read"])
+    assert product.client.get(path, params=query, headers=headers).status_code == 403
+    headers = _binding(product, ["customer_conversations.read"])
+    assert product.client.get(path, params=query, headers=headers).status_code == 200
+    from app.services import xcmax_integration
+
+    with tenant_scope(int(product.accounts[0]["user"]["team_id"])):
+        xcmax_integration._write({"connection": None})
+    assert product.client.get(path, params=query, headers=headers).status_code == 401
+    assert not product.calls
+
+
 def test_pairing_token_is_not_a_remote_api_key(product):
     headers = _binding(product, ["channels.read", "messages.send"])
     remote = TestClient(product.main.create_app(), client=("198.51.100.22", 50001))

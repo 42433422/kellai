@@ -375,6 +375,7 @@ def get_messages_with_state(
     since: str = "",
     *,
     team_id: int | None = None,
+    message_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """获取消息列表，包含前端闭环展示需要的 read/customer/stage/intent 字段。"""
     ensure_messages_schema()
@@ -382,6 +383,11 @@ def get_messages_with_state(
         resolved_team_id = _effective_team_id(team_id)
         clauses: list[str] = ["team_id = ?", "customer_id = ?"]
         params: list[Any] = [resolved_team_id, int(customer_id)]
+        if message_id is not None:
+            # Original receipts must remain readable beyond the recent window.
+            # The message identity narrows, never replaces, tenant/customer scope.
+            clauses.append("id = ?")
+            params.append(message_id)
         if channel_type:
             clauses.append("channel_type = ?")
             params.append(channel_type)
