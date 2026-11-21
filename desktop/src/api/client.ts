@@ -69,10 +69,12 @@ if (mockModeEnabled) {
  */
 declare module "axios" {
   export interface AxiosRequestConfig {
+    expectedAccount?: string;
     skipLoading?: boolean;
     skipErrorToast?: boolean;
   }
   export interface InternalAxiosRequestConfig {
+    expectedAccount?: string;
     skipLoading?: boolean;
     skipErrorToast?: boolean;
   }
@@ -85,7 +87,11 @@ const REFRESH_TOKEN_KEY = "auth_refresh_token";
 const USER_KEY = "auth_user";
 
 /** 防止多个 401 并发刷新：同一时刻只允许一个刷新请求 */
-let refreshingPromise: Promise<string | null> | null = null;
+let activeRefresh: {
+  account: string;
+  token: string;
+  promise: Promise<string | null>;
+} | null = null;
 type LoadingRequestConfig = InternalAxiosRequestConfig & {
   __retried?: boolean;
   __loadingId?: string;
@@ -108,9 +114,8 @@ function clearRequestLoading(config?: LoadingRequestConfig) {
  * 尝试用 refresh_token 换取新的 access_token
  * 返回新 token；失败返回 null
  */
-async function refreshAccessToken(): Promise<string | null> {
-  const refreshToken = localStorage.getItem(REFRESH_TOKEN_KEY);
-  if (!refreshToken) return null;
+async function refreshAccessToken(account: string, refreshToken: string): Promise<string | null> {
+  if (!refreshToken || account !== currentAccountKey()) return null;
 
   try {
     // 注意：此处使用裸 axios 避免触发拦截器递归
@@ -121,6 +126,7 @@ async function refreshAccessToken(): Promise<string | null> {
     // 后端直接返回 flat 格式：{ success, access_token, refresh_token, ... }
     const newToken = response.data?.access_token;
     const newRefresh = response.data?.refresh_token;
+    if (account !== currentAccountKey() || localStorage.getItem(REFRESH_TOKEN_KEY) !== refreshToken) return null;
     if (newToken) {
       localStorage.setItem(TOKEN_KEY, newToken);
       if (newRefresh) localStorage.setItem(REFRESH_TOKEN_KEY, newRefresh);
@@ -151,12 +157,30 @@ function redirectToLogin() {
  * 1. 自动注入 Authorization: Bearer <token>
  * 2. 非 GET 请求且未显式 skipLoading 时弹出 loading toast
  */
+export function currentAccountKey(): string {
+  try {
+    const user = JSON.parse(localStorage.getItem("auth_user") || "null");
+    return user?.id && user?.team_id ? `${user.team_id}:${user.id}` : "";
+  } catch { return ""; }
+}
+
+function accountChanged(config?: { expectedAccount?: string }): boolean {
+  return config?.expectedAccount !== undefined && config.expectedAccount !== currentAccountKey();
+}
+
+function bindRequestAccount(config: InternalAxiosRequestConfig) {
+  // Capture every request, including Settings and loopback pairing calls. A
+  // delayed 401 must never replay an old account's body with a new account's JWT.
+  config.expectedAccount ??= currentAccountKey();
+  if (accountChanged(config)) throw new Error("账号已切换，旧账号操作已停止");
+  const token = localStorage.getItem(TOKEN_KEY);
+  if (token && config.headers) config.headers.Authorization = `Bearer ${token}`;
+  return config;
+}
+
 client.interceptors.request.use(
   (config: InternalAxiosRequestConfig) => {
-    const token = localStorage.getItem(TOKEN_KEY);
-    if (token && config.headers) {
-      config.headers.Authorization = `Bearer ${token}`;
-    }
+    bindRequestAccount(config);
 
     // 仅对写操作（POST/PUT/PATCH/DELETE）显示 loading
     const method = (config.method || "get").toLowerCase();
@@ -175,12 +199,10 @@ client.interceptors.request.use(
   (error) => Promise.reject(error)
 );
 
-loopbackClient.interceptors.request.use((config: InternalAxiosRequestConfig) => {
-  const token = localStorage.getItem(TOKEN_KEY);
-  if (token && config.headers) {
-    config.headers.Authorization = `Bearer ${token}`;
-  }
-  return config;
+loopbackClient.interceptors.request.use(bindRequestAccount);
+loopbackClient.interceptors.response.use((response) => {
+  if (accountChanged(response.config)) throw new Error("账号已切换，旧账号结果已忽略");
+  return response;
 });
 
 /**
@@ -192,6 +214,7 @@ loopbackClient.interceptors.request.use((config: InternalAxiosRequestConfig) => 
 client.interceptors.response.use(
   (response) => {
     clearRequestLoading(response.config as LoadingRequestConfig);
+    if (accountChanged(response.config)) throw new Error("账号已切换，旧账号结果已忽略");
     return response;
   },
   async (error: AxiosError<ApiResponse<unknown>>) => {
@@ -199,6 +222,7 @@ client.interceptors.response.use(
 
     // 关闭 loading toast
     clearRequestLoading(originalConfig);
+    if (accountChanged(originalConfig)) return Promise.reject(error);
 
     const status = error.response?.status;
 
@@ -217,12 +241,19 @@ client.interceptors.response.use(
       }
 
       // 并发复用：避免多个 401 触发多次 refresh
-      if (!refreshingPromise) {
-        refreshingPromise = refreshAccessToken().finally(() => {
-          refreshingPromise = null;
-        });
+      const account = currentAccountKey();
+      const refreshToken = localStorage.getItem(REFRESH_TOKEN_KEY) || "";
+      if (!activeRefresh || activeRefresh.account !== account || activeRefresh.token !== refreshToken) {
+        const refresh = { account, token: refreshToken,
+          promise: refreshAccessToken(account, refreshToken) };
+        activeRefresh = refresh;
+        void refresh.promise.finally(() => { if (activeRefresh === refresh) activeRefresh = null; });
       }
-      const newToken = await refreshingPromise;
+      const newToken = await activeRefresh.promise;
+
+      if (accountChanged(originalConfig)) {
+        return Promise.reject(error);
+      }
 
       if (newToken && originalConfig.headers) {
         originalConfig.headers.Authorization = `Bearer ${newToken}`;
@@ -256,6 +287,13 @@ function extractErrorMessage(error: AxiosError<ApiResponse<unknown>>): string {
   const data = error.response?.data;
   if (data && typeof data === "object" && typeof data.message === "string" && data.message) {
     return data.message;
+  }
+  if (data && typeof data === "object" && "detail" in data) {
+    const detail = (data as { detail?: unknown }).detail;
+    if (typeof detail === "string") return detail;
+    if (detail && typeof detail === "object" && "message" in detail && typeof detail.message === "string") {
+      return detail.message;
+    }
   }
   // HTTP 状态码兜底
   if (error.response?.status) {

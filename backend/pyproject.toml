@@ -18,6 +18,12 @@ dependencies = [
 [project.scripts]
 kellai = "app.main:run"
 
+[dependency-groups]
+test = ["pytest==9.2.0", "pytest-asyncio==1.5.0"]
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"

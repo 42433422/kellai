@@ -15,7 +15,7 @@ import {
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import ChannelLogo, { CHANNEL_BRAND_COLOR } from '../components/ChannelLogo';
-import { getMessages, sendMessage, suggestReply, getChannels } from '../api/messages';
+import { getMessages, sendMessage, suggestReply, getChannels, getDeliveryReceipt, deliveryLabel, MessageSendError, type DeliveryReceipt } from '../api/messages';
 import { updatePipelineStage } from '../api/funnel';
 import { getScriptHint } from '../api/sales';
 import { useApiQuery, useApiMutation, useQueryClient } from '../hooks/useApiQuery';
@@ -26,6 +26,7 @@ import { toastStore } from '../stores/toast';
 import ScriptHintToast from '../components/ScriptHintToast';
 import { useTextToSpeech } from '../hooks/useTextToSpeech';
 import { unwrapApiResponse } from '../utils/format';
+import { currentAccountKey } from '../api/client';
 import type { SalesScriptHint } from '../types';
 import {
   assignCustomer,
@@ -92,6 +93,9 @@ interface ChannelItem {
   id: string;
   name: string;
   type: string;
+  enabled: boolean;
+  connected: boolean;
+  capabilities?: { send: boolean; receive: boolean; message_types?: string[]; limitations?: string[] };
 }
 
 /** 阶段标签颜色映射（与 Dashboard/Format 统一） */
@@ -331,6 +335,7 @@ export default function Messages() {
   // 输入区状态
   const [inputText, setInputText] = useState('');
   const [selectedChannel, setSelectedChannel] = useState('wework');
+  const [deliveryNotice, setDeliveryNotice] = useState<DeliveryReceipt | null>(null);
   const [selectedAssigneeId, setSelectedAssigneeId] = useState<number>(0);
   const [assignmentUpdating, setAssignmentUpdating] = useState(false);
 
@@ -382,7 +387,7 @@ export default function Messages() {
     data: messagesRaw = [],
     isLoading: loading,
   } = useApiQuery<MessageItem[]>(
-    ['messages', 'list'],
+    ['messages', 'list', currentUser?.team_id, currentUser?.id],
     async () => {
       const res = await getMessages({ limit: 50 });
       const data = unwrapApiResponse<MessageItem[] | { messages: MessageItem[] }>(res);
@@ -401,7 +406,7 @@ export default function Messages() {
 
   // 渠道列表（一次性拉取，无需轮询）
   const { data: channelsRaw = [] } = useApiQuery<ChannelItem[]>(
-    ['messages', 'channels'],
+    ['messages', 'channels', currentUser?.team_id, currentUser?.id],
     async () => {
       const res = await getChannels();
       const data = unwrapApiResponse<ChannelItem[] | { channels: ChannelItem[] }>(res);
@@ -532,30 +537,36 @@ export default function Messages() {
 
   /* ---- 发送消息 Mutation ---- */
   const sendMutation = useApiMutation<
-    unknown,
-    { customerId: number; channel: string; contactId: string; content: string }
+    DeliveryReceipt,
+    { customerId: number; channel: string; contactId: string; contactName: string; content: string; accountKey: string }
   >(
     (vars) => sendMessage(
       vars.customerId,
       vars.channel,
       vars.contactId,
       vars.content,
-      selectedContact?.customerName ?? '',
+      vars.contactName,
     ),
     {
-      onSuccess: () => {
-        setInputText('');
-        setShowQuickReplies(false);
-        toastStore.success('消息已发送');
+      onSuccess: (receipt, vars) => {
+        if (currentAccountKey() !== vars.accountKey) return;
+        if (selectedContact?.customerId === vars.customerId) {
+          setInputText((value) => value.trim() === vars.content ? '' : value);
+          setDeliveryNotice(receipt);
+          setShowQuickReplies(false);
+        }
+        toastStore.success(deliveryLabel(receipt));
         // 立即拉取最新消息
         queryClient.invalidateQueries({ queryKey: ['messages', 'list'] });
         queryClient.invalidateQueries({ queryKey: ['funnel', 'data'] });
         queryClient.invalidateQueries({ queryKey: ['dashboard'] });
         void fetchUnread();
       },
-      onError: (error) => {
+      onError: (error, vars) => {
+        if (currentAccountKey() !== vars.accountKey || selectedContact?.customerId !== vars.customerId) return;
         // HTTP/网络错误由 axios 拦截器提示；HTTP 200 的业务失败需显式展示。
         if (error?.name === 'MessageSendError') {
+          setDeliveryNotice((error as unknown as MessageSendError).receipt || null);
           toastStore.error(error.message || '发送失败');
         }
       },
@@ -622,21 +633,32 @@ export default function Messages() {
 
   /** 发送消息 */
   const handleSend = useCallback(() => {
-    if (!selectedContact || !inputText.trim()) return;
+    if (!selectedContact || !inputText.trim() || sendMutation.isPending) return;
+    const capability = channelsRaw.find((channel) => channel.type === selectedChannel);
+    if (!capability?.enabled || !capability.connected || !capability.capabilities?.send || currentUser?.role === 'readonly') {
+      toastStore.error('当前渠道未具备已授权的发送能力');
+      return;
+    }
     if (selectedContact.isGroup && selectedChannel === 'douyin') {
       toastStore.error('抖音群消息已汇总；群内发送还需开放平台粉丝群发送能力');
       return;
     }
     const channelMessage = [...selectedContact.messages]
       .reverse()
-      .find((message) => message.channel_type === selectedChannel);
+      .find((message) => message.channel_type === selectedChannel && message.contact_id);
+    if (!channelMessage?.contact_id) {
+      toastStore.error('客户未绑定此渠道的联系人，请先同步该渠道');
+      return;
+    }
     sendMutation.mutate({
       customerId: selectedContact.customerId,
       channel: selectedChannel,
-      contactId: channelMessage?.contact_id ?? selectedContact.messages[0]?.contact_id ?? '',
+      contactId: channelMessage.contact_id,
+      contactName: selectedContact.customerName,
+      accountKey: currentAccountKey(),
       content: inputText.trim(),
     });
-  }, [selectedContact, inputText, selectedChannel, sendMutation]);
+  }, [selectedContact, inputText, selectedChannel, sendMutation, channelsRaw, currentUser?.role]);
 
   /** 键盘事件：Enter 发送，Shift+Enter 换行 */
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -700,7 +722,13 @@ export default function Messages() {
 
   const sending = sendMutation.isPending;
   const aiLoading = suggestMutation.isPending;
-  const canReplyCurrent = !(selectedContact?.isGroup && selectedChannel === 'douyin');
+  const selectedCapability = channelsRaw.find((channel) => channel.type === selectedChannel);
+  const canReplyCurrent = Boolean(selectedCapability?.enabled && selectedCapability?.connected
+    && selectedCapability?.capabilities?.send && currentUser?.role !== 'readonly'
+    && (!selectedCapability.capabilities.message_types || selectedCapability.capabilities.message_types.includes('text'))
+    && selectedContact?.messages.some((message) => message.channel_type === selectedChannel && message.contact_id)
+    && !(selectedContact?.isGroup && selectedChannel === 'douyin'));
+  useEffect(() => { setDeliveryNotice(null); }, [currentUser?.id, selectedContactId, selectedChannel]);
   const currentUserId = Number(currentUser?.id || 0);
   const nextStage = selectedContact ? getNextPipelineStage(selectedContact.stage) : null;
   const advancingStage = advanceStageMutation.isPending;
@@ -1042,6 +1070,16 @@ export default function Messages() {
                 </div>
               )}
 
+              {deliveryNotice && <div className="mb-2 flex items-center justify-between gap-3 rounded border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900" role="status">
+                <span>{deliveryLabel(deliveryNotice)}</span>
+                <button type="button" className="shrink-0 underline" onClick={async () => {
+                  const actor = currentAccountKey();
+                  try {
+                    const receipt = await getDeliveryReceipt(deliveryNotice.request_id, actor);
+                    if (currentAccountKey() === actor) setDeliveryNotice(receipt);
+                  } catch { toastStore.error('暂时无法读取回执，请稍后再查'); }
+                }}>查询回执</button>
+              </div>}
               <div className="flex items-end gap-3">
                 {/* 渠道选择 */}
                 <select
@@ -1050,17 +1088,11 @@ export default function Messages() {
                   className="shrink-0 rounded-lg border border-gray-200 bg-gray-50 px-2 py-2 text-xs text-gray-700 outline-none focus:border-blue-400 dark:border-slate-700 dark:bg-slate-700 dark:text-slate-200"
                   aria-label="选择发送渠道"
                 >
-                  {channelsRaw.length > 0
-                    ? channelsRaw.filter((ch) => ch.type !== 'web' && ch.type !== 'miniprogram').map((ch) => (
-                        <option key={ch.id} value={ch.type}>{CHANNEL_LABEL[ch.type] ?? ch.name}</option>
-                      ))
-                    : (
-                        <>
-                          <option value="wework">企微</option>
-                          <option value="sms">短信</option>
-                          <option value="email">邮件</option>
-                        </>
-                      )}
+                  {channelsRaw.length > 0 ? channelsRaw.map((ch) => (
+                    <option key={ch.id} value={ch.type} disabled={!ch.capabilities?.send}>
+                      {CHANNEL_LABEL[ch.type] ?? ch.name}{ch.capabilities?.send ? '' : ' · 暂不可发送'}
+                    </option>
+                  )) : <option value="">尚无已注册渠道</option>}
                 </select>
 
                 {/* 消息输入框 */}
@@ -1070,7 +1102,7 @@ export default function Messages() {
                     value={inputText}
                     onChange={(e) => setInputText(e.target.value)}
                     onKeyDown={handleKeyDown}
-                    placeholder={canReplyCurrent ? '输入消息，Enter 发送，Shift+Enter 换行...' : '抖音群消息暂为统一汇总只读'}
+                    placeholder={canReplyCurrent ? '输入消息，Enter 发送，Shift+Enter 换行...' : '当前账号、渠道或联系人尚不满足发送条件'}
                     aria-label="消息输入框"
                     rows={2}
                     disabled={!canReplyCurrent}

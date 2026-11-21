@@ -236,7 +236,11 @@ export interface Channel {
     | "jd"
     | "alibaba"
     | "telegram"
-    | "line";
+    | "line"
+    | "chatwoot";
+  connection_id?: string;
+  config_schema?: { required?: string[]; properties?: Record<string, { title?: string; writeOnly?: boolean }> };
+  capabilities?: { receive: boolean; send: boolean; contacts: boolean; sync: boolean; transport: string; readiness: string; receive_mode: string; limitations?: string[]; message_types?: string[]; live_verified?: boolean };
   config: Record<string, unknown>;
   enabled: boolean;
   connected: boolean;
@@ -805,7 +809,9 @@ export interface FlowTemplate {
   description: string;
   nodes: FlowNode[];
   edges: FlowEdge[];
-  automation_rate: number;
+  automation_rate: number | null;
+  is_example?: boolean;
+  execution_available?: false;
 }
 
 export interface FlowExecution {
@@ -843,6 +849,8 @@ export interface FlowDefinition {
   edges: FlowEdge[];
   created_at: string;
   updated_at: string;
+  status?: 'draft';
+  execution_available?: false;
 }
 
 // === v7 Finance ===

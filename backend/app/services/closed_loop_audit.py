@@ -1,4 +1,4 @@
-"""End-to-end closed-loop audit for Kellai core workflows."""
+"""Local implementation audit; external delivery needs separate provider evidence."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from app.api import content, finance, flow, open as open_api, sales, scout
 from app.channels.base import UnifiedMessage
 from app.services import ai_copilot
 from app.services.agent_assist import build_agent_assist
@@ -196,286 +195,45 @@ def _advanced_check_error(key: str, label: str, exc: Exception) -> dict[str, Any
 
 
 def _run_sales_revenue_loop(customer_id: int) -> dict[str, Any]:
-    label = "销售推进、报价、合同闭环"
-    try:
-        flow_doc = _data(sales.get_flow(customer_id))
-        progress: list[dict[str, Any]] = []
-        for _ in range(len(sales.STEPS) + 1):
-            flow_doc = _data(sales.auto_flow(sales.AutoFlowBody(customer_id=customer_id)))
-            progress.append(
-                {
-                    "current_step": flow_doc.get("current_step"),
-                    "status": flow_doc.get("status"),
-                    "win_probability": flow_doc.get("win_probability"),
-                }
-            )
-            if flow_doc.get("status") == "completed":
-                break
-        quote_doc = _data(sales.quote(sales.QuoteBody(customer_id=customer_id)))
-        contract_doc = _data(
-            sales.contract(
-                sales.ContractBody(customer_id=customer_id, quote_id=str(quote_doc.get("id") or ""))
-            )
-        )
-        ltv_doc = _data(sales.ltv(customer_id))
-        trace_doc = _data(sales.funnel_trace(customer_id))
-        passed = (
-            flow_doc.get("status") == "completed"
-            and float(quote_doc.get("total") or 0) > 0
-            and bool(str(contract_doc.get("sign_url") or "").strip())
-            and float(ltv_doc.get("predicted_ltv") or 0) > 0
-        )
-        return _item(
-            "sales_revenue_loop",
-            label,
-            passed,
-            details={
-                "flow_status": flow_doc.get("status"),
-                "current_step": flow_doc.get("current_step"),
-                "progress": progress,
-                "quote_id": quote_doc.get("id"),
-                "quote_total": quote_doc.get("total"),
-                "contract_id": contract_doc.get("id"),
-                "contract_status": contract_doc.get("status"),
-                "predicted_ltv": ltv_doc.get("predicted_ltv"),
-                "overall_conversion": trace_doc.get("overall_conversion"),
-            },
-        )
-    except Exception as exc:
-        return _advanced_check_error("sales_revenue_loop", label, exc)
+    return _item('sales_revenue_loop', '销售推进、报价、合同闭环', False, details={
+        "verification_level": "not_implemented", "live_verified": False,
+        "reason": 'api/sales.py 仍为内存演示状态与模板报价，未接真实订单、电子签章及回款凭据',
+    })
 
 
 def _run_content_growth_loop(audit_id: str) -> dict[str, Any]:
-    label = "内容生成、投放、数据闭环"
-    try:
-        topic = f"客来来 AI 获客闭环 {audit_id}"
-        text_doc = _data(content.generate_text(content.TopicBody(topic=topic, prompt="面向中小商家的获客短文")))
-        image_doc = _data(content.generate_image(content.TopicBody(topic=topic, prompt="AI 客服工作台海报")))
-        video_doc = _data(content.generate_video_script(content.TopicBody(topic=topic, prompt="30 秒成交闭环脚本")))
-        publish_doc = _data(
-            content.publish(
-                content.PublishBody(
-                    content_id=str(text_doc.get("id") or ""),
-                    platforms=["douyin", "wechat", "wework"],
-                )
-            )
-        )
-        analytics_doc = _data(content.analytics())
-        ad_doc = _data(content.ad_strategy())
-        ab_doc = _data(content.ab_test())
-        totals = analytics_doc.get("totals") if isinstance(analytics_doc.get("totals"), dict) else {}
-        passed = (
-            bool(text_doc.get("id"))
-            and bool(image_doc.get("image_url"))
-            and bool(str(video_doc.get("body") or "").strip())
-            and publish_doc.get("status") == "published"
-            and int(totals.get("conversions") or 0) >= 0
-            and bool(ad_doc.get("recommended_channels"))
-        )
-        return _item(
-            "content_growth_loop",
-            label,
-            passed,
-            details={
-                "content_id": text_doc.get("id"),
-                "image_id": image_doc.get("id"),
-                "video_script_id": video_doc.get("id"),
-                "publish_status": publish_doc.get("status"),
-                "platforms": publish_doc.get("platforms"),
-                "conversions": totals.get("conversions"),
-                "ad_channels": ad_doc.get("recommended_channels"),
-                "ab_test_id": ab_doc.get("id"),
-            },
-        )
-    except Exception as exc:
-        return _advanced_check_error("content_growth_loop", label, exc)
+    return _item('content_growth_loop', '内容生成、投放、数据闭环', False, details={
+        "verification_level": "not_implemented", "live_verified": False,
+        "reason": '内容生成仍为样例；平台发布接口未接通，发布端点已明确拒绝伪成功',
+    })
 
 
 def _run_scout_lead_loop() -> dict[str, Any]:
-    label = "公域线索发现、触达、转化闭环"
-    try:
-        targets = _data(scout.scan(scout.ScanBody(keyword="AI", platform="douyin")))
-        target = targets[0] if isinstance(targets, list) and targets else {}
-        intent_doc = _data(scout.intent_score(scout.CommentBody(comment=str(target.get("comment") or ""))))
-        dm_doc = _data(
-            scout.auto_dm(
-                scout.DmBody(
-                    target_id=str(target.get("id") or ""),
-                    message="看到你在找 AI 自动回复和获客工具，我可以发你一份闭环方案。",
-                )
-            )
-        )
-        convert_doc = _data(scout.convert(scout.ConvertBody(target_id=str(target.get("id") or ""))))
-        trace_doc = _data(scout.trace(target_id=str(target.get("id") or "")))
-        sentiment_doc = _data(scout.sentiment_overview())
-        passed = (
-            bool(target.get("id"))
-            and int(intent_doc.get("score") or 0) >= 70
-            and bool(dm_doc.get("success"))
-            and bool(convert_doc.get("success"))
-            and bool(trace_doc.get("converted"))
-        )
-        return _item(
-            "scout_lead_loop",
-            label,
-            passed,
-            details={
-                "target_id": target.get("id"),
-                "platform": target.get("platform"),
-                "intent_score": intent_doc.get("score"),
-                "dm_success": dm_doc.get("success"),
-                "convert_success": convert_doc.get("success"),
-                "trace_steps": len(trace_doc.get("steps") or []),
-                "watch_terms": sentiment_doc.get("watch_terms"),
-            },
-        )
-    except Exception as exc:
-        return _advanced_check_error("scout_lead_loop", label, exc)
+    return _item('scout_lead_loop', '公域线索发现、触达、转化闭环', False, details={
+        "verification_level": "not_implemented", "live_verified": False,
+        "reason": '线索列表和舆情仍为样例；尚无授权采集及稳定收件人绑定，私信端点已关闭伪成功',
+    })
 
 
 def _run_flow_automation_loop(audit_id: str) -> dict[str, Any]:
-    label = "自动化流程创建、执行、Webhook 闭环"
-    try:
-        created = _data(
-            flow.create_flow(
-                flow.FlowCreateBody(
-                    name=f"闭环验收自动化-{audit_id}",
-                    nodes=[
-                        {"id": "trigger", "type": "message.received", "label": "收到消息"},
-                        {"id": "score", "type": "ai.score", "label": "AI 评分"},
-                        {"id": "notify", "type": "notify.sales", "label": "通知销售"},
-                    ],
-                    edges=[{"from": "trigger", "to": "score"}, {"from": "score", "to": "notify"}],
-                )
-            )
-        )
-        updated = _data(flow.update_flow(flow.FlowUpdateBody(id=str(created.get("id") or ""), name="闭环验收自动化-已启用")))
-        listed = _data(flow.list_flows())
-        executed = _data(flow.execute(flow.ExecuteBody(flow_id=str(created.get("id") or ""))))
-        rate_doc = _data(flow.automation_rate())
-        webhook_doc = _data(
-            flow.webhook(
-                flow.WebhookBody(
-                    url=f"https://hooks.kellai.local/flow/{audit_id}",
-                    events=["message.received", "deal.closed"],
-                )
-            )
-        )
-        passed = (
-            bool(created.get("id"))
-            and updated is not None
-            and isinstance(listed, list)
-            and executed.get("status") == "completed"
-            and float(rate_doc.get("rate") or 0) > 0
-            and bool(webhook_doc.get("enabled"))
-        )
-        return _item(
-            "flow_automation_loop",
-            label,
-            passed,
-            details={
-                "flow_id": created.get("id"),
-                "flow_count": len(listed) if isinstance(listed, list) else 0,
-                "execution_status": executed.get("status"),
-                "automation_rate": rate_doc.get("rate"),
-                "webhook_id": webhook_doc.get("id"),
-            },
-        )
-    except Exception as exc:
-        return _advanced_check_error("flow_automation_loop", label, exc)
+    return _item('flow_automation_loop', '自动化流程创建、执行、Webhook 闭环', False, details={
+        "verification_level": "not_implemented", "live_verified": False,
+        "reason": '图形流程当前可保存租户草稿，执行和对外Webhook尚未绑定既有审批运行时',
+    })
 
 
 def _run_finance_decision_loop() -> dict[str, Any]:
-    label = "财务看板、问答、预算、决策闭环"
-    try:
-        dashboard_doc = _data(finance.dashboard(period="month"))
-        ask_doc = _data(finance.ask(finance.AskBody(question="本月利润和下月预算怎么安排？")))
-        budget_doc = _data(finance.budget_suggest())
-        performance_doc = _data(finance.performance(period="month"))
-        alerts_doc = _data(finance.alerts())
-        report_doc = _data(finance.report(period="2026-06"))
-        decision_doc = _data(finance.decision())
-        passed = (
-            float(dashboard_doc.get("revenue") or 0) > 0
-            and bool(str(ask_doc.get("answer") or "").strip())
-            and float(budget_doc.get("total_budget") or 0) > 0
-            and isinstance(performance_doc, list)
-            and bool(alerts_doc)
-            and bool(str(report_doc.get("download_url") or "").strip())
-            and bool(decision_doc.get("actions"))
-        )
-        return _item(
-            "finance_decision_loop",
-            label,
-            passed,
-            details={
-                "revenue": dashboard_doc.get("revenue"),
-                "profit_margin": dashboard_doc.get("profit_margin"),
-                "answer": ask_doc.get("answer"),
-                "budget": budget_doc.get("total_budget"),
-                "member_count": len(performance_doc) if isinstance(performance_doc, list) else 0,
-                "alert_count": len(alerts_doc) if isinstance(alerts_doc, list) else 0,
-                "report_id": report_doc.get("id"),
-                "decision_actions": decision_doc.get("actions"),
-            },
-        )
-    except Exception as exc:
-        return _advanced_check_error("finance_decision_loop", label, exc)
+    return _item('finance_decision_loop', '财务分析与经营决策闭环', False, details={
+        "verification_level": "not_implemented", "live_verified": False,
+        "reason": '财务路由仍使用固定演示数据，未接真实账务、成本和支付回执',
+    })
 
 
 def _run_open_platform_loop(audit_id: str) -> dict[str, Any]:
-    label = "开放平台密钥、插件、Webhook 闭环"
-    try:
-        key_doc = _data(
-            open_api.create_key(
-                open_api.KeyBody(
-                    name=f"闭环验收-{audit_id}",
-                    scopes=["customers:read", "messages:write", "webhooks:write"],
-                )
-            )
-        )
-        plugins = _data(open_api.plugins())
-        plugin = next((item for item in plugins if not item.get("installed")), plugins[0] if plugins else {})
-        install_doc = _data(open_api.install_plugin({"plugin_id": str(plugin.get("id") or "")}))
-        webhook_doc = _data(
-            open_api.webhooks(
-                open_api.WebhookBody(
-                    url=f"https://hooks.kellai.local/open/{audit_id}",
-                    events=["customer.created", "message.received", "deal.closed"],
-                )
-            )
-        )
-        events_doc = _data(open_api.events())
-        docs_doc = _data(open_api.docs())
-        review_doc = _data(open_api.review(open_api.ReviewBody(app_name=f"闭环验收应用-{audit_id}")))
-        stats_doc = _data(open_api.stats())
-        endpoints = docs_doc.get("endpoints") if isinstance(docs_doc.get("endpoints"), list) else []
-        passed = (
-            str(key_doc.get("api_key") or "").startswith("kl_live_")
-            and bool(install_doc.get("installed"))
-            and bool(webhook_doc.get("active"))
-            and bool(events_doc)
-            and bool(endpoints)
-            and review_doc.get("status") == "pending"
-            and int(stats_doc.get("active_webhooks") or 0) >= 1
-        )
-        return _item(
-            "open_platform_loop",
-            label,
-            passed,
-            details={
-                "key_id": key_doc.get("id"),
-                "key_prefix": key_doc.get("key_prefix"),
-                "installed_plugin": plugin.get("name"),
-                "webhook_id": webhook_doc.get("id"),
-                "event_count": len(events_doc) if isinstance(events_doc, list) else 0,
-                "doc_endpoint_count": len(endpoints),
-                "review_status": review_doc.get("status"),
-                "active_webhooks": stats_doc.get("active_webhooks"),
-            },
-        )
-    except Exception as exc:
-        return _advanced_check_error("open_platform_loop", label, exc)
+    return _item('open_platform_loop', '开放平台应用、插件、Webhook 闭环', False, details={
+        "verification_level": "not_implemented", "live_verified": False,
+        "reason": '已有凭据和订阅登记，但插件安装仅为状态记录，缺少事件投递和实际运行验收',
+    })
 
 
 def _run_customer_management_loop(audit_id: str) -> dict[str, Any]:
@@ -712,52 +470,19 @@ def _run_knowledge_base_loop(audit_id: str, customer_id: int) -> dict[str, Any]:
 
 
 async def _run_channel_onboarding_loop(audit_id: str) -> dict[str, Any]:
-    label = "渠道接入配置、测试、断开闭环"
+    """Inspect the capability SSOT without modifying a live tenant's accounts."""
+    label = "渠道注册与能力声明（静态审计）"
     try:
-        from app.channels import ChannelRegistry, config_store
-
-        snapshot = config_store._read_disk()
-        channel_type = "wework"
-        kfid = f"kf{audit_id[:10]}"
-        kf_url = f"https://work.weixin.qq.com/kfid/{kfid}"
-        try:
-            saved = config_store.save(
-                channel_type,
-                {"kf_url": kf_url, "open_kfid": kfid},
-                name="闭环验收企业微信",
-                enabled=True,
-            )
-            readback = config_store.get_all(channel_type)
-            adapter = ChannelRegistry().get(channel_type)
-            test_doc = await adapter.test_connection()
-            disconnected = config_store.delete(channel_type)
-            after_delete = config_store.get(channel_type)
-        finally:
-            config_store._write_disk(snapshot)
-
-        readback_config = readback.get("config") if isinstance(readback.get("config"), dict) else {}
-        passed = (
-            bool(saved.get("enabled"))
-            and readback_config.get("kf_url") == kf_url
-            and readback_config.get("open_kfid") == kfid
-            and bool(test_doc.get("connected"))
-            and disconnected
-            and after_delete == {}
-        )
-        return _item(
-            "channel_onboarding_loop",
-            label,
-            passed,
-            details={
-                "channel_type": channel_type,
-                "saved_enabled": saved.get("enabled"),
-                "readback_name": readback.get("name"),
-                "connected": test_doc.get("connected"),
-                "message": test_doc.get("message"),
-                "deleted": disconnected,
-                "restored": config_store.get(channel_type) == snapshot.get(channel_type, {}),
-            },
-        )
+        from app.channels import ChannelRegistry
+        rows = ChannelRegistry().list_channels()
+        required = {"receive", "send", "transport", "receive_mode", "readiness"}
+        passed = bool(rows) and all(required.issubset(row.get("capabilities") or {}) for row in rows)
+        return _item("channel_onboarding_loop", label, passed, details={
+            "verification_level": "registry_only", "live_verified": False,
+            "channel_count": len(rows), "audit_id": audit_id,
+            "channels": [{"type": row["channel_type"], "capabilities": row.get("capabilities", {})} for row in rows],
+            "message": "仅核对代码能力声明；未调用平台、修改账号配置或证明真实收发。",
+        })
     except Exception as exc:
         return _advanced_check_error("channel_onboarding_loop", label, exc)
 
@@ -987,7 +712,7 @@ def _run_service_learning_loop(customer_id: int) -> dict[str, Any]:
 
 
 def _run_outbound_call_loop(customer_id: int) -> dict[str, Any]:
-    label = "AI 外呼、电话跟进、漏斗推进闭环"
+    label = "外呼脚本与漏斗推进（本地模拟，无真实通话）"
     try:
         before_ctx = customer_message_context(customer_id)
         before_stage = normalize_stage_id(str(before_ctx.get("stage") or "idle"))
@@ -1307,7 +1032,9 @@ def _build_competitor_benchmark_profile(checks: list[dict[str, Any]], *, require
     required = [item for item in dimensions if item.get("required")]
     failed_required = [item for item in required if not item.get("passed")]
     return {
-        "name": "红熊/黑熊 AI Agent 客服对标",
+        "name": "历史本地回归覆盖（非外部成熟度）",
+        "verification_level": "local_regression",
+        "live_verified": False,
         "summary": {
             "total": len(dimensions),
             "passed": sum(1 for item in dimensions if item.get("passed")),
@@ -1503,7 +1230,7 @@ async def run_closed_loop_audit(
     checks.append(
         _item(
             "redbear_benchmark_coverage",
-            "红熊/黑熊 AI 对标能力覆盖",
+            "本地实现覆盖（不含真实渠道验收）",
             int((benchmark_profile.get("summary") or {}).get("failed_required") or 0) == 0,
             required=True,
             details={
@@ -1520,6 +1247,8 @@ async def run_closed_loop_audit(
 
     report = {
         "audit_id": audit_id,
+        "verification_level": "local_implementation_audit",
+        "live_verified": False,
         "passed": passed,
         "require_llm": bool(require_llm),
         "target_stage": target,

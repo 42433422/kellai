@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import {
   ArrowLeft,
@@ -27,6 +27,8 @@ import {
   ClipboardCheck,
 } from 'lucide-react';
 import { clsx } from 'clsx';
+import { currentAccountKey } from '../api/client';
+import { useAuthStore } from '../stores/auth';
 import ChannelLogo from '../components/ChannelLogo';
 import FollowUpModal from '../components/customers/FollowUpModal';
 import { useCrmEnhanceStore, followUpUrgency } from '../stores/crmEnhance';
@@ -344,6 +346,10 @@ export default function CustomerDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const customerId = Number(id);
+  const account = useAuthStore((state) => `${state.user?.team_id || ''}:${state.user?.id || ''}`);
+  const viewKey = `${account}:${customerId}`;
+  const activeView = useRef(viewKey);
+  activeView.current = viewKey;
 
   // Tab 状态
   const [activeTab, setActiveTab] = useState<TabId>('overview');
@@ -407,6 +413,7 @@ export default function CustomerDetail() {
   /** 加载客户数据 */
   const loadCustomerData = useCallback(async () => {
     if (!customerId) return;
+    const requestView = viewKey;
     setLoading(true);
     try {
       const [pipelineRes, messagesRes, aiRes, insightRes, qualityRes, ticketRes, learningRes, selfServiceRes, agentAssistRes, outboundRes, intakeRes, crmRes] = await Promise.allSettled([
@@ -427,6 +434,7 @@ export default function CustomerDetail() {
         getCustomerCrm(customerId),
       ]);
 
+      if (activeView.current !== requestView) return;
       if (pipelineRes.status === 'fulfilled') {
         const data = unwrapApiResponse<CustomerPipeline | { pipeline?: CustomerPipeline }>(pipelineRes.value);
         const nextPipeline = data && typeof data === 'object' && 'pipeline' in data
@@ -471,11 +479,15 @@ export default function CustomerDetail() {
     } catch (err) {
       console.error('Failed to load customer data:', err);
     } finally {
-      setLoading(false);
+      if (activeView.current === requestView) setLoading(false);
     }
-  }, [customerId]);
+  }, [customerId, viewKey]);
 
   useEffect(() => {
+    setMessageInput('');
+    setMessages([]);
+    setPipeline(null);
+    setSendingMessage(false);
     loadCustomerData();
   }, [loadCustomerData]);
 
@@ -669,24 +681,29 @@ export default function CustomerDetail() {
       showToast('当前渠道缺少联系人标识，请先在消息中心选择已收信的客户');
       return;
     }
+    const sendingView = activeView.current;
+    const sendingAccount = currentAccountKey();
+    const sentContent = messageInput.trim();
     setSendingMessage(true);
     try {
-      await sendMessage(
+      const receipt = await sendMessage(
         customerId,
         selectedChannel,
         channelMessage.contact_id,
         messageInput.trim(),
         channelMessage.contact_name ?? '',
       );
-      setMessageInput('');
+      if (activeView.current !== sendingView || currentAccountKey() !== sendingAccount) return;
+      setMessageInput((value) => value.trim() === sentContent ? '' : value);
       setSuggestedReplies([]);
-      showToast('消息已发送');
+      showToast(receipt.provider_state === 'delivered' || receipt.provider_state === 'read' ? '渠道已确认送达' : '渠道已受理，送达待确认');
       loadCustomerData();
     } catch (err) {
+      if (activeView.current !== sendingView || currentAccountKey() !== sendingAccount) return;
       console.error('Failed to send message:', err);
       showToast(err instanceof Error && err.message ? err.message : '发送失败，请重试');
     } finally {
-      setSendingMessage(false);
+      if (activeView.current === sendingView) setSendingMessage(false);
     }
   }, [messageInput, customerId, selectedChannel, sendingMessage, messages, loadCustomerData, showToast]);
 

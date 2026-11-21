@@ -1,0 +1,71 @@
+name: Product closed loop
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    env:
+      KELLAI_APP_ENV: development
+      KELLAI_JWT_SECRET: isolated-ci-test-secret
+      KELLAI_CHANNEL_WORKER_ENABLED: "0"
+      KELLAI_DATA_DIR: ${{ runner.temp }}/kellai-test-data
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.9"
+          python-version: "3.12"
+      - run: uv sync --locked --project backend --group test
+      - run: uv run --project backend --group test python -m pytest backend/tests -q
+        env:
+          PYTHONPATH: backend
+  desktop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+        working-directory: desktop
+      - run: node --test tests/*.test.mjs
+        working-directory: desktop
+      - run: npm run build
+        working-directory: desktop
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the production dependency lock
+        run: docker build -t kellai-closed-loop:ci backend
+      - name: Start isolated production backend
+        run: >-
+          docker run --detach --name kellai-smoke
+          --publish 127.0.0.1:8793:8790
+          --env KELLAI_JWT_SECRET=isolated-container-test-secret-at-least-32-characters
+          --env KELLAI_PASSWORD_SALT=isolated-container-test-salt
+          --env KELLAI_CHANNEL_WORKER_ENABLED=0
+          kellai-closed-loop:ci
+      - name: Check health and authentication boundary
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8793/health; then break; fi
+            sleep 2
+          done
+          curl --fail --silent http://127.0.0.1:8793/health
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:8793/api/kellai/channels)" = "401"
+      - name: Container logs
+        if: failure()
+        run: docker logs kellai-smoke
+      - name: Stop container
+        if: always()
+        run: docker rm --force kellai-smoke

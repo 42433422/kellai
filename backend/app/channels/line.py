@@ -3,7 +3,7 @@
 参考：https://developers.line.biz/en/docs/messaging-api/
 - 鉴权：channel_access_token（Bearer）
 - 发送：POST /v2/bot/message/push
-- 接收：webhook → kellai_channel_inbox
+- 接收：仅消费本地 inbox；本适配器尚未实现原生 webhook
 
 环境变量（或前端配置）：
 - KELLAI_LINE_CHANNEL_ACCESS_TOKEN
@@ -19,7 +19,7 @@ import httpx
 
 from app.channels.base import ChannelAdapter, UnifiedMessage
 from app.channels.config_store import get_field
-from app.channels.http_client import read_env
+from app.channels.http_client import read_env, checked_json, send_error
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,7 @@ _UNCONFIGURED_MSG = "LINE 渠道未配置（缺少 channel_access_token）"
 
 
 def _channel_access_token() -> str:
-    return get_field("line", "channel_access_token", read_env("KELLAI_LINE_CHANNEL_ACCESS_TOKEN"))
+    return get_field("line", "channel_access_token")
 
 
 class LineAdapter(ChannelAdapter):
@@ -60,30 +60,28 @@ class LineAdapter(ChannelAdapter):
     async def send_message(self, contact_id: str, content: str, **kwargs: Any) -> dict:
         """contact_id: LINE user_id。"""
         if not self._is_configured():
-            return {"success": False, "message_id": "", "error": _UNCONFIGURED_MSG}
+            return {"success": False, "message_id": "", "error": _UNCONFIGURED_MSG, "delivery_state": "failed", "definitely_not_sent": True}
         if not contact_id or not (content or "").strip():
-            return {"success": False, "message_id": "", "error": "参数不完整"}
+            return {"success": False, "message_id": "", "error": "参数不完整", "delivery_state": "failed", "definitely_not_sent": True}
+        if len(content) > 5000:
+            return send_error("消息超过平台文本长度限制", definitely_not_sent=True)
         try:
             client = await self._get_client()
             payload = {
                 "to": contact_id,
-                "messages": [{"type": "text", "text": content[:5000]}],
+                "messages": [{"type": "text", "text": content}],
             }
             resp = await client.post("/v2/bot/message/push", json=payload)
-            try:
-                body = resp.json()
-            except Exception:
-                body = {"raw": resp.text}
-            if resp.status_code >= 400 or "message" in body:
-                return {
-                    "success": False,
-                    "message_id": "",
-                    "error": f"errcode={body.get('code', resp.status_code)} {body.get('message', '')}",
-                }
-            return {"success": True, "message_id": "", "error": ""}
+            body = checked_json(resp)
+            if "message" in body:
+                return send_error(f"LINE 拒绝请求: {body.get('message')}", definitely_not_sent=True)
+            messages = body.get("sentMessages", [])
+            message_id = str(messages[0].get("id", "")) if messages else ""
+            return {"success": True, "message_id": message_id, "delivery_state": "accepted", "error": ""}
+
         except Exception as exc:
             logger.warning("LINE send_message 异常: %s", exc)
-            return {"success": False, "message_id": "", "error": str(exc)}
+            return send_error(exc)
 
     # ----------------- receive_messages -----------------
 
@@ -142,7 +140,7 @@ class LineAdapter(ChannelAdapter):
 
     # ----------------- test_connection -----------------
 
-    async def test_connection(self) -> dict:
+    async def test_connection(self, **kwargs) -> dict:
         if not self._is_configured():
             return {"connected": False, "message": _UNCONFIGURED_MSG}
         try:
@@ -156,6 +154,7 @@ class LineAdapter(ChannelAdapter):
             if resp.status_code == 200 and body.get("userId"):
                 return {
                     "connected": True,
+                    "verification_level": "authenticated",
                     "message": f"LINE Bot {body.get('basicId') or body.get('userId', '?')} 鉴权通过",
                 }
             return {

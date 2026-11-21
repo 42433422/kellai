@@ -6,3 +6,13 @@ node_modules
 src-tauri
 scripts
 *.md
+.env
+.env.*
+.venv
+data
+__pycache__
+**/__pycache__
+.pytest_cache
+.ruff_cache
+*.pyc
+*.log

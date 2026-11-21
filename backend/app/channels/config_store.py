@@ -1,26 +1,93 @@
-"""渠道配置持久化层（JSON 文件 · 跨进程共享）。
+"""渠道配置持久化层（JSON 文件 · 原子替换）。
 
 跟环境变量双轨：
 - 启动时：先读 env，再覆盖为 JSON 中保存的值（用户在前端"保存配置"能即时生效）
 - 写入：只写 JSON，不动 env（避免污染运行环境）
 - 缺失字段：env 兜底
 
-文件位置：data/channel_configs.json
+文件位置：data/tenants/<team>/channel_configs.json。
+进程内写入串行化，写入失败会向调用者抛出，不返回虚假的保存成功。
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import sqlite3
 import threading
+import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
-from app.services.tenant_context import current_team_id, tenant_data_root
+from app.services.tenant_context import base_data_root, current_team_id, infer_legacy_owner_team_id, tenant_data_root
 
 logger = logging.getLogger(__name__)
 
 _LOCK = threading.RLock()
+REDACTED_VALUE = "********"
+_CHANNEL_ALIASES = {"wecom": "wework", "miniapp": "miniprogram"}
+_FIELD_GROUPS = {
+    "wework": [("corp_id", "corpid"), ("secret", "corp_secret", "corpsecret"), ("agent_id", "agentid")],
+    "wechat": [("app_id", "appid"), ("app_secret", "appsecret", "secret"),
+               ("official_app_id", "mp_app_id"), ("official_app_secret", "mp_app_secret"),
+               ("token", "server_token", "webhook_token", "verify_token")],
+    "douyin": [("app_id", "client_key"), ("app_secret", "client_secret"),
+               ("miniapp_app_id", "miniapp_appid"), ("miniapp_secret", "miniapp_app_secret")],
+    "miniprogram": [("app_id", "appid"), ("app_secret", "secret", "appsecret")],
+}
+
+
+def _field_names(channel_type: str, key: str) -> tuple[str, ...]:
+    return next((group for group in _FIELD_GROUPS.get(channel_type, []) if key in group), (key,))
+
+
+def _canonical(channel_type: str) -> str:
+    return _CHANNEL_ALIASES.get(channel_type, channel_type)
+
+
+def _is_secret(key: str) -> bool:
+    return any(part in key.lower() for part in (
+        "secret", "token", "password", "api_key", "bot_webhook", "encoding_aes_key",
+    ))
+
+
+def redact_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return a redacted copy. The sentinel is accepted unchanged by save()."""
+    return {
+        key: redact_config(value) if isinstance(value, dict)
+        else REDACTED_VALUE if _is_secret(key) and value not in (None, "") else value
+        for key, value in config.items()
+    }
+
+
+def public_config(channel_type: str) -> dict[str, Any]:
+    """Effective persisted/environment configuration, with credentials removed."""
+    return redact_config(get_all(channel_type))
+
+
+def environment_config_allowed() -> bool:
+    """Server credentials belong to one explicitly bound or legacy sole tenant."""
+    team_id = current_team_id()
+    if team_id <= 0:
+        return True  # Legacy local migration/tests, never an authenticated tenant.
+    explicit = os.environ.get("KELLAI_CHANNEL_ENV_TEAM_ID")
+    if explicit is not None:
+        try:
+            return int(explicit) == team_id
+        except ValueError:
+            return False
+    if infer_legacy_owner_team_id() != team_id:
+        return False
+    path = base_data_root() / "kellai.db"
+    if path.exists():
+        try:
+            with sqlite3.connect(str(path)) as connection:
+                if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kellai_teams'").fetchone():
+                    teams = connection.execute("SELECT id FROM kellai_teams LIMIT 2").fetchall()
+                    return len(teams) == 1 and int(teams[0][0]) == team_id
+        except sqlite3.Error:
+            return False
+    return True
 
 def _config_path() -> Path:
     explicit = (os.environ.get("KELLAI_CHANNEL_CONFIG_PATH") or "").strip()
@@ -49,18 +116,24 @@ def _read_disk() -> dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except Exception as exc:
         logger.warning("读取渠道配置失败: %s", exc)
-        return {}
+        raise
 
 
 def _write_disk(data: dict[str, Any]) -> None:
     _ensure_parent()
     path = _config_path()
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp: Path | None = None
     try:
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=path.name + ".", delete=False) as stream:
+            tmp = Path(stream.name)
+            json.dump(data, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
         tmp.replace(path)
-    except Exception as exc:
-        logger.warning("写入渠道配置失败: %s", exc)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
 
 
 def _env_prefixes(channel_type: str) -> list[str]:
@@ -75,6 +148,7 @@ def _env_prefixes(channel_type: str) -> list[str]:
         "wecom": ["WECOM", "WEWORK"],
         "miniprogram": ["MINIAPP", "MINIPROGRAM"],
         "miniapp": ["MINIAPP", "MINIPROGRAM"],
+        "phone": ["PHONE", "SMS"],
     }
     out = aliases.get(channel_type, [primary])
     if primary not in out:
@@ -138,21 +212,31 @@ def _saved_config(cfg: dict[str, Any]) -> dict[str, Any]:
 def get(channel_type: str) -> dict[str, Any]:
     """获取某渠道的已保存配置（不含 env 兜底）。"""
     with _LOCK:
-        return dict(_read_disk().get(channel_type) or {})
+        all_cfg = _read_disk()
+        canonical = _canonical(channel_type)
+        if canonical in all_cfg:
+            return dict(all_cfg.get(canonical) or {})
+        for alias, target in _CHANNEL_ALIASES.items():
+            if target == canonical and alias in all_cfg:
+                return dict(all_cfg.get(alias) or {})
+        return {}
 
 
 def get_field(channel_type: str, key: str, default: str = "") -> str:
-    """获取某渠道某字段的配置值（env > JSON > default）。"""
-    import os as _os
-
+    """Read JSON > env > default; an explicitly saved empty value revokes it."""
+    channel_type = _canonical(channel_type)
+    saved = _saved_config(get(channel_type))
+    for alias in _field_names(channel_type, key):
+        if alias in saved:
+            return str(saved[alias]) if saved[alias] is not None else ""
+    if not environment_config_allowed():
+        return default
     for prefix in _env_prefixes(channel_type):
         for suffix in _env_suffixes(channel_type, key):
-            env_val = _os.environ.get(f"KELLAI_{prefix}_{suffix}", "").strip()
+            env_val = os.environ.get(f"KELLAI_{prefix}_{suffix}", "").strip()
             if env_val:
                 return env_val
-    cfg = get(channel_type)
-    val = _saved_config(cfg).get(key)
-    return str(val) if val is not None else default
+    return default
 
 
 def get_all(channel_type: str) -> dict[str, Any]:
@@ -160,9 +244,15 @@ def get_all(channel_type: str) -> dict[str, Any]:
     cfg = get(channel_type)
     out = dict(cfg)
     merged_config = _saved_config(cfg)
+    allow_environment = environment_config_allowed()
     # env 默认值以"未在前端设置过"为判断标准
     for key in _expected_fields(channel_type):
-        if key in merged_config and merged_config[key]:
+        saved_alias = next((alias for alias in _field_names(_canonical(channel_type), key)
+                            if alias in merged_config), None)
+        if saved_alias is not None:
+            merged_config[key] = merged_config[saved_alias]
+            continue
+        if not allow_environment:
             continue
         for prefix in _env_prefixes(channel_type):
             for suffix in _env_suffixes(channel_type, key):
@@ -220,7 +310,9 @@ def _expected_fields(channel_type: str) -> list[str]:
         "whatsapp": ["phone_number_id", "access_token", "business_id"],
         "telegram": ["bot_token"],
         "line": ["channel_access_token", "channel_secret"],
-        "phone": ["line"],
+        "phone": ["provider", "account_sid", "auth_token", "from_number", "access_key_id",
+                  "access_key_secret", "sign_name", "template_code"],
+        "chatwoot": ["base_url", "account_id", "inbox_id", "api_access_token", "webhook_secret"],
         "email": ["smtp_host", "smtp_port", "smtp_user", "smtp_password"],
         "sms": ["provider", "api_key", "api_secret"],
     }
@@ -234,12 +326,22 @@ def save(channel_type: str, config: dict[str, Any], *, name: Optional[str] = Non
     写回磁盘并返回该渠道的最终状态 dict（含 name/enabled/connected）。
     """
     with _LOCK:
+        channel_type = _canonical(channel_type)
         all_cfg = _read_disk()
-        cur = dict(all_cfg.get(channel_type) or {})
+        cur = get(channel_type)
         # 合并：保留原 name/enabled，只覆盖 config
         new_cfg = dict(cur)
-        incoming_config = dict(config or {})
-        merged_config = dict(cur.get("config") or {})
+        incoming_config = {key: value for key, value in (config or {}).items()
+                           if not (_is_secret(key) and value == REDACTED_VALUE)}
+        for group in _FIELD_GROUPS.get(channel_type, []):
+            supplied = [incoming_config[key] for key in group if key in incoming_config]
+            if supplied:
+                if any(value != supplied[0] for value in supplied):
+                    raise ValueError("渠道配置的同义字段值不一致: " + ", ".join(group))
+                incoming_config.update({key: supplied[0] for key in group})
+        merged_config = _saved_config(cur)
+        changed = any(key not in merged_config or merged_config[key] != value
+                      for key, value in incoming_config.items())
         merged_config.update(incoming_config)
         new_cfg["config"] = merged_config
         if name is not None:
@@ -248,7 +350,7 @@ def save(channel_type: str, config: dict[str, Any], *, name: Optional[str] = Non
             new_cfg["enabled"] = bool(enabled)
         if connected is not None:
             new_cfg["connected"] = bool(connected)
-        elif incoming_config:
+        elif changed:
             # 凭据变更后必须重新测试，避免“已保存”误显示为“已接入”。
             new_cfg["connected"] = False
         new_cfg.setdefault("name", channel_type)
@@ -262,10 +364,13 @@ def save(channel_type: str, config: dict[str, Any], *, name: Optional[str] = Non
 def delete(channel_type: str) -> bool:
     """删除渠道配置（断开/取消配置）。"""
     with _LOCK:
+        channel_type = _canonical(channel_type)
         all_cfg = _read_disk()
-        if channel_type not in all_cfg:
+        keys = {channel_type, *[key for key, value in _CHANNEL_ALIASES.items() if value == channel_type]}
+        if not keys.intersection(all_cfg):
             return False
-        all_cfg.pop(channel_type)
+        for key in keys:
+            all_cfg.pop(key, None)
         _write_disk(all_cfg)
         return True
 

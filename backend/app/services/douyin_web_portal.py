@@ -30,6 +30,7 @@ from app.services.message_store import (
     push_inbox,
     save_message,
 )
+from app.services.tenant_context import resolve_team_id, tenant_scope
 
 logger = logging.getLogger(__name__)
 
@@ -490,7 +491,14 @@ def _ingest_message(
     account: dict[str, Any],
     session: dict[str, Any],
     item: dict[str, Any],
+    historical: bool = False,
 ) -> bool:
+    """Persist before consuming; duplicate pending events retry the same work.
+
+    Polling getMsgLog is a history backfill even when its timestamps are recent.
+    Only the real-time WebSocket path supplies historical=False.
+    """
+    team_id = resolve_team_id(team_id, required=True)
     contact_id = str(
         session.get("from_open_id")
         or session.get("open_id")
@@ -512,7 +520,7 @@ def _ingest_message(
     with sqlite3.connect(str(_crm_db_path()), timeout=10.0) as conn:
         existing = conn.execute(
             """
-            SELECT content, direction, created_at
+            SELECT contact_id, content, direction, created_at, metadata_json
             FROM kellai_messages
             WHERE team_id = ? AND id = ?
             LIMIT 1
@@ -520,18 +528,33 @@ def _ingest_message(
             (int(team_id), message_id),
         ).fetchone()
         if existing:
+            try:
+                previous_metadata = json.loads(existing[4] or "{}")
+            except (ValueError, TypeError):
+                previous_metadata = {}
+            previous_at = _timestamp(previous_metadata["provider_created_at"]) if isinstance(previous_metadata, dict) and previous_metadata.get("provider_created_at") is not None else str(existing[3] or "")
             if (
-                str(existing[0] or "") == content
-                and str(existing[1] or "") == direction
-                and str(existing[2] or "") == created_at
+                str(existing[0] or "") != contact_id
+                or str(existing[1] or "") != content
+                or str(existing[2] or "") != direction
+                or (item.get("createtime") is not None and item.get("createtime") != "" and previous_at != created_at)
             ):
-                return False
-            message_id = _collision_message_id(team_id, contact_id, item)
-            if conn.execute(
-                "SELECT 1 FROM kellai_messages WHERE team_id = ? AND id = ? LIMIT 1",
-                (int(team_id), message_id),
-            ).fetchone():
-                return False
+                message_id = _collision_message_id(team_id, contact_id, item)
+        # A prior attempt may have crashed before the unified message was saved.
+        pending = conn.execute(
+            "SELECT contact_id, content, direction, metadata_json FROM kellai_channel_inbox WHERE team_id=? AND id=?",
+            (team_id, message_id),
+        ).fetchone()
+        if pending:
+            try:
+                pending_metadata = json.loads(pending[3] or "{}")
+            except (TypeError, ValueError):
+                pending_metadata = {}
+            if (str(pending[0]), str(pending[1]), str(pending[2])) != (contact_id, content, direction) or (
+                isinstance(pending_metadata, dict) and pending_metadata.get("provider_created_at") is not None
+                and item.get("createtime") is not None and _timestamp(pending_metadata["provider_created_at"]) != created_at
+            ):
+                message_id = _collision_message_id(team_id, contact_id, item)
     provisional_customer_id = 0
     if direction == "outbound":
         provisional_customer_id = _remove_matching_desktop_provisional(
@@ -539,6 +562,7 @@ def _ingest_message(
             contact_id=contact_id,
             content=content,
             created_at=created_at,
+            remove=False,
         )
     contact_name = str(
         session.get("nick_name")
@@ -555,6 +579,9 @@ def _ingest_message(
         "server_message_id": str(item.get("server_message_id") or item.get("msg_id") or ""),
         "remote_message_type": message_type,
         "avatar": str(session.get("avatar") or item.get("avatar") or ""),
+        "provider_created_at": item.get("createtime"),
+        "historical": bool(historical),
+        "portal_provisional_customer_id": provisional_customer_id,
     }
     push_inbox(
         "douyin",
@@ -562,37 +589,70 @@ def _ingest_message(
         contact_name=contact_name,
         direction=direction,
         content=content,
-        content_type="text",
+        content_type="text" if message_type == "text" else message_type or "unknown",
         metadata=metadata,
         msg_id=message_id,
+        team_id=team_id,
     )
-    saved = save_message(
-        UnifiedMessage(
-            id=message_id,
-            customer_id=provisional_customer_id,
-            channel_type="douyin",
-            contact_id=contact_id,
-            contact_name=contact_name,
-            direction=direction,
-            content=content,
-            content_type="text",
-            metadata=metadata,
-            created_at=created_at,
-        )
-    )
-    if direction == "inbound":
-        try:
+    return _consume_portal_inbox_message(team_id, message_id)
+
+
+def _consume_portal_inbox_message(team_id: int, message_id: str) -> bool:
+    """Use the durable original payload through save -> enqueue -> acknowledge.
+
+    save_message and enqueue_message are idempotent. Any failure leaves the
+    inbox pending for either the common channel consumer or portal replay.
+    """
+    with sqlite3.connect(str(_crm_db_path()), timeout=10.0) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM kellai_channel_inbox WHERE team_id=? AND id=? AND channel_type='douyin' AND consumed=0",
+            (team_id, message_id),
+        ).fetchone()
+    if row is None:
+        return False
+    metadata = json.loads(row["metadata_json"] or "{}")
+    if not isinstance(metadata, dict) or metadata.get("source") != "douyin_web_portal" or int(metadata.get("team_id") or 0) != team_id:
+        raise ValueError("portal_inbox_payload_mismatch")
+    created_at = _timestamp(metadata.get("provider_created_at")) if metadata.get("provider_created_at") is not None else str(row["received_at"])
+    with tenant_scope(team_id):
+        saved = save_message(UnifiedMessage(
+            id=str(row["id"]), customer_id=int(metadata.get("portal_provisional_customer_id") or 0),
+            channel_type="douyin", contact_id=str(row["contact_id"]), contact_name=str(row["contact_name"]),
+            direction=str(row["direction"]), content=str(row["content"]), content_type=str(row["content_type"]),
+            metadata=metadata, created_at=created_at,
+        ))
+        if saved.direction == "inbound":
             from app.services.auto_reply_runtime import enqueue_message
 
             enqueue_message(saved)
-        except Exception:
-            logger.warning(
-                "抖音客服网页消息已保存但自动回复任务入队失败: message_id=%s",
-                message_id,
-                exc_info=True,
+        else:
+            # Keep the old provisional row until the provider copy is durable.
+            _remove_matching_desktop_provisional(
+                team_id=team_id, contact_id=saved.contact_id, content=saved.content, created_at=created_at,
             )
-    mark_inbox_consumed([message_id], team_id=team_id)
-    return bool(saved.id)
+        mark_inbox_consumed([message_id], team_id=team_id)
+    return True
+
+
+def _replay_pending_portal_inbox(team_id: int) -> tuple[int, int]:
+    ensure_messages_schema()
+    with sqlite3.connect(str(_crm_db_path()), timeout=10.0) as conn:
+        rows = conn.execute(
+            "SELECT id, metadata_json FROM kellai_channel_inbox WHERE team_id=? AND channel_type='douyin' AND consumed=0 ORDER BY received_at",
+            (team_id,),
+        ).fetchall()
+    consumed = errors = 0
+    for message_id, raw_metadata in rows:
+        try:
+            metadata = json.loads(raw_metadata or "{}")
+            if not isinstance(metadata, dict) or metadata.get("source") != "douyin_web_portal":
+                continue
+            consumed += int(_consume_portal_inbox_message(team_id, str(message_id)))
+        except Exception:
+            errors += 1
+            logger.warning("网页消息接入未完成，保留待重试: message_id=%s", message_id, exc_info=True)
+    return consumed, errors
 
 
 def _remove_matching_desktop_provisional(
@@ -601,6 +661,7 @@ def _remove_matching_desktop_provisional(
     contact_id: str,
     content: str,
     created_at: str,
+    remove: bool = True,
 ) -> int:
     """用网页同步的真实消息替换桌面自动化产生的临时出站记录。"""
     try:
@@ -635,11 +696,12 @@ def _remove_matching_desktop_provisional(
                 continue
             if abs((remote_at - local_at).total_seconds()) > 300:
                 continue
-            conn.execute(
-                "DELETE FROM kellai_messages WHERE team_id = ? AND id = ?",
-                (int(team_id), str(row[0])),
-            )
-            conn.commit()
+            if remove:
+                conn.execute(
+                    "DELETE FROM kellai_messages WHERE team_id = ? AND id = ?",
+                    (int(team_id), str(row[0])),
+                )
+                conn.commit()
             return int(row[1] or 0)
     return 0
 
@@ -650,6 +712,8 @@ async def sync_messages(
     max_conversations: int = 200,
     history_limit: int = 20,
 ) -> dict[str, Any]:
+    team_id = resolve_team_id(team_id, required=True)
+    replayed, replay_errors = _replay_pending_portal_inbox(team_id)
     token = _stored_token(team_id)
     try:
         accounts_raw = await _post(token, "service/TodayShunt/index")
@@ -696,21 +760,26 @@ async def sync_messages(
             *(fetch_history(account, session) for account, session in sessions),
             return_exceptions=True,
         )
-        ingested = 0
-        history_errors = 0
+        ingested = replayed
+        history_errors = replay_errors
         for result in histories:
             if isinstance(result, Exception):
                 history_errors += 1
                 continue
             account, session, items = result
             for item in reversed(items):
-                if _ingest_message(
-                    team_id=team_id,
-                    account=account,
-                    session=session,
-                    item=item,
-                ):
-                    ingested += 1
+                try:
+                    if _ingest_message(
+                        team_id=team_id,
+                        account=account,
+                        session=session,
+                        item=item,
+                        historical=True,
+                    ):
+                        ingested += 1
+                except Exception:
+                    history_errors += 1
+                    logger.warning("网页历史消息接入失败，收件箱保留重试", exc_info=True)
         _update_state(
             team_id,
             status="connected",
@@ -722,6 +791,7 @@ async def sync_messages(
             "contacts": len(sessions),
             "messages": ingested,
             "history_errors": history_errors,
+            "replayed": replayed,
         }
     except DouyinWebPortalAuthError as exc:
         _update_state(team_id, status="expired", monitor_enabled=0, last_error=str(exc))

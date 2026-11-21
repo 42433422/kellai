@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/api/kellai/scout", tags=["scout"])
@@ -67,10 +67,7 @@ def intent_score(body: CommentBody) -> dict:
 
 @router.post("/auto-dm")
 def auto_dm(body: DmBody) -> dict:
-    for t in _TARGETS:
-        if t["id"] == body.target_id and t["status"] == "new":
-            t["status"] = "contacted"
-    return {"success": True, "data": {"success": True, "message": "已发送私信"}}
+    raise HTTPException(status_code=501, detail="猎手目标尚无已验证的渠道联系人绑定；请从消息中心选择真实会话发送")
 
 
 @router.post("/convert")

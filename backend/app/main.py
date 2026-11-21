@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import asyncio
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -47,9 +49,9 @@ def _validate_configuration() -> None:
         if _PASSWORD_SALT == "kellai_default_salt_2026":
             logger.warning("⚠️  生产环境建议设置 KELLAI_PASSWORD_SALT（虽然主要使用 bcrypt）")
         
-        # 3. 建议启用严格认证模式
+        # Production APIs must not fall through to tenant zero.
         if not strict_auth:
-            logger.warning("⚠️  生产环境建议设置 KELLAI_STRICT_AUTH=1 以启用强制 token 验证")
+            errors.append("生产环境必须设置 KELLAI_STRICT_AUTH=1")
         
         if errors:
             logger.critical("=" * 60)
@@ -234,6 +236,8 @@ _SOFT_AUTH_WHITELIST: set[str] = {
     # not accept the user JWT and validate that token again in the route.
     "/api/kellai/integrations/xcmax/data-status",
     "/api/kellai/integrations/xcmax/customers",
+    "/api/kellai/integrations/xcmax/channels",
+    "/api/kellai/integrations/xcmax/messages/send",
 }
 
 
@@ -266,7 +270,16 @@ async def _request_log_middleware(
     """
     start = time.perf_counter()
     path = request.url.path
-    is_xcmax_data_route = path.startswith("/api/kellai/integrations/xcmax/customers/")
+    is_xcmax_data_route = (
+        path.startswith("/api/kellai/integrations/xcmax/customers/")
+        or path.startswith("/api/kellai/integrations/xcmax/messages/requests/")
+    )
+    is_signed_callback = bool(re.fullmatch(r"/api/kellai/webhook/(?:chatwoot|wechat)/[1-9][0-9]*", path))
+    exempt = path in _SOFT_AUTH_WHITELIST or is_xcmax_data_route or is_signed_callback
+    # Live messaging/configuration is authenticated even in development mode.
+    require_user = not exempt and (_STRICT_AUTH or path.startswith((
+        "/api/kellai/messages", "/api/kellai/channels", "/api/kellai/ai/auto-reply/", "/api/kellai/ai/llm-",
+    )))
     user_id: object = "-"
     user_info: dict | None = None
 
@@ -300,8 +313,8 @@ async def _request_log_middleware(
                 user_id = info["id"]
             else:
                 # token 无效
-                if path not in _SOFT_AUTH_WHITELIST and not is_xcmax_data_route:
-                    if _STRICT_AUTH:
+                if not exempt:
+                    if require_user:
                         return JSONResponse(
                             status_code=401,
                             content={"success": False, "error": "token 无效或已过期", "code": 401},
@@ -310,14 +323,17 @@ async def _request_log_middleware(
         except Exception as exc:  # pragma: no cover - 解析失败不影响主流程
             logger.debug("软认证解析异常: %s", exc)
     else:
-        if path not in _SOFT_AUTH_WHITELIST and not is_xcmax_data_route:
-            if _STRICT_AUTH:
+        if not exempt:
+            if require_user:
                 return JSONResponse(
                     status_code=401,
                     content={"success": False, "error": "未提供认证 token", "code": 401},
                 )
             # 软认证：未带 token 警告但仍放行（演示阶段）
             logger.warning("soft-auth: 未带 token 访问受保护接口 path=%s（演示模式放行）", path)
+
+    if require_user and user_info is None:
+        return JSONResponse(status_code=401, content={"success": False, "error": "登录已失效", "code": 401})
 
     # 把 user 挂到 request.state，便于路由层依赖读取
     request.state.user = user_info
@@ -402,6 +418,30 @@ def create_app() -> FastAPI:
     app.include_router(flow.router)
     app.include_router(finance.router)
     app.include_router(open_api.router)
+    from app.api import xcmax_channels, channel_gateway, wechat_callbacks
+    app.include_router(xcmax_channels.router)
+    app.include_router(channel_gateway.router)
+    app.include_router(wechat_callbacks.router)
+
+    @app.on_event("startup")
+    async def _start_channel_worker():
+        if os.environ.get("KELLAI_CHANNEL_WORKER_ENABLED", "1") == "1":
+            from app.services.channel_worker import run
+            app.state.channel_stop = asyncio.Event()
+            app.state.channel_task = asyncio.create_task(run(app.state.channel_stop))
+
+    @app.on_event("shutdown")
+    async def _stop_channel_worker():
+        task = getattr(app.state, "channel_task", None)
+        if task is not None:
+            app.state.channel_stop.set()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        from app.channels import ChannelRegistry
+        await ChannelRegistry().close_all()
 
     @app.on_event("startup")
     async def _resume_douyin_web_portal_monitors():
@@ -427,7 +467,7 @@ app = create_app()
 def run() -> None:
     import uvicorn
 
-    port = int(os.environ.get("KELLAI_PORT", "8790"))
+    port = int(os.environ.get("KELLAI_PORT", "8793"))
     uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=False)
 
 

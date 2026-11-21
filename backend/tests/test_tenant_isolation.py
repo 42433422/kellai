@@ -125,7 +125,7 @@ def test_auto_reply_and_assignment_keys_include_tenant(monkeypatch, tmp_path):
         with tenant_scope(team_id):
             create_customer({"name": f"租户{team_id}客户"})
             assert auto_reply_runtime.enqueue_message(
-                _message(team_id, 90001, f"租户{team_id}入站")
+                message_store.save_message(_message(team_id, 90001, f"租户{team_id}入站"))
             )
             assignment = workforce_routing.assign_customer(
                 customer_id=90001,

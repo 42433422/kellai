@@ -17,7 +17,7 @@ import httpx
 
 from app.channels.base import ChannelAdapter, UnifiedMessage
 from app.channels.config_store import get_field
-from app.channels.http_client import BaseChannelClient, CachedToken, read_env
+from app.channels.http_client import BaseChannelClient, CachedToken, ChannelHTTPError, read_env, checked_json, send_error
 
 logger = logging.getLogger(__name__)
 
@@ -25,17 +25,18 @@ _UNCONFIGURED_MSG = "微信渠道未配置（缺少开放平台 AppID/Secret、�
 
 
 def _cfg(field: str, default: str = "") -> str:
-    value = get_field("wechat", field, default=default)
-    if value:
-        return value
-    suffix = field.upper()
-    return (
-        read_env(f"KELLAI_WECHAT_{suffix}", default=default)
-        or read_env(f"WECHAT_{suffix}", default=default)
-    )
+    from app.channels.config_store import environment_config_allowed
+    fallback = read_env(f"WECHAT_{field.upper()}", default=default) if environment_config_allowed() else default
+    return get_field("wechat", field, default=fallback)
 
 
 def _cfg_any(*fields: str) -> str:
+    from app.channels.config_store import get
+    saved = get("wechat")
+    config = {**saved, **(saved.get("config") or {})}
+    for field in fields:
+        if field in config:
+            return str(config[field] or "")
     for field in fields:
         value = _cfg(field)
         if value:
@@ -84,7 +85,10 @@ class _WeChatOfficialClient(BaseChannelClient):
         return await self.ensure_token().get()
 
     async def post_with_token(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        token = await self.fetch_token()
+        try:
+            token = await self.fetch_token()
+        except Exception as exc:
+            raise ChannelHTTPError("微信发送前获取凭据失败", delivery_state="failed") from exc
         return await self.post_json(path, params={"access_token": token}, json=payload)
 
 
@@ -133,13 +137,13 @@ class WeChatAdapter(ChannelAdapter):
 
     async def send_message(self, contact_id: str, content: str, **kwargs: Any) -> dict:
         if not self._is_configured():
-            return {"success": False, "message_id": "", "error": _UNCONFIGURED_MSG}
+            return {"success": False, "message_id": "", "error": _UNCONFIGURED_MSG, "delivery_state": "failed", "definitely_not_sent": True}
 
         content = (content or "").strip()
         if not content:
-            return {"success": False, "message_id": "", "error": "消息内容为空"}
+            return {"success": False, "message_id": "", "error": "消息内容为空", "delivery_state": "failed", "definitely_not_sent": True}
         if not contact_id:
-            return {"success": False, "message_id": "", "error": "contact_id/openid 不能为空"}
+            return {"success": False, "message_id": "", "error": "contact_id/openid 不能为空", "delivery_state": "failed", "definitely_not_sent": True}
 
         if self._bot_webhook() and contact_id.startswith("@chat"):
             return await self._send_via_bot(content, kwargs.get("mentioned_list", []))
@@ -152,12 +156,11 @@ class WeChatAdapter(ChannelAdapter):
                 "success": False,
                 "message_id": "",
                 "error": "微信开放平台 OAuth 已授权，可识别 openid/unionid；主动发消息还需配置公众号 AppID/Secret 并开通客服消息接口",
+                "delivery_state": "failed", "definitely_not_sent": True,
             }
 
-        if self._bot_webhook():
-            return await self._send_via_bot(content, kwargs.get("mentioned_list", []))
-
-        return {"success": False, "message_id": "", "error": _UNCONFIGURED_MSG}
+        return send_error("该联系人缺少公众号客服发信授权；固定群机器人仅支持明确的 @chat 目标",
+                          definitely_not_sent=True)
 
     async def _send_via_bot(self, content: str, mentioned: list[str]) -> dict:
         try:
@@ -170,44 +173,44 @@ class WeChatAdapter(ChannelAdapter):
                         "mentioned_list": list(mentioned or []),
                     },
                 )
-            try:
-                body = resp.json()
-            except Exception:
-                body = {"raw": resp.text}
-            if resp.status_code >= 400 or int(body.get("errcode", 0)) != 0:
-                return {
-                    "success": False,
-                    "message_id": "",
-                    "error": f"微信机器人返回错误: HTTP {resp.status_code} body={body}",
-                }
+            body = checked_json(resp)
+            if body.get("errcode") != 0:
+                return send_error("微信机器人未返回成功确认", definitely_not_sent="errcode" in body)
             return {
                 "success": True,
+                "delivery_state": "accepted",
                 "message_id": str(body.get("msgid", "")),
                 "error": "",
             }
         except Exception as exc:
             logger.warning("微信 send_message 失败: %s", exc)
-            return {"success": False, "message_id": "", "error": str(exc)}
+            return send_error(exc)
 
     async def _send_via_customer_service(self, openid: str, content: str) -> dict:
         try:
             client = _WeChatOfficialClient(self._official_app_id(), self._official_app_secret())
-            body = await client.post_with_token(
-                "/cgi-bin/message/custom/send",
-                {
-                    "touser": openid,
-                    "msgtype": "text",
-                    "text": {"content": content},
-                },
-            )
+            try:
+                body = await client.post_with_token(
+                    "/cgi-bin/message/custom/send",
+                    {
+                        "touser": openid,
+                        "msgtype": "text",
+                        "text": {"content": content},
+                    },
+                )
+            finally:
+                await client.close()
+            if body.get("errcode") != 0:
+                return send_error("微信公众号未返回成功确认", definitely_not_sent="errcode" in body)
             return {
                 "success": True,
+                "delivery_state": "accepted",
                 "message_id": str(body.get("msgid", "")),
                 "error": "",
             }
         except Exception as exc:
             logger.warning("微信客服消息发送失败: %s", exc)
-            return {"success": False, "message_id": "", "error": str(exc)}
+            return send_error(exc)
 
     async def receive_messages(self, since: str = "", limit: int = 50) -> list[UnifiedMessage]:
         try:
@@ -261,17 +264,22 @@ class WeChatAdapter(ChannelAdapter):
                 break
         return list(seen.values())
 
-    async def test_connection(self) -> dict:
+    async def test_connection(self, **kwargs) -> dict:
         if not self._is_configured():
             return {"connected": False, "message": _UNCONFIGURED_MSG}
         if self._bot_webhook():
-            return {"connected": True, "message": "微信兼容 Webhook 已配置（无需 access_token）"}
+            return {"connected": False, "verification_level": "configured",
+                    "message": "微信兼容 Webhook 已配置；尚未进行远端收发验收"}
         if self._has_official_account_config():
             try:
                 client = _WeChatOfficialClient(self._official_app_id(), self._official_app_secret())
-                token = await client.fetch_token()
+                try:
+                    token = await client.fetch_token()
+                finally:
+                    await client.close()
                 if token:
-                    return {"connected": True, "message": "微信公众号 access_token 拉取成功，客服消息接口可用"}
+                    return {"connected": True, "verification_level": "authenticated",
+                            "message": "微信公众号鉴权通过；客服消息权限、回复窗口和真实收发尚需验收"}
                 return {"connected": False, "message": "微信公众号 token 为空"}
             except Exception as exc:
                 return {"connected": False, "message": f"微信公众号连接失败: {exc}"}

@@ -40,5 +40,14 @@ class ChannelAdapter(ABC):
         """获取联系人/群列表。"""
 
     @abstractmethod
-    async def test_connection(self) -> dict:
+    async def test_connection(self, **kwargs) -> dict:
         """测试渠道连接，返回 {"connected": bool, "message": str}。"""
+
+    async def close(self) -> None:
+        """Release a cached HTTPX client or the shared channel HTTP wrapper."""
+        client = getattr(self, "_client", None)
+        if client is not None:
+            closer = getattr(client, "aclose", None) or getattr(client, "close", None)
+            if closer is not None:
+                await closer()
+            self._client = None

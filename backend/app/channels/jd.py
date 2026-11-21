@@ -1,14 +1,7 @@
-"""京东渠道适配器（真实 HTTP API 实现 · 京东开放平台）。
+"""京东历史接入骨架。
 
-参考：https://open.jd.com
-- 鉴权：app_key / app_secret → access_token（OAuth2）
-- 发送：jingdong.message.send（ISV 消息推送）
-- 接收：依赖 webhook → kellai_channel_inbox
-
-环境变量：
-- KELLAI_JD_APP_KEY
-- KELLAI_JD_APP_SECRET
-- KELLAI_JD_BASE_URL（默认 https://api.jd.com）
+原请求未形成完整OAuth授权与可验证聊天协议。本轮停止客户消息外发，
+保留历史inbox消费；本地签名生成不代表平台鉴权。
 """
 from __future__ import annotations
 
@@ -31,11 +24,11 @@ _UNCONFIGURED_MSG = "京东渠道未配置（缺少 app_key / app_secret）"
 
 
 def _app_key() -> str:
-    return get_field("jd", "app_key", read_env("KELLAI_JD_APP_KEY"))
+    return get_field("jd", "app_key")
 
 
 def _app_secret() -> str:
-    return get_field("jd", "app_secret", read_env("KELLAI_JD_APP_SECRET"))
+    return get_field("jd", "app_secret")
 
 
 class JdAdapter(ChannelAdapter):
@@ -69,43 +62,11 @@ class JdAdapter(ChannelAdapter):
     # ----------------- send_message -----------------
 
     async def send_message(self, contact_id: str, content: str, **kwargs: Any) -> dict:
-        """调用 jingdong_message_send 发送通知。"""
-        if not self._is_configured():
-            return {"success": False, "message_id": "", "error": _UNCONFIGURED_MSG}
-        if not contact_id or not (content or "").strip():
-            return {"success": False, "message_id": "", "error": "参数不完整"}
-        try:
-            client = await self._get_client()
-            ts = str(int(time.time() * 1000))
-            params: dict[str, Any] = {
-                "app_key": _app_key(),
-                "timestamp": ts,
-                "format": "json",
-                "v": "1.0",
-                "method": "jingdong.message.send",
-                "param_json": '{"content": "' + content.replace('"', '\\"') + '", "to": "' + contact_id + '"}',
-            }
-            params["sign"] = self._sign(params, _app_secret())
-            resp = await client.post("/routerjson", json=params)
-            try:
-                body = resp.json()
-            except Exception:
-                body = {"raw": resp.text}
-            inner = body.get("jingdong_message_send_response", {}) or {}
-            if "code" in inner and int(inner.get("code", 0)) != 0:
-                return {
-                    "success": False,
-                    "message_id": "",
-                    "error": f"errcode={inner.get('code')} {inner.get('msg', '')}",
-                }
-            return {
-                "success": True,
-                "message_id": str(inner.get("result", "") or ""),
-                "error": "",
-            }
-        except Exception as exc:
-            logger.warning("京东 send_message 异常: %s", exc)
-            return {"success": False, "message_id": "", "error": str(exc)}
+        """The historical request is not an authorized customer chat protocol."""
+        from app.channels.capabilities import CAPABILITIES
+        return {"success": False, "message_id": "", "delivery_state": "failed",
+                "definitely_not_sent": True, "retryable": False,
+                "error": CAPABILITIES[self.channel_type]["limitations"][0]}
 
     # ----------------- receive_messages -----------------
 
@@ -164,20 +125,7 @@ class JdAdapter(ChannelAdapter):
 
     # ----------------- test_connection -----------------
 
-    async def test_connection(self) -> dict:
-        if not self._is_configured():
-            return {"connected": False, "message": _UNCONFIGURED_MSG}
-        try:
-            params = {
-                "app_key": _app_key(),
-                "timestamp": str(int(time.time() * 1000)),
-                "format": "json",
-                "v": "1.0",
-                "method": "jingdong.time.check",
-            }
-            sig = self._sign(params, _app_secret())
-            if not sig or len(sig) != 32:
-                return {"connected": False, "message": "京东签名生成失败，app_secret 格式异常"}
-            return {"connected": True, "message": "京东 app_key/app_secret 签名校验通过"}
-        except Exception as exc:
-            return {"connected": False, "message": f"京东连接失败: {exc}"}
+    async def test_connection(self, **kwargs) -> dict:
+        from app.channels.capabilities import CAPABILITIES
+        return {"connected": False, "verification_level": "unverified",
+                "message": CAPABILITIES[self.channel_type]["limitations"][0]}

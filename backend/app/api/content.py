@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 router = APIRouter(prefix="/api/kellai/content", tags=["content"])
@@ -35,7 +35,7 @@ def generate_video_script(body: TopicBody) -> dict:
 
 @router.post("/publish")
 def publish(body: PublishBody) -> dict:
-    return {"success": True, "data": {"id": body.content_id, "status": "published", "platforms": body.platforms}}
+    raise HTTPException(status_code=501, detail="内容发布尚未接入平台授权和真实发布接口；当前内容仅为草稿")
 
 
 @router.post("/ad-strategy")

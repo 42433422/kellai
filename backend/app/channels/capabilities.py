@@ -1,0 +1,111 @@
+"""Audited implementation capabilities, not proof of a customer's authorization.
+
+Only an actual end-to-end receipt can establish live delivery. The catalog is
+the shared backend/frontend source of truth and never infers ability from a name.
+"""
+from __future__ import annotations
+
+from typing import Any
+
+
+def _cap(*, receive: bool, send: bool, transport: str, receive_mode: str,
+         readiness: str, limitations: list[str], auto_reply: bool = True, **extra: Any) -> dict:
+    return {"receive": receive, "send": send, "contacts": True, "sync": True,
+            "transport": transport, "receive_mode": receive_mode, "readiness": readiness,
+            "auto_reply": auto_reply and send and receive,
+            "verification_level": "code_reviewed", "live_verified": False,
+            "contact_source": "known_contacts", "limitations": limitations, **extra}
+
+
+CAPABILITIES = {
+    "wework": _cap(receive=True, send=True, transport="api", receive_mode="signed_webhook",
+        readiness="implemented", limitations=[
+            "应用消息仅发内部成员；群机器人发固定群；客服接待链接不等于外部联系人聊天API。",
+            "需要企业授权、应用可见范围和可信回调；尚无该账号真实送达验收。"],
+        send_modes=["internal_app_message", "fixed_group_bot"]),
+    "wechat": _cap(receive=True, send=True, transport="api", receive_mode="signed_webhook",
+        readiness="implemented", limitations=[
+            "当前公众号回调仅明文模式，AES安全模式尚未接入。",
+            "公众号客服消息需要公众号权限、openid及平台回复窗口。",
+            "开放平台扫码登录只证明身份授权；不支持个人微信好友任意私聊。"],
+        send_modes=["official_account_customer_service", "fixed_group_bot"]),
+    "douyin": _cap(receive=True, send=True, transport="hybrid", receive_mode="webhook_or_native_capture",
+        readiness="conditional", limitations=[
+            "官方私信需相应scope及真实入站会话；miniapp回复需owner/conversation/server_message上下文。",
+            "网页会话的桌面发送需原生运行时，云端无原生运行时时必须拦截。"],
+        transports=["official_api", "remote_bridge", "native_desktop"], native_only=False,
+        native_sources=["douyin_web_portal", "manual"]),
+    "miniprogram": _cap(receive=False, send=True, transport="api", receive_mode="local_inbox_only",
+        readiness="outbound_only", auto_reply=False, limitations=[
+            "这里只实现用户订阅的模板通知，不是任意文本私聊；需要template_id和匹配的模板字段。",
+            "原生云函数入站适配尚未提供。"], message_types=["template"]),
+    "phone": _cap(receive=False, send=True, transport="sms_api", receive_mode="local_inbox_only",
+        readiness="outbound_only", auto_reply=False, limitations=[
+            "现有实现为Twilio短信/阿里云模板短信，不是语音通话。",
+            "原生上行短信和送达回调尚未接入；可通过支持该渠道的Chatwoot收件箱接入。"]),
+    "telegram": _cap(receive=False, send=True, transport="api", receive_mode="local_inbox_only",
+        readiness="outbound_only", limitations=[
+            "Bot API sendMessage可发送到有权限的chat_id；原生getUpdates/webhook尚未实现。",
+            "双向消息可使用Chatwoot Telegram收件箱。"]),
+    "line": _cap(receive=False, send=True, transport="api", receive_mode="local_inbox_only",
+        readiness="outbound_only", limitations=[
+            "Messaging API push仅限平台允许的user/group目标；原生签名回调尚未实现。",
+            "双向消息可使用Chatwoot LINE收件箱。"]),
+    "whatsapp": _cap(receive=False, send=True, transport="api", receive_mode="local_inbox_only",
+        readiness="outbound_only", limitations=[
+            "Cloud API自由文本受会话窗口及商业账号授权限制；原生回调尚未实现。",
+            "双向消息可使用Chatwoot WhatsApp收件箱。"]),
+    "chatwoot": _cap(receive=True, send=True, transport="api", receive_mode="signed_webhook",
+        readiness="implemented", limitations=[
+            "绑定一个account/inbox；网关支持哪些平台取决于Chatwoot收件箱及该平台账号授权。",
+            "发送响应仅表示Chatwoot受理；真实status经认证API读取，未知结果不自动重发。",
+            "当前客来来适配器只发送文本；平台接入和真实设备验收仍需部署方完成。"],
+        upstream_version="4.20.1", message_types=["text"]),
+}
+
+for _kind, _reason in {
+    "taobao": "旧实现调用TMC事件生产，不是买家私聊。",
+    "jd": "旧协议缺少完整OAuth/平台授权，无法证明京麦聊天可用。",
+    "pdd": "旧发送请求缺少完整开放平台方法和授权，无法证明客服聊天可用。",
+    "alibaba": "旧开放平台请求未形成可验证的旺旺/1688聊天协议。",
+}.items():
+    CAPABILITIES[_kind] = _cap(receive=False, send=False, transport="unverified",
+        receive_mode="local_inbox_only", readiness="blocked", auto_reply=False,
+        limitations=[_reason, "保留配置和历史数据；需官方授权协议及真实平台验收后再开放发送。"])
+
+
+CHATWOOT_CONFIG_SCHEMA = {
+    "type": "object",
+    "required": ["base_url", "account_id", "inbox_id", "api_access_token", "webhook_secret"],
+    "properties": {
+        "base_url": {"type": "string", "title": "Chatwoot 地址"},
+        "account_id": {"type": "string", "title": "Account ID"},
+        "inbox_id": {"type": "string", "title": "Inbox ID"},
+        "api_access_token": {"type": "string", "title": "API Access Token", "writeOnly": True},
+        "webhook_secret": {"type": "string", "title": "Webhook Secret", "writeOnly": True},
+    },
+}
+
+
+def resolve_send_capability(channel_type: str, *, contact_id: str, customer_id: int = 0,
+                            contact_name: str = "", metadata: dict | None = None, team_id: int = 0) -> dict:
+    """Resolve transport for this recipient before reserving an outbound send."""
+    from app.services.tenant_context import resolve_team_id
+    from app.channels.registry import ChannelRegistry
+    kind = ChannelRegistry._aliases.get(channel_type, channel_type)
+    capability = dict(CAPABILITIES.get(kind, {"send": False, "transport": "unverified"}))
+    if kind != "douyin":
+        return capability
+    from app.channels.douyin import DouyinAdapter
+    resolved_team = resolve_team_id(team_id, required=True)
+    source = (metadata or {}).get("source")
+    target = DouyinAdapter._resolve_desktop_target(
+        customer_id=customer_id, contact_id=contact_id, contact_name=contact_name, team_id=resolved_team,
+    )
+    if source == "douyin_web_portal" or target:
+        capability.update(transport="desktop", send=False, auto_reply=False,
+                          requires_desktop_execution=True, error="requires_desktop_execution",
+                          definitely_not_sent=True)
+    else:
+        capability.update(transport="api", requires_desktop_execution=False)
+    return capability

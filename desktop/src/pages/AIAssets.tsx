@@ -64,6 +64,7 @@ const CHANNEL_LABELS: Record<string, string> = {
   whatsapp: 'WhatsApp',
   telegram: 'Telegram',
   line: 'LINE',
+  chatwoot: 'Chatwoot 多渠道网关',
   email: '邮件',
   sms: '短信',
   web: '网页',
@@ -86,6 +87,7 @@ const ACCOUNT_ID_KEYS = [
   'open_id',
   'openid',
   'open_kfid',
+  'inbox_id',
   'phone_number_id',
   'bot_username',
   'user_id',
@@ -185,7 +187,7 @@ function genericAsset(channel: Channel): ChannelAccountAsset | null {
   else if (channel.onboarding?.status === 'saved' || channel.enabled) state = 'pending';
 
   return {
-    id: `${channel.type}:primary`,
+    id: channel.connection_id || `${channel.type}:primary`,
     channelType: channel.type,
     channelName,
     accountName,
@@ -193,7 +195,7 @@ function genericAsset(channel: Channel): ChannelAccountAsset | null {
     bindingType: bindingTypeOf(channel),
     state,
     connected: channel.connected,
-    message: channel.message,
+    message: [channel.message, `接收：${channel.capabilities?.receive ? '已实现' : '未接通'} / 发送：${channel.capabilities?.send ? '已实现' : '未接通'}`, channel.capabilities?.limitations?.[0]].filter(Boolean).join(' · '),
   };
 }
 

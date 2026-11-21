@@ -1,4 +1,4 @@
-FROM python:3.11-slim AS base
+FROM python:3.12-slim AS base
 
 # 系统依赖
 RUN apt-get update && \
@@ -8,8 +8,8 @@ RUN apt-get update && \
 WORKDIR /app
 
 # 先装依赖（利用 Docker layer cache）
-COPY pyproject.toml ./
-RUN pip install --no-cache-dir .
+COPY requirements.lock ./
+RUN pip install --no-cache-dir -r requirements.lock
 
 # 再拷代码
 COPY app/ app/
@@ -25,4 +25,4 @@ ENV KELLAI_PORT=8790
 
 EXPOSE 8790
 
-CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8790", "--workers", "2"]
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8790", "--workers", "1"]

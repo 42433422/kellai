@@ -1,15 +1,7 @@
-"""淘宝 / 天猫渠道适配器（真实 HTTP API 实现 · 淘宝开放平台 TopAPI）。
+"""淘宝/天猫历史接入骨架。
 
-参考：https://open.taobao.com
-- 鉴权：app_key / app_secret → session_key（依赖用户授权码 code，本适配器接受预授权 session）
-- 发送：taobao.tmc.message.produce（交易消息中心，适合商户通知）
-- 接收：webhook / TMC 长连接 → kellai_channel_inbox
-
-环境变量（或前端配置保存到 channel_configs.json）：
-- KELLAI_TAOBAO_APP_KEY
-- KELLAI_TAOBAO_APP_SECRET
-- KELLAI_TAOBAO_SESSION_KEY（可选，商家预授权 session）
-- KELLAI_TAOBAO_BASE_URL（默认 https://eco.taobao.com）
+TMC事件生产不是买家私聊。本轮停止未经验证的客户消息外发，
+保留原配置工具和历史inbox消费；能力以capabilities.py为准。
 """
 from __future__ import annotations
 
@@ -32,15 +24,15 @@ _UNCONFIGURED_MSG = "淘宝渠道未配置（缺少 app_key / app_secret）"
 
 
 def _app_key() -> str:
-    return get_field("taobao", "app_key", read_env("KELLAI_TAOBAO_APP_KEY"))
+    return get_field("taobao", "app_key")
 
 
 def _app_secret() -> str:
-    return get_field("taobao", "app_secret", read_env("KELLAI_TAOBAO_APP_SECRET"))
+    return get_field("taobao", "app_secret")
 
 
 def _session_key() -> str:
-    return get_field("taobao", "session_key", read_env("KELLAI_TAOBAO_SESSION_KEY"))
+    return get_field("taobao", "session_key")
 
 
 class TaobaoAdapter(ChannelAdapter):
@@ -74,53 +66,11 @@ class TaobaoAdapter(ChannelAdapter):
     # ----------------- send_message -----------------
 
     async def send_message(self, contact_id: str, content: str, **kwargs: Any) -> dict:
-        """通过 taobao.tmc.message.produce 发送通知。
-
-        contact_id: 商家 nick 或用户 open_id
-        content: 文本
-        """
-        if not self._is_configured():
-            return {"success": False, "message_id": "", "error": _UNCONFIGURED_MSG}
-        if not contact_id or not (content or "").strip():
-            return {"success": False, "message_id": "", "error": "参数不完整"}
-
-        try:
-            client = await self._get_client()
-            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-            params: dict[str, Any] = {
-                "app_key": _app_key(),
-                "timestamp": ts,
-                "format": "json",
-                "v": "2.0",
-                "sign_method": "md5",
-                "method": "taobao.tmc.message.produce",
-                "topic": "kellai",
-                "content": content,
-                "to_ids": contact_id,
-            }
-            session = _session_key()
-            if session:
-                params["session"] = session
-            params["sign"] = self._sign(params, _app_secret())
-
-            resp = await client.post("/router/rest", data=params)
-            try:
-                body = resp.json()
-            except Exception:
-                body = {"raw": resp.text}
-            inner = body.get("tmc_message_produce_response", {}) or {}
-            result = inner.get("is_success") or inner.get("msg_id")
-            if not result:
-                err = body.get("error_response", {}) or {}
-                return {
-                    "success": False,
-                    "message_id": "",
-                    "error": f"errcode={err.get('code')} {err.get('msg', '')}",
-                }
-            return {"success": True, "message_id": str(inner.get("msg_id", "")), "error": ""}
-        except Exception as exc:
-            logger.warning("淘宝 send_message 异常: %s", exc)
-            return {"success": False, "message_id": "", "error": str(exc)}
+        """The historical request is not an authorized customer chat protocol."""
+        from app.channels.capabilities import CAPABILITIES
+        return {"success": False, "message_id": "", "delivery_state": "failed",
+                "definitely_not_sent": True, "retryable": False,
+                "error": CAPABILITIES[self.channel_type]["limitations"][0]}
 
     # ----------------- receive_messages -----------------
 
@@ -179,21 +129,7 @@ class TaobaoAdapter(ChannelAdapter):
 
     # ----------------- test_connection -----------------
 
-    async def test_connection(self) -> dict:
-        if not self._is_configured():
-            return {"connected": False, "message": _UNCONFIGURED_MSG}
-        try:
-            # 不发实际请求，只本地拼一次签名验证 app_key/secret 格式
-            params = {
-                "app_key": _app_key(),
-                "timestamp": str(int(time.time())),
-                "format": "json",
-                "v": "2.0",
-                "method": "taobao.time.get",
-            }
-            sig = self._sign(params, _app_secret())
-            if not sig or len(sig) != 32:
-                return {"connected": False, "message": "淘宝签名生成失败，app_secret 格式异常"}
-            return {"connected": True, "message": "淘宝 app_key/app_secret 签名校验通过"}
-        except Exception as exc:
-            return {"connected": False, "message": f"淘宝连接失败: {exc}"}
+    async def test_connection(self, **kwargs) -> dict:
+        from app.channels.capabilities import CAPABILITIES
+        return {"connected": False, "verification_level": "unverified",
+                "message": CAPABILITIES[self.channel_type]["limitations"][0]}

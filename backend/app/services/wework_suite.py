@@ -377,6 +377,40 @@ def save_suite_ticket(ticket: str) -> None:
         )
 
 
+def load_authorization(team_id: int) -> dict[str, Any]:
+    """Read the active sending identity without decrypting credentials."""
+
+    from app.services.tenant_context import resolve_team_id
+
+    team_id = resolve_team_id(team_id, required=True)
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT team_id, auth_corpid, agent_id, status FROM kellai_wework_authorizations "
+            "WHERE team_id=? AND status='authorized'", (team_id,),
+        ).fetchone()
+    return dict(row) if row is not None else {}
+
+
+def resolve_callback_authorization(corp_id: str) -> dict[str, Any]:
+    """Resolve an already-authenticated data callback to its active tenant.
+
+    This helper intentionally returns no permanent code or access token. Its
+    caller must verify and decrypt the callback before trusting the corp ID.
+    """
+
+    corp_id = str(corp_id or "").strip()
+    if not corp_id:
+        raise WeWorkSuiteError("企业微信回调缺少 CorpID")
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT team_id, auth_corpid, agent_id FROM kellai_wework_authorizations "
+            "WHERE auth_corpid=? AND status='authorized'", (corp_id,),
+        ).fetchall()
+    if len(rows) != 1 or int(rows[0]["team_id"]) <= 0:
+        raise WeWorkSuiteError("企业微信回调企业尚未授权或授权已撤销")
+    return dict(rows[0])
+
+
 def load_suite_ticket() -> str:
     ensure_schema()
     with sqlite3.connect(str(_crm_db_path()), timeout=10.0) as conn:

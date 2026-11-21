@@ -1,5 +1,6 @@
-import api from './client';
+import api, { currentAccountKey } from './client';
 import { invoke } from '@tauri-apps/api/core';
+import { clearPendingDelivery, readPendingDelivery } from './deliveryState';
 
 /** 消息未读汇总响应 */
 export interface UnreadSummary {
@@ -10,6 +11,8 @@ export interface UnreadSummary {
 
 export interface AutoReplyJob {
   inbound_message_id: string;
+  lease_token: string;
+  delivery_key: string;
   customer_id: number;
   channel_type: string;
   contact_id: string;
@@ -42,84 +45,174 @@ export const getMessages = async (params: { customer_id?: number; channel_type?:
 };
 
 /** 同步渠道收件箱到消息/客户/漏斗闭环 */
-export const syncInboxMessages = (channelType = '', limit = 50) =>
+export const syncInboxMessages = (channelType = '', limit = 50, accountKey = currentAccountKey()) =>
   api.post(
     '/api/kellai/channels/sync-inbox',
     { channel_type: channelType, limit },
-    { skipErrorToast: true, skipLoading: true },
+    { expectedAccount: accountKey, skipErrorToast: true, skipLoading: true },
   );
 
-/** 发送消息 */
+export interface DeliveryReceipt {
+  request_id: string;
+  message_id: string;
+  provider_message_id?: string;
+  status: 'sending' | 'unknown' | 'accepted' | 'failed';
+  provider_state?: string;
+  success?: boolean;
+  persisted: boolean;
+  error?: string;
+  dispatch_allowed?: boolean;
+  delivery_token?: string;
+}
+
+export class MessageSendError extends Error {
+  name = 'MessageSendError';
+  constructor(message: string, public receipt?: DeliveryReceipt) { super(message); }
+}
+
+export const deliveryLabel = (receipt: DeliveryReceipt) => {
+  if (receipt.provider_state === 'read') return '渠道回执：已读';
+  if (receipt.provider_state === 'delivered') return '渠道回执：已送达';
+  if (receipt.status === 'accepted') return '渠道已受理，送达待确认';
+  if (receipt.status === 'failed') return '发送失败，渠道未接受';
+  return '发送结果待确认，请查询原请求回执';
+};
+
+export const getDeliveryReceipt = async (requestId: string, accountKey = currentAccountKey()): Promise<DeliveryReceipt> => {
+  const response = await api.get(`/api/kellai/messages/requests/${encodeURIComponent(requestId)}`,
+    { expectedAccount: accountKey, skipErrorToast: true, skipLoading: true });
+  return response.data.data;
+};
+
+// Only request IDs and hashes survive a refresh. No message text, credentials
+// or single-use native execution tokens are written to browser storage.
+const nativeCompletions = new Map<string, Record<string, unknown>>();
+
+/** Restore a known native result after an interrupted HTTP response or login switch.
+ * This submits only the original receipt; it never executes a native send.
+ */
+export const flushNativeCompletions = async (accountKey = currentAccountKey()): Promise<void> => {
+  if (!accountKey || currentAccountKey() !== accountKey) return;
+  for (const [nativeKey, body] of nativeCompletions) {
+    if (!nativeKey.startsWith(`${accountKey}:`)) continue;
+    if (currentAccountKey() !== accountKey) return;
+    try {
+      const response = await api.post('/api/kellai/messages/send', body, {
+        expectedAccount: accountKey, timeout: 45_000, skipErrorToast: true, skipLoading: true,
+        headers: { 'X-Kellai-Desktop-Delivery': '1' },
+      });
+      const receipt = response.data.data as DeliveryReceipt;
+      if (receipt.request_id !== body.client_request_id || receipt.status === 'sending') continue;
+      // The ledger now owns this result, including an explicit unknown result.
+      nativeCompletions.delete(nativeKey);
+      if (receipt.status === 'failed' || (receipt.status === 'accepted' && receipt.persisted)) {
+        const storageKey = `kellai:delivery:${accountKey}:${body.customer_id}:${body.channel_type}:${body.contact_id}`;
+        clearPendingDelivery(localStorage, storageKey, receipt.request_id);
+      }
+    } catch { /* Keep the original in-memory receipt for this account's next poll. */ }
+  }
+};
+
+/** Reserve a stable request before either HTTP or native execution. */
 export const sendMessage = async (
   customerId: number,
   channelType: string,
   contactId: string,
   content: string,
   contactName = '',
-  options?: { autoReplyInboundId?: string },
-) => {
-  let desktopResult: Record<string, unknown> | undefined;
-  const isTauriRuntime =
-    typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
-  if (channelType === 'douyin' && isTauriRuntime) {
-    try {
-      desktopResult = await invoke<Record<string, unknown>>('douyin_desktop_send', {
-        contactName,
-        contactId,
-        content,
-      });
-    } catch (reason) {
-      const message = reason instanceof Error ? reason.message : String(reason || '抖音桌面发送失败');
-      if (message.includes('辅助功能权限')) {
-        await invoke('open_accessibility_settings').catch(() => undefined);
+  options?: { autoReplyInboundId?: string; leaseToken?: string; clientRequestId?: string; expectedAccount?: string },
+): Promise<DeliveryReceipt> => {
+  const accountKey = options?.expectedAccount || currentAccountKey();
+  if (!accountKey) throw new MessageSendError('请先登录');
+  if (currentAccountKey() !== accountKey) throw new MessageSendError('账号已切换，旧账号操作已停止');
+  const storageKey = `kellai:delivery:${accountKey}:${customerId}:${channelType}:${contactId}`;
+  const hash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(content))))
+    .map((b) => b.toString(16).padStart(2, '0')).join('');
+  let requestId = options?.clientRequestId || '';
+  if (!requestId) {
+    const previous = readPendingDelivery(localStorage, storageKey);
+    if (previous?.requestId && previous.hash !== hash) {
+      const old = await getDeliveryReceipt(previous.requestId, accountKey).catch(() => null);
+      if (!old || !['accepted', 'failed'].includes(old.status) || (old.status === 'accepted' && !old.persisted)) {
+        throw new MessageSendError('该联系人上一条发送尚未确认，请保留原内容并查询回执', old || undefined);
       }
-      const error = new Error(message);
-      error.name = 'MessageSendError';
-      throw error;
+      clearPendingDelivery(localStorage, storageKey, previous.requestId);
+    } else if (previous?.requestId) {
+      requestId = previous.requestId;
     }
+    requestId ||= crypto.randomUUID();
+    localStorage.setItem(storageKey, JSON.stringify({ requestId, hash }));
   }
-  const response = await api.post(
-    '/api/kellai/messages/send',
-    {
-      customer_id: customerId,
-      channel_type: channelType,
-      contact_id: contactId,
-      content,
-      ...(options?.autoReplyInboundId
-        ? { auto_reply_inbound_id: options.autoReplyInboundId }
-        : {}),
-      ...(desktopResult ? { desktop_result: desktopResult } : {}),
-    },
-    {
-      timeout: 45_000,
-      ...(desktopResult ? { headers: { 'X-Kellai-Desktop-Delivery': '1' } } : {}),
-    },
-  );
-  const payload = response.data as {
-    success?: boolean;
-    error?: string;
-    message?: string;
-    data?: unknown;
+  const body: Record<string, unknown> = {
+    customer_id: customerId, channel_type: channelType, contact_id: contactId, content,
+    client_request_id: requestId,
+    ...(options?.autoReplyInboundId ? { auto_reply_inbound_id: options.autoReplyInboundId,
+      auto_reply_lease_token: options.leaseToken || '' } : {}),
   };
-  if (payload?.success === false) {
-    const error = new Error(payload.error || payload.message || '渠道发送失败');
-    error.name = 'MessageSendError';
-    throw error;
+  const config = { timeout: 45_000, expectedAccount: accountKey, skipErrorToast: true,
+    skipLoading: Boolean(options?.autoReplyInboundId) };
+  const nativeKey = `${accountKey}:${requestId}`;
+  const finish = (receipt: DeliveryReceipt): DeliveryReceipt => {
+    if (receipt.status === 'accepted' && receipt.persisted) {
+      if (!options?.clientRequestId) clearPendingDelivery(localStorage, storageKey, requestId);
+      nativeCompletions.delete(nativeKey);
+      return receipt;
+    }
+    if (receipt.status === 'failed' && !options?.clientRequestId) clearPendingDelivery(localStorage, storageKey, requestId);
+    throw new MessageSendError(receipt.error || (receipt.status === 'accepted'
+      ? '渠道已受理，本地记录正在恢复，请查询原请求回执' : deliveryLabel(receipt)), receipt);
+  };
+  try {
+    const isNative = channelType === 'douyin' && typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+    if (isNative) {
+      const nativeConfig = { ...config, headers: { 'X-Kellai-Desktop-Delivery': '1' } };
+      let completedBody = nativeCompletions.get(nativeKey);
+      if (!completedBody) {
+        const prepared = await api.post('/api/kellai/messages/prepare', body, nativeConfig);
+        const reservation = prepared.data.data as DeliveryReceipt;
+        if (!reservation.dispatch_allowed) return finish(reservation);
+        if (currentAccountKey() !== accountKey) throw new MessageSendError('账号已切换，本次桌面发送已停止');
+        let result: Record<string, unknown>;
+        try {
+          result = await invoke<Record<string, unknown>>('douyin_desktop_send', { contactName, contactId, content });
+        } catch (reason) {
+          result = { success: false, source: 'douyin_desktop_automation', contact_id: contactId,
+            delivery_state: 'unknown', error: reason instanceof Error ? reason.message : '桌面执行结果未知' };
+        }
+        completedBody = { ...body, delivery_token: reservation.delivery_token, desktop_result: result };
+        nativeCompletions.set(nativeKey, completedBody);
+      }
+      const response = await api.post('/api/kellai/messages/send', completedBody, nativeConfig);
+      return finish(response.data.data as DeliveryReceipt);
+    }
+    const response = await api.post('/api/kellai/messages/send', body, config);
+    return finish(response.data.data as DeliveryReceipt);
+  } catch (reason: any) {
+    if (reason instanceof MessageSendError) throw reason;
+    if (currentAccountKey() !== accountKey) throw new MessageSendError('账号已切换，请回到原账号查询发送回执');
+    const receipt = await getDeliveryReceipt(requestId, accountKey).catch(() => null);
+    if (receipt) return finish(receipt);
+    const status = reason?.response?.status;
+    if ([400, 401, 403, 404, 422].includes(status) && !options?.clientRequestId) clearPendingDelivery(localStorage, storageKey, requestId);
+    throw new MessageSendError(reason?.response?.data?.error || '发送结果未确认。再次提交将沿用原请求，避免重复发送',
+      { request_id: requestId, message_id: '', status: 'unknown', persisted: false });
   }
-  return payload?.data ?? payload;
 };
 
 /** 领取需要由已签名桌面端真实发送的自动回复任务 */
-export const claimAutoReplyJobs = (limit = 3) =>
-  api.post('/api/kellai/ai/auto-reply/jobs/claim', { limit });
+export const claimAutoReplyJobs = (limit = 3, accountKey = currentAccountKey()) =>
+  api.post('/api/kellai/ai/auto-reply/jobs/claim', { limit }, { expectedAccount: accountKey });
 
 /** 回报自动回复发送结果（成功发送也会由统一发送接口幂等落账） */
 export const reportAutoReplyResult = (payload: {
   inbound_message_id: string;
+  lease_token: string;
+  delivery_key: string;
   success: boolean;
   error?: string;
   outbound_message_id?: string;
-}) => api.post('/api/kellai/ai/auto-reply/jobs/result', payload);
+}, accountKey = currentAccountKey()) => api.post('/api/kellai/ai/auto-reply/jobs/result', payload,
+  { expectedAccount: accountKey, skipErrorToast: true, skipLoading: true });
 
 /** 自动回复真实运行状态 */
 export const getAutoReplyRuntimeStatus = () =>
