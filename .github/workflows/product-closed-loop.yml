@@ -15,7 +15,7 @@ jobs:
       KELLAI_APP_ENV: development
       KELLAI_JWT_SECRET: isolated-ci-test-secret
       KELLAI_CHANNEL_WORKER_ENABLED: "0"
-      KELLAI_DATA_DIR: ${{ runner.temp }}/kellai-test-data
+      KELLAI_DATA_DIR: /tmp/kellai-test-data
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
