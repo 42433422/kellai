@@ -7,7 +7,10 @@ import { build } from 'esbuild';
 // Bundle the actual product API with only the network/native transport replaced.
 // No browser, provider account, native app or new test dependency is required.
 const bundled = await build({
-  entryPoints: [fileURLToPath(new URL('../src/api/messages.ts', import.meta.url))],
+  stdin: {
+    contents: "export * from './src/api/messages.ts'; export * from './src/api/deliveryState.ts';",
+    resolveDir: fileURLToPath(new URL('..', import.meta.url)), loader: 'ts',
+  },
   bundle: true, platform: 'node', format: 'esm', write: false,
   plugins: [{ name: 'test-transports', setup(builder) {
     builder.onResolve({ filter: /^\.\/client$/ }, () => ({ path: 'client', namespace: 'transport' }));
@@ -82,13 +85,118 @@ test('late acceptance cannot delete the next request recovery pointer', async ()
   assert.equal(localStorage.getItem(storageKey), null);
 });
 
-test('a corrupt pointer does not break a new authorized request', async () => {
+test('an absent recovery pointer allows one authorized request', async () => {
   const key = 'kellai:delivery:7:1:7:telegram:contact';
-  localStorage.setItem(key, '{broken-json');
+  assert.equal(localStorage.getItem(key), null);
   let calls = 0;
-  __deliveryHarness.post = async (_url, body) => { calls += 1; return response(accepted(body.client_request_id)); };
+  __deliveryHarness.post = async (_url, body) => {
+    calls += 1;
+    const pointer = JSON.parse(localStorage.getItem(key));
+    assert.equal(pointer.requestId, body.client_request_id);
+    assert.match(pointer.hash, /^[a-f0-9]{64}$/);
+    return response(accepted(body.client_request_id));
+  };
   assert.equal((await api.sendMessage(7, 'telegram', 'contact', 'hello')).status, 'accepted');
   assert.equal(calls, 1);
+  assert.equal(localStorage.getItem(key), null);
+});
+
+for (const [name, raw] of [
+  ['invalid JSON', '{broken-json'],
+  ['empty record', ''],
+  ['serialized null', 'null'],
+  ['array', '[]'],
+  ['missing fields', '{}'],
+  ['empty request ID', JSON.stringify({ requestId: ' ', hash: 'a'.repeat(64) })],
+  ['non-string request ID', JSON.stringify({ requestId: 123, hash: 'a'.repeat(64) })],
+  ['missing hash', JSON.stringify({ requestId: 'original-request' })],
+  ['invalid hash', JSON.stringify({ requestId: 'original-request', hash: 'truncated' })],
+]) {
+  test(`${name} blocks new external delivery and preserves the damaged record`, async () => {
+    const key = 'kellai:delivery:7:1:7:telegram:contact';
+    localStorage.setItem(key, raw);
+    let posts = 0;
+    __deliveryHarness.post = async (_url, body) => { posts += 1; return response(accepted(body.client_request_id)); };
+    await assert.rejects(api.sendMessage(7, 'telegram', 'contact', 'hello'), /本地发送记录/);
+    assert.equal(posts, 0);
+    assert.equal(localStorage.getItem(key), raw);
+  });
+}
+
+test('an unreadable recovery pointer blocks HTTP and native delivery', async () => {
+  const key = 'kellai:delivery:7:1:7:douyin:contact';
+  const original = JSON.stringify({ requestId: 'original-request', hash: 'a'.repeat(64) });
+  localStorage.setItem(key, original);
+  localStorage.getItem = () => { throw new Error('storage unavailable'); };
+  window.__TAURI_INTERNALS__ = {};
+  let posts = 0;
+  let invokes = 0;
+  __deliveryHarness.post = async (_url, body) => { posts += 1; return response(accepted(body.client_request_id)); };
+  __deliveryHarness.invoke = async () => { invokes += 1; return { success: true }; };
+  await assert.rejects(api.sendMessage(7, 'douyin', 'contact', 'hello'), /无法读取本地发送记录/);
+  assert.equal(posts, 0);
+  assert.equal(invokes, 0);
+  assert.equal(localStorage.values.get(key), original);
+});
+
+test('clearing a pointer requires its original request ID', () => {
+  const key = 'recovery-pointer';
+  const original = JSON.stringify({ requestId: 'original-request', hash: 'a'.repeat(64) });
+  localStorage.setItem(key, original);
+  assert.equal(api.clearPendingDelivery(localStorage, key, 'another-request'), false);
+  assert.equal(localStorage.getItem(key), original);
+  assert.equal(api.clearPendingDelivery(localStorage, key, 'original-request'), true);
+  assert.equal(localStorage.getItem(key), null);
+});
+
+test('clearing never removes a corrupt or unreadable pointer', () => {
+  const key = 'recovery-pointer';
+  localStorage.setItem(key, '{broken-json');
+  let removals = 0;
+  localStorage.removeItem = () => { removals += 1; };
+  assert.throws(() => api.clearPendingDelivery(localStorage, key, 'original-request'), /本地发送记录损坏/);
+  assert.equal(localStorage.values.get(key), '{broken-json');
+  localStorage.getItem = () => { throw new Error('storage unavailable'); };
+  assert.throws(() => api.clearPendingDelivery(localStorage, key, 'original-request'), /无法读取本地发送记录/);
+  assert.equal(removals, 0);
+});
+
+test('a changed pointer during receipt lookup cannot be replaced by a new send', async () => {
+  const key = 'kellai:delivery:7:1:7:telegram:contact';
+  localStorage.setItem(key, JSON.stringify({ requestId: 'first-request', hash: 'a'.repeat(64) }));
+  const replacement = JSON.stringify({ requestId: 'second-request', hash: 'b'.repeat(64) });
+  __deliveryHarness.get = async () => {
+    localStorage.setItem(key, replacement);
+    return response(accepted('first-request'));
+  };
+  let posts = 0;
+  __deliveryHarness.post = async (_url, body) => { posts += 1; return response(accepted(body.client_request_id)); };
+  await assert.rejects(api.sendMessage(7, 'telegram', 'contact', 'third message'), /本地发送记录已变化/);
+  assert.equal(posts, 0);
+  assert.equal(localStorage.getItem(key), replacement);
+});
+
+test('labels only promote platform receipts after ledger acceptance', () => {
+  for (const [state, label] of [
+    [undefined, '渠道已受理，送达待确认'],
+    ['accepted', '渠道已受理，送达待确认'],
+    ['sent', '渠道回执：已发送，送达待确认'],
+    ['delivered', '渠道回执：已送达'],
+    ['read', '渠道回执：已读'],
+    ['failed', '渠道回执：发送失败'],
+  ]) {
+    assert.equal(api.deliveryLabel({ ...accepted('request'), provider_state: state }), label);
+  }
+  for (const status of ['sending', 'unknown']) {
+    for (const provider_state of ['sent', 'delivered', 'read', 'failed']) {
+      assert.equal(api.deliveryLabel({ ...accepted('request'), status, provider_state }),
+        '发送结果待确认，请查询原请求回执');
+    }
+  }
+  for (const provider_state of [undefined, 'sent', 'delivered', 'read', 'failed']) {
+    assert.equal(api.deliveryLabel({ ...accepted('request'), status: 'failed', provider_state }),
+      '发送失败，请查看失败原因');
+  }
 });
 
 test('native send is fenced when account changes during prepare', async () => {

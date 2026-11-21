@@ -65,7 +65,7 @@ flowchart TD
 | C10 | 20 条历史会话可能被分批自动回复，演示消息也可入队 | 历史、模拟、演示、未解析媒体拒绝自动外发；先取全队列每会话最新，再限制数量。`test_auto_reply_runtime.py` |
 | C11 | 生成期间新消息/人工回复/阶段变化不能取消旧草稿 | 生成完成和 begin_delivery 都核验原消息、当前客户、阶段与后续消息；原消息时间 900 秒窗口，最多允许 60 秒平台时钟偏差 |
 | C12 | 多 worker 与前端重复重试会多发；超时被当失败重发 | SQLite 租约和 outbox 唯一请求号；一个请求只放行一次渠道调用；unknown 只查询。`test_delivery_runtime.py` |
-| C13 | 原生执行结果可伪造、重复领取或换号上报 | prepare/complete 绑定令牌及原请求；已知执行结果恢复仅上报回执，不再次操作设备。`desktop/tests/message_delivery_state.test.mjs` |
+| C13 | 原生执行结果可伪造、重复领取或换号上报；恢复记录损坏后可能重新外发 | prepare/complete 绑定令牌及原请求；已知执行结果恢复仅上报回执，不再次操作设备；请求存储读取或解析失败时停止新外发。`desktop/tests/message_delivery_state.test.mjs` |
 | C14 | 抖音 bridge 无幂等、递归远端、云端客户 ID 与桌面混用 | 透传同一个 request ID；云端独立账本和稳定联系人解析；内部执行禁止回环与 native。`test_messaging_api.py` |
 | C15 | 云 worker 抢走 relay inbox；hybrid 渠道永远不由 API worker 处理 | relay 角色不消费抖音游标；普通 CRM 按真实目标在领租约前分流 API/native。`test_channel_worker.py` |
 | C16 | 企微取 token 自锁，suite 入站可用但出站未复用授权 | 修复锁递归，复用 tenant suite token/agent，并保留内部成员的实际能力范围。`test_channel_gateway.py` |
@@ -156,7 +156,7 @@ XCMAX 消息副驾驶沿 `chat_completion_openai_format(profile="customer_copilo
 | `/api/kellai/integrations/xcmax/messages/send` | loopback 配对令牌 + `messages.send`，复用同一发送服务 |
 | `/api/kellai/integrations/xcmax/messages/requests/{id}` | 同一授权范围内查询回执 |
 
-`accepted` 只表示渠道受理；只有真实平台状态才推进 `sent/delivered/read`。网络超时可能已经产生外部效果，保持 `unknown`；重试原 request ID 只返回原账本，不重新发送。同一 request ID 改正文、目标或关键上下文会冲突。原生执行中断后已知结果优先补记回执，不重新操作设备。
+`accepted` 只表示渠道受理；真实平台状态保存在 `provider_state`，界面与小 C 分别显示 `sent/delivered/read/failed`，不会把未知请求升级为成功。网络超时可能已经产生外部效果，保持 `unknown`；重试原 request ID 只返回原账本，不重新发送。同一 request ID 改正文、目标或关键上下文会冲突。原生执行中断后已知结果优先补记回执，不重新操作设备；无法读取或解析原请求记录时停止新外发。
 
 ### 启动与验证
 

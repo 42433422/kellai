@@ -71,10 +71,14 @@ export class MessageSendError extends Error {
 }
 
 export const deliveryLabel = (receipt: DeliveryReceipt) => {
-  if (receipt.provider_state === 'read') return '渠道回执：已读';
-  if (receipt.provider_state === 'delivered') return '渠道回执：已送达';
-  if (receipt.status === 'accepted') return '渠道已受理，送达待确认';
-  if (receipt.status === 'failed') return '发送失败，渠道未接受';
+  if (receipt.status === 'accepted') {
+    if (receipt.provider_state === 'read') return '渠道回执：已读';
+    if (receipt.provider_state === 'delivered') return '渠道回执：已送达';
+    if (receipt.provider_state === 'sent') return '渠道回执：已发送，送达待确认';
+    if (receipt.provider_state === 'failed') return '渠道回执：发送失败';
+    return '渠道已受理，送达待确认';
+  }
+  if (receipt.status === 'failed') return '发送失败，请查看失败原因';
   return '发送结果待确认，请查询原请求回执';
 };
 
@@ -136,7 +140,9 @@ export const sendMessage = async (
       if (!old || !['accepted', 'failed'].includes(old.status) || (old.status === 'accepted' && !old.persisted)) {
         throw new MessageSendError('该联系人上一条发送尚未确认，请保留原内容并查询回执', old || undefined);
       }
-      clearPendingDelivery(localStorage, storageKey, previous.requestId);
+      if (!clearPendingDelivery(localStorage, storageKey, previous.requestId)) {
+        throw new MessageSendError('本地发送记录已变化，请先查询当前请求回执');
+      }
     } else if (previous?.requestId) {
       requestId = previous.requestId;
     }
