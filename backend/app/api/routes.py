@@ -8,7 +8,7 @@ import os
 import secrets
 from typing import Annotated, Any, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -3379,7 +3379,12 @@ def xcmax_customers(request: Request, limit: int = 12):
 
 
 @router.get("/integrations/xcmax/customers/{customer_id}/conversations")
-def xcmax_customer_conversations(customer_id: int, request: Request, limit: int = 30):
+def xcmax_customer_conversations(
+    customer_id: int,
+    request: Request,
+    limit: int = 30,
+    message_id: Annotated[str | None, Query(min_length=1, max_length=512)] = None,
+):
     from app.services.message_store import get_messages_with_state
     from app.services.xcmax_integration import authorize_access_token
     from app.services.tenant_context import tenant_scope
@@ -3389,7 +3394,7 @@ def xcmax_customer_conversations(customer_id: int, request: Request, limit: int 
     )
     with tenant_scope(int(connection.get("team_id") or 0)):
         messages = get_messages_with_state(
-            int(customer_id), limit=max(1, min(int(limit), 100))
+            int(customer_id), limit=max(1, min(int(limit), 100)), message_id=message_id
         )
     return {"success": True, "data": {"customer_id": int(customer_id), "messages": messages}}
 
