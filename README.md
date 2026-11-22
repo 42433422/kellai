@@ -26,6 +26,7 @@
 | 桌面协议唤起 | [Tauri deep-link / single-instance](https://github.com/tauri-apps/plugins-workspace) | 2.6.3 / 2.5.5 | Apache-2.0 OR MIT |
 | 自包含 Python 服务打包 | [PyInstaller](https://github.com/pyinstaller/pyinstaller) | 6.22.3 | GPL-2.0-or-later，附发行例外 |
 | 浏览器流程回归 | [Playwright](https://github.com/microsoft/playwright-python) | 1.62.0 | Apache-2.0，仅测试环境 |
+| 外部渠道网关 | [Chatwoot](https://github.com/chatwoot/chatwoot/tree/v4.20.1) 官方账号 API | 4.20.1 / b2f94636 | MIT（企业版目录另有许可，未引入） |
 
 React、TanStack Query、FastAPI、SQLite 与既有 HTTP 渠道适配器继续复用。产品代码只负责工作区/账号归属、宿主授权、平台协议适配、原子迁移和发送账本。以上核心组件均在本地进程中使用，不要求注册外部托管连接平台。
 
@@ -64,12 +65,16 @@ Authlib 管理标准 OAuth 授权与 PKCE。授权事务有有效期、归属、
 | 企业微信自建应用 | 内部成员应用消息、固定群机器人、验签入站 | 不等于外部联系人任意私聊 |
 | 微信公众号 | 客服文本消息、明文验签回调 | 受公众号权限和回复窗口限制；AES 回调未接入 |
 | 抖音 | 官方账号 OAuth 与企业号私信适配 | 需要 `enterprise.im` 等平台许可和真实会话，尚无实号验收 |
-| Chatwoot | 文本发送、验签入站、认证 API 状态回读 | 上游平台能力取决于实际配置的收件箱 |
+| Chatwoot | 文本发送、本机 API 分页收件、可选验签入站、原请求状态回读 | 上游平台能力取决于实际配置的收件箱 |
 | Telegram / LINE / WhatsApp / Twilio | 原生发送适配 | 原生接收尚未实现；双向可通过 Chatwoot 收件箱接入 |
 | 阿里云短信 / 小程序 | 模板通知适配 | 通用聊天文字发送会被阻止 |
 | 淘宝 / 京东 / 拼多多 / 1688 | 保留旧配置及历史 | 缺少可验证的官方客服协议，发送保持阻止 |
 | GitHub / Google / Microsoft OAuth | 账号授权、加密存储、刷新与撤销 | 不表示具备聊天发送能力 |
 | 浏览器账号 | 预留明确连接身份 | 未绑定宿主真实执行器时为 `executor_required` |
+
+Chatwoot 本机连接只需填写服务地址、Account ID、Inbox ID 和 API Access Token；无需公网桌面地址或回调密钥。后台和“同步收件箱”共用官方会话/消息 API，将收件与分页进度按工作区、连接和远端账号持久保存。每轮工作有界、不同会话轮转，消息先落入原 inbox 再推进游标；断网、落库中断或重启后只读续传。上游消息按创建时间排序，满页时会按消息 ID 区间补齐，避免回填旧日期的大编号跳过较小编号。
+
+Chatwoot 已受理但 POST 响应丢失时，通过签名回调或 API 拉取发现原消息，再以认证 API 核对原请求号、账号、会话和内容，恢复同一账本；已知消息持续只读核对送达/已读状态。无法核对的请求继续保持未知，不重新 POST。供应商送达/已读与本地受理状态分别显示。其他仅提供回调的渠道仍需要供应商可达、经过验签的回调地址；本机监听不等于公网回调已经接通。
 
 ## 本地开发
 
@@ -128,7 +133,7 @@ KELLAI_TEST_HOST_REVISION=replace_with_the_exact_40_character_host_commit
 
 `--host-checkout`、`--tool-python`、`--expected-host-revision` 也分别支持环境变量 `KELLAI_TEST_HOST_CHECKOUT`、`KELLAI_TEST_TOOL_PYTHON`、`KELLAI_TEST_HOST_REVISION`。Windows 可显式传入相应环境的 `Scripts/python.exe`。开发中需要检查未提交的宿主改动时，可追加 `--allow-dirty-host`；输出会明确记录 `host_dirty=true`，不能把它当成指定 commit 的发布证据。
 
-脚本在隔离临时目录启动两个真实 loopback HTTP/ASGI 服务，使用真实 SQLite 用户会话和生产身份解析器，检查单次交接、最小权限批准、凭据引用、账号元数据读取、另一账号访问拒绝、授权探针和撤销恢复。当前包含原有 36 项检查及 2 项普通业务读取发现撤销的检查，共 38 项；成功时输出 JSON，并在输出的 `runtime` 目录保存 `result.json` 和工具服务日志。服务会在结束时退出，临时证据目录保留供复查。
+脚本在隔离临时目录启动真实 loopback HTTP/ASGI 服务，使用真实 SQLite 用户会话、生产身份解析器与隔离 Chatwoot 协议服务，检查单次交接、最小权限、账号隔离、API 拉取入站、原请求幂等、发送响应丢失后的只读恢复、真实 SQL 审批消耗和 Agent 重载后的原回执核验。成功时输出实际检查列表，并在输出的 `runtime` 目录保存 `result.json` 和服务日志。服务会在结束时退出，临时证据目录保留供复查。
 
 测试只替换系统钥匙串的 I/O，仍执行生产安全后端选择逻辑；它不能证明真实操作系统钥匙串可用。测试不会使用真实平台凭据或发送外部消息，也不能替代平台账号与安装包验收。需要在 CI 使用时，应由调用方显式准备和固定两个 checkout，不依赖浮动的宿主分支。
 
@@ -140,7 +145,7 @@ uv run --project backend --group browser playwright install chromium
 uv run --project backend --group browser python desktop/tests/smoke_tool_ui.py
 ```
 
-CI 还会构建并启动真实冻结后端，在 Windows/macOS 检查原生壳、协议插件和父进程监测；这些检查不能替代安装后的系统钥匙串与平台账号验收。
+CI 从干净的已提交源码构建 Windows NSIS 与 macOS DMG 候选包，将完整 commit SHA、源码树与版本同时嵌入原生壳和冻结后端；安装或挂载后核对包内文件，并启动包内后端验证 `/health` 返回相同身份及父进程监测。候选包通过独立 CI 配置明确使用未签名模式，仅保存为内部 artifact，正式签名配置保持不变，不能作为正式发布证据。当前验证尚未覆盖安装后的 GUI 操作、真实系统钥匙串、协议唤起和平台账号验收。
 
 ```bash
 uv sync --locked --project backend --group build

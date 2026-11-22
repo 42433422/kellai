@@ -35,6 +35,18 @@ class _BoundAdapter(ChannelAdapter):
                 raise config_store.ConnectionConflict("账号配置已变化，请重新获取连接")
             if self._retiring:
                 raise config_store.ConnectionConflict("账号连接实例已更新，请重新获取")
+            if method == "send_message":
+                host_guard = kwargs.get("before_send")
+
+                def before_send(*, config_version: int | None = None):
+                    current = require_active(self.connection_id, channel_type=self.channel_type)
+                    expected = self._version if config_version is None else config_version
+                    if current["version"] != expected or self._retiring:
+                        raise config_store.ConnectionConflict("发送前账号配置已变化")
+                    if host_guard is not None:
+                        host_guard()
+
+                kwargs["before_send"] = before_send
             self._inflight += 1
             try:
                 return await getattr(self._adapter, method)(*args, **kwargs)

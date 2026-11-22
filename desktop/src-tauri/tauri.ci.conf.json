@@ -1,0 +1,9 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "客来来候选",
+  "identifier": "com.kellai.desktop.candidate",
+  "bundle": {
+    "macOS": { "signingIdentity": null },
+    "windows": { "nsis": { "installMode": "currentUser" } }
+  }
+}

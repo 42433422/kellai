@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import json
+import argparse
+import hashlib
 import os
 from pathlib import Path
 import socket
 import subprocess
-import sys
 import tempfile
 import time
 import urllib.error
@@ -14,7 +15,13 @@ import urllib.request
 
 
 def main() -> None:
-    binary = Path(sys.argv[1]).resolve()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("binary", type=Path)
+    parser.add_argument("--expected-build-info", type=Path)
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
+    binary = args.binary.resolve()
+    expected = json.loads((args.expected_build_info or binary.parent / "build-info.json").read_text(encoding="utf-8"))
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
@@ -39,6 +46,7 @@ def main() -> None:
                 raise RuntimeError("Packaged backend did not start")
             assert health["service"] == "kellai-account-tool"
             assert health["protocol_version"] == 2
+            assert health["build_info"] == expected, "Running backend differs from packaged source identity"
             # Exercise parent-liveness monitoring on every native CI runner.
             time.sleep(1.1)
             assert process.poll() is None, "Parent watchdog stopped a live desktop session"
@@ -48,7 +56,16 @@ def main() -> None:
                 assert exc.code == 401
             else:
                 raise AssertionError("Unauthenticated account access was accepted")
-            print("Packaged backend identity and authentication boundary: PASS")
+            with binary.open("rb") as stream:
+                binary_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
+            evidence = {"status": "PASS", "build_info": expected,
+                        "binary_sha256": binary_sha256,
+                        "health_identity_matches": True, "unauthenticated_accounts_status": 401,
+                        "parent_watchdog_alive": True}
+            if args.output:
+                args.output.parent.mkdir(parents=True, exist_ok=True)
+                args.output.write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+            print(json.dumps(evidence, sort_keys=True))
         finally:
             process.terminate()
             try:

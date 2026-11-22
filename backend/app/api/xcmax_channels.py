@@ -72,7 +72,7 @@ async def send_message(body: SendBody, request: Request):
     from app.services.messaging import send
     connection = _connection(request, "messages.send")
     with tenant_scope(connection["team_id"]):
-        return await send(body, user=connection["actor"])
+        return await send(body, user=connection["actor"], before_send=lambda: _connection(request, "messages.send"))
 
 
 @router.get("/messages/requests/{client_request_id}")

@@ -16,6 +16,7 @@ from starlette.exceptions import HTTPException
 
 from app.services.auth import LOCAL_ORIGINS, require_local_request, verify_token, workspace_id
 from app.services.tenant_context import bind_request_tenant, reset_request_tenant
+from app.build_info import load_build_info
 
 logger = logging.getLogger("kellai")
 # Provider URLs may contain API keys (for example Telegram bot tokens).
@@ -57,15 +58,23 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         stop.set()
-        if worker is not None:
-            await worker
-        await ChannelRegistry().close_all()
+        try:
+            if worker is not None:
+                worker.cancel()
+                try:
+                    await worker
+                except asyncio.CancelledError:
+                    pass
+        finally:
+            await ChannelRegistry().close_all()
 
 
 try:
     APP_VERSION = version("kellai")
 except PackageNotFoundError:
     APP_VERSION = "0+source"
+
+BUILD_INFO = load_build_info(APP_VERSION)
 
 app = FastAPI(title="客来来账号与通道工具", version=APP_VERSION, lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=_load_cors_origins(),
@@ -128,7 +137,8 @@ async def unhandled_error(request: Request, exc: Exception):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "kellai-account-tool", "protocol_version": 2}
+    return {"status": "ok", "service": "kellai-account-tool", "protocol_version": 2,
+            "build_info": BUILD_INFO}
 
 
 from app.api.routes import router

@@ -98,7 +98,7 @@ async def test_chatwoot_preflight_and_readback_bind_the_exact_inbox(tool_env):
         sent=await adapter.send_message(settings.target(23),"hello",idempotency_key="request-81")
         assert sent["message_id"] == "81" and sent["delivery_state"] == "accepted"
         with config_store.connection_scope("chat"):
-            assert await adapter._adapter.message_status(23,81) == "delivered"
+            assert (await adapter._adapter.message_receipt(23,81))["status"] == "delivered"
         assert sum(request.method=="POST" for request in calls)==1
 
 

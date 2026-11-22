@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import hmac
 import json
 import logging
@@ -18,6 +19,8 @@ logger = logging.getLogger(__name__)
 MAX_WEBHOOK_BYTES = 1_048_576
 SIGNATURE_TOLERANCE_SECONDS = 300
 RECEIPT_CHANNEL = "chatwoot_receipt"
+RECEIPT_TOTAL_TIMEOUT_SECONDS = 5.0
+RECEIPT_CANDIDATE_TIMEOUT_SECONDS = 2.0
 
 
 class WebhookRejected(ValueError):
@@ -120,21 +123,50 @@ def store_event(payload: dict, *, settings: ChatwootSettings, team_id: int, deli
 
 
 async def reconcile_pending_receipts(adapter: ChatwootAdapter, *, team_id: int) -> None:
-    from app.services.outbound_delivery import reconcile_receipt
+    from app.channels.config_store import current_connection_id
+    from app.services.outbound_delivery import pending_provider_receipts, reconcile_receipt
     settings = adapter.settings()
-    for row in list_inbox(RECEIPT_CHANNEL, limit=50, team_id=team_id):
+    pending = {}
+    for row in list_inbox(RECEIPT_CHANNEL, limit=1, team_id=team_id, rotate=True):
         metadata = row.get("metadata", {})
-        if (metadata.get("account_id") != settings.account_id or metadata.get("inbox_id") != settings.inbox_id
-                or metadata.get("gateway_id") != settings.gateway_id):
-            continue
-        try:
-            message_id = int(metadata["provider_message_id"])
-            state = await adapter.message_status(int(metadata["conversation_id"]), message_id)
-            if state != "unknown" and reconcile_receipt(
-                team_id=team_id, channel_type="chatwoot", provider_message_id=str(message_id), state=state,
-                provider_context={key: metadata[key] for key in ("gateway_id", "account_id", "inbox_id", "conversation_id")},
-            ):
-                mark_inbox_consumed([row["id"]], team_id=team_id)
-        except Exception as exc:
-            # Failed API lookup and unbound ACKs stay pending, never guessed or resent.
-            logger.warning("Chatwoot 消息状态尚未确认: team=%s (%s)", team_id, type(exc).__name__)
+        key = (str(metadata.get("provider_message_id") or ""), str(metadata.get("kellai_request_id") or ""))
+        candidate = pending.setdefault(key, {"metadata": metadata, "inbox_ids": []})
+        candidate["inbox_ids"].append(row["id"])
+    for receipt in pending_provider_receipts(team_id=team_id, connection_id=current_connection_id(required=True),
+                                             channel_type="chatwoot", limit=1):
+        metadata = {**receipt["context"], "provider_message_id": receipt["provider_message_id"],
+                    "kellai_request_id": receipt["request_id"]}
+        key = (str(receipt["provider_message_id"]), str(receipt["request_id"]))
+        pending.setdefault(key, {"metadata": metadata, "inbox_ids": []})
+    try:
+        async with asyncio.timeout(RECEIPT_TOTAL_TIMEOUT_SECONDS):
+            for candidate in pending.values():
+                metadata = candidate["metadata"]
+                if (metadata.get("account_id") != settings.account_id or metadata.get("inbox_id") != settings.inbox_id
+                        or metadata.get("gateway_id") != settings.gateway_id):
+                    continue
+                try:
+                    message_id = _positive_id(metadata["provider_message_id"])
+                    async with asyncio.timeout(RECEIPT_CANDIDATE_TIMEOUT_SECONDS):
+                        receipt = await adapter.message_receipt(_positive_id(metadata["conversation_id"]), message_id)
+                    attributes = (receipt or {}).get("content_attributes")
+                    request_id = str(metadata.get("kellai_request_id") or "")
+                    if (receipt is None or not isinstance(attributes, dict) or not request_id
+                            or attributes.get("kellai_request_id") != request_id
+                            or not isinstance(receipt.get("content"), str)):
+                        continue
+                    # This local transaction is fenced against account revoke;
+                    # no network request occurs while the account lock is held.
+                    with adapter._current_account_snapshot():
+                        if reconcile_receipt(
+                            team_id=team_id, channel_type="chatwoot", provider_message_id=str(message_id), state=receipt["status"],
+                            provider_context={key: metadata[key] for key in ("gateway_id", "account_id", "inbox_id", "conversation_id")},
+                            request_id=request_id, verified_content=receipt["content"],
+                        ):
+                            mark_inbox_consumed(candidate["inbox_ids"], team_id=team_id)
+                except Exception as exc:
+                    # Failed API lookup and unbound ACKs stay pending; task
+                    # cancellation propagates rather than becoming a retry.
+                    logger.warning("Chatwoot 消息状态尚未确认: team=%s (%s)", team_id, type(exc).__name__)
+    except TimeoutError:
+        logger.warning("Chatwoot 回执核对时间预算已用尽: team=%s", team_id)

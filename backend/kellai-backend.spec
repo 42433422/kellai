@@ -1,12 +1,17 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_submodules, copy_metadata
+from pathlib import Path
+import runpy
+import shutil
+
+build_info = runpy.run_path(str(Path(SPECPATH) / "build_identity.py"))["write_build_info"]()
 
 
 a = Analysis(
     ['kellai_backend_entry.py'],
     pathex=[],
     binaries=[],
-    datas=copy_metadata("keyring"),
+    datas=copy_metadata("keyring") + copy_metadata("kellai") + [(str(build_info), "app")],
     hiddenimports=collect_submodules("keyring.backends"),
     hookspath=[],
     hooksconfig={},
@@ -37,3 +42,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
 )
+
+shutil.copyfile(build_info, Path(DISTPATH) / "build-info.json")

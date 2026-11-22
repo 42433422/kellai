@@ -11,6 +11,10 @@ use tauri::Manager;
 
 const BACKEND_PORT: u16 = 8793;
 
+pub fn build_info_json() -> &'static str {
+    include_str!(concat!(env!("OUT_DIR"), "/kellai-build-info.json"))
+}
+
 #[derive(Default)]
 struct BackendProcess(Mutex<Option<Child>>);
 
@@ -28,10 +32,16 @@ fn backend_is_healthy() -> bool {
         return false;
     }
     let mut response = String::new();
-    stream.read_to_string(&mut response).is_ok()
-        && response.starts_with("HTTP/1.1 200")
-        && response.contains("\"service\":\"kellai-account-tool\"")
-        && response.contains("\"protocol_version\":2")
+    if stream.take(64 * 1024).read_to_string(&mut response).is_err()
+        || !response.starts_with("HTTP/1.1 200")
+    {
+        return false;
+    }
+    let Some((_, body)) = response.split_once("\r\n\r\n") else { return false; };
+    let Ok(health) = serde_json::from_str::<serde_json::Value>(body) else { return false; };
+    let Ok(expected) = serde_json::from_str::<serde_json::Value>(build_info_json()) else { return false; };
+    health["service"] == "kellai-account-tool" && health["protocol_version"] == 2
+        && (expected["source_sha"].is_null() || health["build_info"] == expected)
 }
 
 fn start_bundled_backend(app: &tauri::AppHandle) -> Result<(), String> {

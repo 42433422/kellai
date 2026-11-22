@@ -6,7 +6,7 @@ import json
 import httpx
 
 from app.channels.base import ChannelAdapter, UnifiedMessage
-from app.channels.http_client import checked_json, send_error
+from app.channels.http_client import ChannelHTTPError, checked_json, send_error, check_send_authorization
 from app.services.douyin_channel import DOUYIN_API_BASE, access_context
 from app.services.tenant_context import current_team_id
 
@@ -23,6 +23,7 @@ class DouyinAdapter(ChannelAdapter):
             return send_error("账号未完成 enterprise.im 授权，请重新连接", definitely_not_sent=True)
         try:
             async with httpx.AsyncClient(timeout=15, follow_redirects=False, trust_env=False) as client:
+                check_send_authorization(kwargs.get("before_send"), config_version=auth["_connection_version"])
                 response = await client.post(DOUYIN_API_BASE + "/enterprise/im/message/send/",
                     params={"open_id": auth["open_id"]}, headers={"access-token": auth["access_token"]},
                     json={"message_type": "text", "to_user_id": contact_id,
@@ -36,6 +37,8 @@ class DouyinAdapter(ChannelAdapter):
                 return send_error("抖音未返回消息编号，发送结果待确认")
             return {"success": True, "message_id": identifier, "delivery_state": "accepted",
                     "open_id": auth["open_id"], "error": ""}
+        except ChannelHTTPError as exc:
+            return send_error(exc)
         except Exception:
             return send_error("抖音发送结果未知，请读取原请求回执")
 

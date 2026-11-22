@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { useEffect, useId, useRef, useState, useSyncExternalStore } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import Form from '@rjsf/core';
 import validator from '@rjsf/validator-ajv8';
@@ -6,7 +6,7 @@ import type { RJSFSchema, UiSchema } from '@rjsf/utils';
 import { ArrowUpRight, Cable, Check, CircleHelp, KeyRound, Mail, Plus, RefreshCw, ShieldCheck, Unplug, X } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { beginHandoff, currentAccountKey, errorMessage, getSession, request, setToolSession, subscribeSession } from './api/client';
-import { receiptLabel, scopeLabels, type Account, type Channel, type Contact, type Message, type PairStatus, type PendingPairing, type Receipt } from './types';
+import { receiptLabel, receiptState, scopeLabels, type Account, type Channel, type Contact, type Message, type PairStatus, type PendingPairing, type Receipt } from './types';
 
 async function openExternal(url: string) {
   const parsed = new URL(url);
@@ -34,6 +34,8 @@ export function passwordWidgets(schema?: RJSFSchema): UiSchema {
 
 function AccountEditor({ channels, account, onClose }: { channels: Channel[]; account?: Account; onClose: () => void }) {
   const dialog = useRef<HTMLDialogElement>(null);
+  const platformId = useId();
+  const authTypeId = useId();
   const cache = useQueryClient();
   const [kind, setKind] = useState(account?.channel_type || channels[0]?.channel_type || '');
   const [authType, setAuthType] = useState<Account['auth_type']>(account?.auth_type || channels[0]?.auth_types?.[0] || 'credentials');
@@ -54,12 +56,12 @@ function AccountEditor({ channels, account, onClose }: { channels: Channel[]; ac
   return <dialog ref={dialog} onCancel={onClose} className="editor">
     <header><h2>{account ? '编辑账号连接' : '添加账号连接'}</h2><button className="icon" aria-label="关闭" onClick={onClose}><X size={20} /></button></header>
     <p className="muted">凭据保存在本机受保护的账号库。已保存的秘密以掩码显示，保持掩码即可沿用。</p>
-    <label>平台<select value={kind} disabled={Boolean(account)} onChange={(event) => { setKind(event.target.value); setValues({ name: '', config: {}, enabled: true }); setAuthType(channels.find((item) => item.channel_type === event.target.value)?.auth_types?.[0] || 'credentials'); }}>
+    <div className="field"><label htmlFor={platformId}>平台</label><select id={platformId} value={kind} disabled={Boolean(account)} onChange={(event) => { setKind(event.target.value); setValues({ name: '', config: {}, enabled: true }); setAuthType(channels.find((item) => item.channel_type === event.target.value)?.auth_types?.[0] || 'credentials'); }}>
       {channels.map((item) => <option key={item.channel_type} value={item.channel_type}>{item.display_name || item.name || item.channel_type}</option>)}
-    </select></label>
-    {(channel?.auth_types?.length || 0) > 1 && <label>授权方式<select value={authType} disabled={Boolean(account)} onChange={(event) => setAuthType(event.target.value as Account['auth_type'])}>
+    </select></div>
+    {(channel?.auth_types?.length || 0) > 1 && <div className="field"><label htmlFor={authTypeId}>授权方式</label><select id={authTypeId} value={authType} disabled={Boolean(account)} onChange={(event) => setAuthType(event.target.value as Account['auth_type'])}>
       {channel?.auth_types?.map((type) => <option key={type} value={type}>{{ credentials: '平台凭据', oauth2: 'OAuth 授权', browser: '浏览器会话' }[type]}</option>)}
-    </select></label>}
+    </select></div>}
     <ErrorNote error={saving.error} />
     <Form key={`${kind}:${authType}`} schema={schema} uiSchema={passwordWidgets(schema)} validator={validator}
       formData={values} onChange={(event) => setValues(event.formData || {})} disabled={saving.isPending}
@@ -140,6 +142,7 @@ function Pairing() {
 
 function ContactEditor({ accounts, initialConnection, onClose }: { accounts: Account[]; initialConnection: string; onClose: () => void }) {
   const dialog = useRef<HTMLDialogElement>(null);
+  const accountId = useId();
   const cache = useQueryClient();
   const [connectionId, setConnectionId] = useState(initialConnection || accounts[0]?.connection_id || '');
   const [address, setAddress] = useState('');
@@ -151,7 +154,7 @@ function ContactEditor({ accounts, initialConnection, onClose }: { accounts: Acc
   return <dialog ref={dialog} onCancel={onClose} className="editor"><header><h2>添加通道联系人</h2><button className="icon" aria-label="关闭" onClick={onClose}><X size={20} /></button></header>
     <p className="muted">填写这个账号已有权限联系的平台地址，如 chat_id、openid 或会话编号。添加联系人不会发送消息。</p>
     <ErrorNote error={saving.error} /><form onSubmit={(event) => { event.preventDefault(); saving.mutate(); }}>
-      <label>账号连接<select required value={connectionId} onChange={(event) => setConnectionId(event.target.value)}>{accounts.map((account) => <option key={account.connection_id} value={account.connection_id}>{account.name} · {account.channel_type}</option>)}</select></label>
+      <div className="field"><label htmlFor={accountId}>账号连接</label><select id={accountId} required value={connectionId} onChange={(event) => setConnectionId(event.target.value)}>{accounts.map((account) => <option key={account.connection_id} value={account.connection_id}>{account.name} · {account.channel_type}</option>)}</select></div>
       <label>平台联系地址<input required maxLength={256} value={address} onChange={(event) => setAddress(event.target.value)} /></label>
       <label>显示名称<input maxLength={256} value={name} onChange={(event) => setName(event.target.value)} placeholder="选填" /></label>
       <footer><button type="button" onClick={onClose}>取消</button><button className="primary" disabled={saving.isPending || !connectionId || !address.trim()}>{saving.isPending ? '正在保存…' : '添加联系人'}</button></footer>
@@ -160,6 +163,7 @@ function ContactEditor({ accounts, initialConnection, onClose }: { accounts: Acc
 
 function Traffic() {
   const cache = useQueryClient();
+  const accountFilterId = useId();
   const namespace = currentAccountKey();
   const [addingContact, setAddingContact] = useState(false);
   const [connectionId, setConnectionId] = useState('');
@@ -182,17 +186,17 @@ function Traffic() {
     return result;
   } });
   return <section><div className="section-title"><div><h2>统一聊天</h2><p>汇总各账号的会话和消息，发送任务在 XCMAX 中发起。</p></div><div className="actions"><button disabled={!activeAccounts.length} onClick={() => setAddingContact(true)}><Plus size={16} />添加通道联系人</button><button disabled={!canSync || sync.isPending} title="选择具体账号后，同步该账号已接入的收件箱" onClick={() => sync.mutate()}><RefreshCw size={16} />{sync.isPending ? '正在同步…' : '同步消息'}</button></div></div><ErrorNote error={accounts.error || channels.error} />
-    <label className="account-filter">选择账号<select value={connectionId} onChange={(event) => { setConnectionId(event.target.value); setContact(null); }}><option value="">全部账号</option>{accounts.data?.map((account) => <option key={account.connection_id} value={account.connection_id}>{account.name} · {account.channel_type}</option>)}</select></label>
+    <div className="account-filter"><label htmlFor={accountFilterId}>选择账号</label><select id={accountFilterId} value={connectionId} onChange={(event) => { setConnectionId(event.target.value); setContact(null); }}><option value="">全部账号</option>{accounts.data?.map((account) => <option key={account.connection_id} value={account.connection_id}>{account.name} · {account.channel_type}</option>)}</select></div>
     <div className="traffic"><aside><h3>通道联系人</h3><ErrorNote error={contacts.error} />{contacts.isFetching && <p className="muted">正在加载…</p>}
       {contacts.data?.contacts.map((item) => <button className={`contact ${contact?.customer_id === item.customer_id && contact.connection_id === item.connection_id ? 'selected' : ''}`} key={`${item.connection_id}:${item.customer_id}:${item.contact_id}`} onClick={() => setContact(item)}><strong>{item.contact_name || item.contact_id}</strong><small>{accounts.data?.find((account) => account.connection_id === item.connection_id)?.name || item.channel_type} · {item.contact_id}</small></button>)}
       {!contacts.isFetching && !contacts.data?.contacts.length && <p className="muted">{connectionId ? '这个账号暂无通道联系人' : '暂无通道联系人'}</p>}
     </aside><div className="conversation"><div className="conversation-title"><h3>{contact?.contact_name || '消息记录'}</h3><button disabled={!contact || messages.isFetching} onClick={() => void messages.refetch()}><RefreshCw size={14} />刷新</button></div><ErrorNote error={messages.error} />
-      {messages.data?.messages.map((message) => <article className={`message ${message.direction === 'outbound' ? 'outbound' : ''}`} key={message.id}><p>{message.content}</p><small>{message.created_at}{message.status ? ` · ${receiptLabel(message.status)}` : ''}</small></article>)}
+      {messages.data?.messages.map((message) => <article className={`message ${message.direction === 'outbound' ? 'outbound' : ''}`} key={message.id}><p>{message.content}</p><small>{message.created_at}{message.metadata?.delivery_state ? ` · ${receiptLabel(message.metadata.delivery_state)}` : ''}</small></article>)}
       {!messages.data?.messages.length && <div className="empty compact"><Mail size={24} /><p>{contact ? '暂无消息记录' : '选择联系人查看原始消息'}</p></div>}
     </div></div>
     {addingContact && <ContactEditor accounts={activeAccounts} initialConnection={activeAccounts.some((account) => account.connection_id === connectionId) ? connectionId : ''} onClose={() => setAddingContact(false)} />}
     <article className="card receipt"><h3>查询原发送回执</h3><p className="muted">查询只读取原请求，不会再次发送消息。</p><form onSubmit={(event) => { event.preventDefault(); receipt.mutate(); }}><label>请求编号<input value={requestId} onChange={(event) => { setRequestId(event.target.value); receipt.reset(); }} required maxLength={200} placeholder="填写 XCMAX 中的发送请求编号" /></label><button disabled={receipt.isPending || !requestId.trim()}>查询回执</button></form><ErrorNote error={receipt.error} />
-      {receipt.data && <dl><dt>状态</dt><dd>{receiptLabel(receipt.data.status)}</dd><dt>账号连接</dt><dd>{receipt.data.connection_id}</dd><dt>平台消息编号</dt><dd>{receipt.data.provider_message_id || '尚无平台回执'}</dd></dl>}
+      {receipt.data && <dl><dt>状态</dt><dd>{receiptLabel(receiptState(receipt.data))}</dd><dt>账号连接</dt><dd>{receipt.data.connection_id}</dd><dt>平台消息编号</dt><dd>{receipt.data.provider_message_id || '尚无平台回执'}</dd></dl>}
     </article>
   </section>;
 }

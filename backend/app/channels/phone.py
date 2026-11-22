@@ -27,7 +27,7 @@ import httpx
 
 from app.channels.base import ChannelAdapter, UnifiedMessage
 from app.channels.config_store import get_field
-from app.channels.http_client import read_env, checked_json, send_error
+from app.channels.http_client import read_env, checked_json, send_error, check_send_authorization
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +136,7 @@ class PhoneAdapter(ChannelAdapter):
 
         try:
             if self._provider == "twilio":
-                return await self._send_twilio(contact_id, content)
+                return await self._send_twilio(contact_id, content, kwargs.get("before_send"))
             if self._provider == "aliyun":
                 return await self._send_aliyun(contact_id, content, kwargs)
             return {"success": False, "message_id": "", "error": f"不支持的 provider: {self._provider}", "delivery_state": "failed", "definitely_not_sent": True}
@@ -144,10 +144,11 @@ class PhoneAdapter(ChannelAdapter):
             logger.warning("短信发送异常: %s", type(exc).__name__)
             return send_error(exc)
 
-    async def _send_twilio(self, to: str, body: str) -> dict:
+    async def _send_twilio(self, to: str, body: str, before_send) -> dict:
         """Twilio Programmable SMS API。"""
         client = await self._get_client()
         url = f"https://api.twilio.com/2010-04-01/Accounts/{self._account_sid}/Messages.json"
+        check_send_authorization(before_send)
         resp = await client.post(
             url,
             auth=(self._account_sid, self._auth_token),
@@ -205,6 +206,7 @@ class PhoneAdapter(ChannelAdapter):
         params["Signature"] = base64.b64encode(signature).decode("utf-8")
 
         client = await self._get_client()
+        check_send_authorization(kwargs.get("before_send"))
         resp = await client.get("https://dysmsapi.aliyuncs.com/", params=params)
         result = checked_json(resp)
         if str(result.get("Code", "")).upper() != "OK":

@@ -54,10 +54,11 @@ CAPABILITIES = {
         readiness="outbound_only", limitations=[
             "Cloud API自由文本受会话窗口及商业账号授权限制；原生回调尚未实现。",
             "双向消息可使用Chatwoot WhatsApp收件箱。"]),
-    "chatwoot": _cap(receive=True, send=True, transport="api", receive_mode="signed_webhook",
+    "chatwoot": _cap(receive=True, send=True, transport="api", receive_mode="api_polling_and_signed_webhook",
         readiness="implemented", limitations=[
             "绑定一个account/inbox；网关支持哪些平台取决于Chatwoot收件箱及该平台账号授权。",
             "发送响应仅表示Chatwoot受理；真实status经认证API读取，未知结果不自动重发。",
+            "本机主动分页拉取并持久保存进度；签名回调可选，不要求把桌面端口暴露到公网。",
             "当前客来来适配器只发送文本；平台接入和真实设备验收仍需部署方完成。"],
         upstream_version="4.20.1", message_types=["text"]),
 }
@@ -75,13 +76,13 @@ for _kind, _reason in {
 
 CHATWOOT_CONFIG_SCHEMA = {
     "type": "object",
-    "required": ["base_url", "account_id", "inbox_id", "api_access_token", "webhook_secret"],
+    "required": ["base_url", "account_id", "inbox_id", "api_access_token"],
     "properties": {
         "base_url": {"type": "string", "title": "Chatwoot 地址"},
         "account_id": {"type": "string", "title": "Account ID"},
         "inbox_id": {"type": "string", "title": "Inbox ID"},
         "api_access_token": {"type": "string", "title": "API Access Token", "writeOnly": True},
-        "webhook_secret": {"type": "string", "title": "Webhook Secret", "writeOnly": True},
+        "webhook_secret": {"type": "string", "title": "Webhook Secret（仅接收回调时填写）", "writeOnly": True},
     },
 }
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
+from collections.abc import Callable
 
 from fastapi import HTTPException, Request
 
@@ -56,7 +57,7 @@ def _channel(body):
     return registry.get(body.channel_type, connection_id=body.connection_id)
 
 
-async def send(body, *, user: dict) -> dict:
+async def send(body, *, user: dict, before_send: Callable[[], Any]) -> dict:
     from app.channels.config_store import connection_scope
     user = require_actor(user)
     team_id = int(user["team_id"])
@@ -77,7 +78,8 @@ async def send(body, *, user: dict) -> dict:
             result = await outbound_delivery.dispatch(message, idempotency_key=body.client_request_id,
                 team_id=team_id, sender=lambda: adapter.send_message(body.contact_id, body.content,
                     team_id=team_id, customer_id=body.customer_id, connection_id=body.connection_id,
-                    contact_name=contact["contact_name"], idempotency_key=body.client_request_id))
+                    contact_name=contact["contact_name"], idempotency_key=body.client_request_id,
+                    before_send=before_send))
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"success": bool(result.get("success")), "data": result, "error": str(result.get("error") or "")}

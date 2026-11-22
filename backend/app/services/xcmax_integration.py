@@ -193,12 +193,17 @@ def approve_authorization(*, request_id: str, accepted_scopes: list[str], curren
         "accepted_scopes": accepted_scopes, "access_token": token, "authorized_by": user,
         "protocol_version": PROTOCOL_VERSION,
     })
-    _write({"version": PROTOCOL_VERSION, "connection": {
-        "connection_id": request_id, "token_hash": hashlib.sha256(token.encode()).hexdigest(),
-        "authorized_scopes": sorted(set(accepted_scopes)), "authorized_by": user,
-        "team_id": workspace_id(), "protocol_version": PROTOCOL_VERSION,
-    }})
     with _LOCK:
+        # The host roundtrip may overlap a local revoke or a new handoff.
+        # Only the still-current, live claim can activate this exact grant.
+        if (_HANDOFFS.get(_handoff_key(request_id)) is not pending
+                or not _handoff_live(pending)):
+            raise RuntimeError("本机交接已失效，请从 XCMAX 重新打开账号工具")
+        _write({"version": PROTOCOL_VERSION, "connection": {
+            "connection_id": request_id, "token_hash": hashlib.sha256(token.encode()).hexdigest(),
+            "authorized_scopes": sorted(set(accepted_scopes)), "authorized_by": user,
+            "team_id": workspace_id(), "protocol_version": PROTOCOL_VERSION,
+        }})
         _HANDOFFS.pop(_handoff_key(request_id), None)
     return response.get("data") or {}
 
@@ -215,8 +220,8 @@ def cancel_authorization(*, request_id: str) -> None:
 def disconnect() -> dict:
     # Local revocation is authoritative: the old host token immediately stops
     # working. The host's owner-only disconnect API requires its own user session.
-    _write({"version": PROTOCOL_VERSION, "connection": None, "host_cleanup_required": True})
     with _LOCK:
+        _write({"version": PROTOCOL_VERSION, "connection": None, "host_cleanup_required": True})
         for key in list(_HANDOFFS):
             if key[0] == str(base_data_root()):
                 del _HANDOFFS[key]

@@ -19,7 +19,7 @@ import httpx
 
 from app.channels.base import ChannelAdapter, UnifiedMessage
 from app.channels.config_store import get_field
-from app.channels.http_client import read_env, checked_json, send_error
+from app.channels.http_client import read_env, checked_json, send_error, check_send_authorization
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +71,7 @@ class LineAdapter(ChannelAdapter):
                 "to": contact_id,
                 "messages": [{"type": "text", "text": content}],
             }
+            check_send_authorization(kwargs.get("before_send"))
             resp = await client.post("/v2/bot/message/push", json=payload)
             body = checked_json(resp)
             if "message" in body:

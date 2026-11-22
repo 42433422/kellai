@@ -20,7 +20,7 @@ from typing import Any
 import httpx
 
 from app.channels.base import ChannelAdapter, UnifiedMessage
-from app.channels.http_client import BaseChannelClient, CachedToken, ChannelHTTPError, read_env, checked_json, send_error
+from app.channels.http_client import BaseChannelClient, CachedToken, ChannelHTTPError, read_env, checked_json, send_error, check_send_authorization
 
 logger = logging.getLogger(__name__)
 
@@ -104,13 +104,14 @@ class _WeComClient(BaseChannelClient):
     async def fetch_token(self) -> str:
         return await self.ensure_token().get()
 
-    async def post_with_token(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def post_with_token(self, path: str, payload: dict[str, Any], *, before_send) -> dict[str, Any]:
         """所有需要 token 的接口走这个。"""
         try:
             token = await self.ensure_token().get()
         except Exception as exc:
             raise ChannelHTTPError("企微发送前获取凭据失败", delivery_state="failed") from exc
-        return await self.post_json(path, params={"access_token": token}, json=payload)
+        return await self.post_json(path, params={"access_token": token}, json=payload,
+                                    before_send=lambda: check_send_authorization(before_send))
 
 
 class WeComAdapter(ChannelAdapter):
@@ -185,18 +186,19 @@ class WeComAdapter(ChannelAdapter):
 
         try:
             if contact_id.startswith("@chat"):
-                return await self._send_via_bot(content, kwargs.get("mentioned_list", []))
+                return await self._send_via_bot(content, kwargs.get("mentioned_list", []), kwargs.get("before_send"))
             return await self._send_via_app(contact_id, content, kwargs)
         except Exception as exc:
             logger.warning("企微 send_message 失败: %s", type(exc).__name__)
             return send_error(exc)
 
-    async def _send_via_bot(self, content: str, mentioned: list[str]) -> dict:
+    async def _send_via_bot(self, content: str, mentioned: list[str], before_send) -> dict:
         """群机器人 Webhook 模式（markdown 消息）。"""
         webhook = self._bot_webhook()
         if not webhook:
             return {"success": False, "message_id": "", "error": "未配置 bot_webhook", "delivery_state": "failed", "definitely_not_sent": True}
         async with httpx.AsyncClient(timeout=10.0) as http:
+            check_send_authorization(before_send)
             resp = await http.post(
                 webhook,
                 json={
@@ -234,7 +236,7 @@ class WeComAdapter(ChannelAdapter):
             "safe": 0,
         }
         try:
-            body = await client.post_with_token("/cgi-bin/message/send", payload)
+            body = await client.post_with_token("/cgi-bin/message/send", payload, before_send=kwargs.get("before_send"))
         finally:
             await client.close()
         if body.get("errcode") != 0:

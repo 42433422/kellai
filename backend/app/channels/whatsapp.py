@@ -21,7 +21,7 @@ import httpx
 
 from app.channels.base import ChannelAdapter, UnifiedMessage
 from app.channels.config_store import get_field
-from app.channels.http_client import read_env, checked_json, send_error
+from app.channels.http_client import read_env, checked_json, send_error, check_send_authorization
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +79,7 @@ class WhatsAppAdapter(ChannelAdapter):
                 "type": "text",
                 "text": {"body": content},
             }
+            check_send_authorization(kwargs.get("before_send"))
             resp = await client.post(
                 f"/{_phone_number_id()}/messages",
                 json=payload,

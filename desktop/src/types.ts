@@ -43,13 +43,14 @@ export interface Message {
   id: number | string;
   direction: string;
   content: string;
-  status?: string;
+  metadata?: { delivery_state?: string };
   created_at: string;
 }
 export interface Receipt {
   request_id: string;
   connection_id: string;
   status: string;
+  provider_state?: string;
   error?: string;
   message_id?: number | string;
   provider_message_id?: string;
@@ -65,4 +66,12 @@ export function receiptLabel(status: string) {
   return ({ accepted: '平台已受理', sent: '发送请求已提交', delivered: '已送达', read: '已读',
     pending: '等待处理', sending: '正在提交', failed: '发送失败', rejected: '未获准发送',
     unknown: '结果待核验，请查询原请求' } as Record<string, string>)[status] || status || '未核验';
+}
+
+export function receiptState(receipt: Receipt): string {
+  // The ledger records acceptance separately from subsequent platform evidence.
+  // An unknown/failed attempt must not be promoted by a stale provider field.
+  return receipt.status === 'accepted'
+    && ['sent', 'delivered', 'read'].includes(receipt.provider_state || '')
+    ? receipt.provider_state! : receipt.status;
 }

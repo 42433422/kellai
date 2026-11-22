@@ -2,6 +2,9 @@
 import hashlib
 import json
 import sqlite3
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -92,6 +95,42 @@ async def test_single_use_handoff_is_only_local_session_entry(tool_env, monkeypa
         with pytest.raises(Exception):
             xcmax_integration.authorize_access_token(supplied, "messages.send")
         assert xcmax_integration.pending_authorization() is None
+
+
+@pytest.mark.asyncio
+async def test_local_revoke_fences_an_inflight_host_approval(tool_env, monkeypatch):
+    requested, release = threading.Event(), threading.Event()
+    request_id = "approval-overlapped-by-revoke"
+    xcmax_integration._HANDOFFS[xcmax_integration._handoff_key(request_id)] = {
+        "request_id": request_id, "authorization_secret": "S" * 48,
+        "workspace_id": 1, "received_at": time.time(),
+        "requested_scopes": [{"id": "messages.send"}],
+    }
+    issued = []
+
+    def host(path, *, method="GET", data=None):
+        assert path.endswith("/approve")
+        issued.append(data["access_token"])
+        requested.set()
+        assert release.wait(5), "test did not release the host acknowledgement"
+        return {"success": True, "data": {"state": "connected"}}
+
+    monkeypatch.setattr(xcmax_integration, "_xcmax_request", host)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(xcmax_integration.approve_authorization,
+            request_id=request_id, accepted_scopes=["messages.send"], current_user=auth.operator())
+        assert requested.wait(5)
+        try:
+            assert xcmax_integration.disconnect()["local_grant_revoked"]
+        finally:
+            release.set()
+        with pytest.raises(RuntimeError, match="本机交接已失效"):
+            pending.result(timeout=5)
+    assert xcmax_integration.public_status()["connected"] is False
+    assert xcmax_integration.pending_authorization() is None
+    with pytest.raises(Exception) as denied:
+        xcmax_integration.authorize_access_token(issued[0], "messages.send")
+    assert denied.value.status_code == 401
 
 
 @pytest.mark.asyncio

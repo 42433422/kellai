@@ -22,7 +22,7 @@ import httpx
 
 from app.channels.base import ChannelAdapter, UnifiedMessage
 from app.channels.config_store import get_field
-from app.channels.http_client import CachedToken, read_env, checked_json, send_error
+from app.channels.http_client import CachedToken, read_env, checked_json, send_error, check_send_authorization
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +136,7 @@ class MiniAppAdapter(ChannelAdapter):
             }
             if kwargs.get("page"):
                 payload["page"] = str(kwargs["page"])
+            check_send_authorization(kwargs.get("before_send"))
             resp = await client.post(
                 "/cgi-bin/message/subscribe/send",
                 params={"access_token": token},

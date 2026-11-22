@@ -143,7 +143,7 @@ async def access_context(team_id: int) -> dict:
     if "enterprise.im" not in set(str(token.get("scope") or "").replace(" ", ",").split(",")):
         raise DouyinChannelError("此账号未授予 enterprise.im 私信权限")
     if int(token.get("expires_at") or 0) > time.time() + 120:
-        return token
+        return {**token, "_connection_version": item["version"]}
     if not token.get("refresh_token") or int(token.get("refresh_expires_at") or 0) <= time.time() + 60:
         store.update_connection(identifier, connected=False, status="requires_reconnect", expected_version=item["version"])
         raise DouyinChannelError("授权已过期，请重新连接")
@@ -165,9 +165,9 @@ async def access_context(team_id: int) -> dict:
             raise DouyinChannelError("刷新后的授权缺少私信权限")
         if updated["open_id"] != token["open_id"]:
             raise DouyinChannelError("刷新后的账号身份不一致")
-        store.update_connection(identifier, {"oauth_token": updated}, connected=True,
-                                expected_version=item["version"])
-        return updated
+        refreshed = store.update_connection(identifier, {"oauth_token": updated}, connected=True,
+                                            expected_version=item["version"])
+        return {**updated, "_connection_version": refreshed["version"]}
     except Exception:
         try:
             store.update_connection(identifier, connected=False, status="requires_reconnect", expected_version=item["version"])

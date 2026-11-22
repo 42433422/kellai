@@ -79,6 +79,7 @@ jobs:
         if: always()
         run: docker rm --force kellai-smoke
   native:
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -103,7 +104,7 @@ jobs:
         run: |
           binary=backend/dist/kellai-backend
           if [[ "$RUNNER_OS" == "Windows" ]]; then binary="$binary.exe"; fi
-          uv run --project backend python backend/tests/smoke_packaged_backend.py "$binary"
+          uv run --project backend python backend/tests/smoke_packaged_backend.py "$binary" --output native-test-artifacts/frozen-backend.json
       - run: npm ci --ignore-scripts --no-audit --no-fund
         working-directory: desktop
       - run: npm run build
@@ -111,4 +112,29 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.100.0"
-      - run: cargo check --locked --manifest-path desktop/src-tauri/Cargo.toml
+      - name: Build the complete unsigned CI candidate
+        shell: bash
+        working-directory: desktop
+        run: |
+          bundle=nsis
+          if [[ "$RUNNER_OS" == "macOS" ]]; then bundle=dmg; fi
+          npm run tauri build -- --ci --no-sign --bundles "$bundle" --config src-tauri/tauri.ci.conf.json -- --locked
+      - name: Verify the installer contents and running packaged identity
+        shell: bash
+        run: uv run --project backend python backend/tests/smoke_native_bundle.py --source-sha "$(git rev-parse HEAD)" --output native-test-artifacts/installed-candidate.json
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: kellai-unsigned-candidate-${{ matrix.os }}-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            desktop/src-tauri/target/release/bundle/nsis/*.exe
+            desktop/src-tauri/target/release/bundle/dmg/*.dmg
+            backend/build-info.json
+            native-test-artifacts/
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: kellai-native-failure-evidence-${{ matrix.os }}
+          path: native-test-artifacts/

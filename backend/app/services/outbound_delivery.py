@@ -35,6 +35,7 @@ def _now() -> str:
 
 def ensure_schema() -> None:
     with sqlite3.connect(str(database_path()), timeout=30) as conn:
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute(
             """CREATE TABLE IF NOT EXISTS kellai_outbound_deliveries (
                 team_id INTEGER NOT NULL,
@@ -50,6 +51,7 @@ def ensure_schema() -> None:
                 result_json TEXT NOT NULL DEFAULT '{}',
                 provider_message_id TEXT NOT NULL DEFAULT '',
                 provider_state TEXT NOT NULL DEFAULT '',
+                receipt_checked_at TEXT NOT NULL DEFAULT '',
                 projected INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -58,6 +60,8 @@ def ensure_schema() -> None:
         )
         if "connection_id" not in {r[1] for r in conn.execute("PRAGMA table_info(kellai_outbound_deliveries)")}:
             conn.execute("ALTER TABLE kellai_outbound_deliveries ADD COLUMN connection_id TEXT NOT NULL DEFAULT ''")
+        if "receipt_checked_at" not in {r[1] for r in conn.execute("PRAGMA table_info(kellai_outbound_deliveries)")}:
+            conn.execute("ALTER TABLE kellai_outbound_deliveries ADD COLUMN receipt_checked_at TEXT NOT NULL DEFAULT ''")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_outbound_connection_receipt "
             "ON kellai_outbound_deliveries(team_id, connection_id, channel_type, provider_message_id)"
@@ -159,6 +163,30 @@ def get_delivery(idempotency_key: str, *, team_id: int = 0) -> dict[str, Any] | 
         # acceptance without ever invoking the provider again.
         return _project_message(key, team_id=team_id, replayed=True)
     return _receipt(row, replayed=True)
+
+
+def pending_provider_receipts(*, team_id: int, connection_id: str, channel_type: str,
+                              limit: int = 50) -> list[dict[str, Any]]:
+    """Rotate bounded readback work on the original outbox, including failures.
+
+    Updating the observation time before provider I/O keeps an unavailable old
+    message from permanently starving newer receipts. It never grants a send.
+    """
+    team_id = resolve_team_id(team_id, required=True)
+    from app.services.message_store import _connection_id
+    connection_id = _connection_id(connection_id)
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            "SELECT * FROM kellai_outbound_deliveries WHERE team_id=? AND connection_id=? AND channel_type=? "
+            "AND status IN ('accepted','unknown') AND provider_message_id<>'' "
+            "AND provider_state NOT IN ('read','failed') ORDER BY receipt_checked_at,created_at,request_id LIMIT ?",
+            (team_id, connection_id, channel_type, max(1, min(int(limit), 50))),
+        ).fetchall()
+        conn.executemany("UPDATE kellai_outbound_deliveries SET receipt_checked_at=? WHERE team_id=? AND request_id=?",
+                         [(_now(), team_id, row["request_id"]) for row in rows])
+    return [{"request_id": row["request_id"], "provider_message_id": row["provider_message_id"],
+             "context": json.loads(row["result_json"])} for row in rows]
 
 
 def delivery_matches(
@@ -339,7 +367,18 @@ def complete_external(
             raise DeliveryLeaseError("发送回执不属于当前任务")
         if row["status"] in {"accepted", "failed", "cancelled"}:
             if row["result_json"] != encoded_result:
-                raise DeliveryConflict("发送终态已有不同回执")
+                canonical = json.loads(row["result_json"])
+                incoming_id = str(result.get("message_id") or "")
+                # A verified provider readback can win the race against the
+                # original POST response or timeout. The same attempt may
+                # acknowledge that result, but cannot replace its identity.
+                if (not canonical.get("reconciled")
+                        or (incoming_id and incoming_id != row["provider_message_id"])
+                        or (success and not incoming_id)
+                        or any(key in result and result[key] != canonical.get(key)
+                               for key in ("gateway_id", "account_id", "inbox_id", "conversation_id"))):
+                    raise DeliveryConflict("发送终态已有不同回执")
+                status = row["status"]
             replayed = True
         else:
             if row["status"] not in {"sending", "unknown"}:
@@ -389,6 +428,7 @@ async def dispatch(
 def reconcile_receipt(
     *, team_id: int, channel_type: str, provider_message_id: str, state: str,
     provider_context: dict[str, Any] | None = None, connection_id: str = "",
+    request_id: str = "", verified_content: str | None = None,
 ) -> bool:
     """Apply a verified provider webhook to its existing tenant/channel receipt."""
 
@@ -400,14 +440,20 @@ def reconcile_receipt(
         return False
     if channel_type == "chatwoot" and not {"gateway_id", "account_id", "inbox_id", "conversation_id"}.issubset(provider_context or {}):
         return False
+    recovering = channel_type == "chatwoot" and bool(request_id)
+    if request_id and not recovering:
+        return False
+    if recovering and not isinstance(verified_content, str):
+        return False
+    key = _request_key(request_id) if recovering else ""
     with _connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         rows = conn.execute(
             "SELECT * FROM kellai_outbound_deliveries WHERE team_id=? AND connection_id=? AND channel_type=? "
-            "AND provider_message_id=?",
-            (team_id, connection_id, channel_type, str(provider_message_id)),
+            + ("AND request_id=?" if recovering else "AND provider_message_id=?"),
+            (team_id, connection_id, channel_type, key if recovering else str(provider_message_id)),
         ).fetchall()
-        if provider_context:
+        if provider_context and not recovering:
             matched = []
             for candidate in rows:
                 result = json.loads(candidate["result_json"])
@@ -418,20 +464,45 @@ def reconcile_receipt(
         if len(rows) != 1:
             return False
         row = rows[0]
+        original = json.loads(row["result_json"])
+        if recovering:
+            payload = json.loads(row["payload_json"])
+            context = provider_context or {}
+            target = (f"chatwoot:{context['gateway_id']}:{context['account_id']}:"
+                      f"{context['inbox_id']}:{context['conversation_id']}")
+            if (payload.get("contact_id") != target or payload.get("content") != verified_content
+                    or payload.get("direction") != "outbound" or payload.get("content_type") != "text"
+                    or (row["provider_message_id"] and row["provider_message_id"] != str(provider_message_id))
+                    or any(name in original and original[name] != value for name, value in context.items())):
+                return False
+            if conn.execute(
+                "SELECT 1 FROM kellai_outbound_deliveries WHERE team_id=? AND connection_id=? "
+                "AND channel_type=? AND provider_message_id=? AND request_id<>?",
+                (team_id, connection_id, channel_type, str(provider_message_id), key),
+            ).fetchone():
+                return False
         previous = str(row["provider_state"])
         if previous == state:
             return True
-        if row["status"] not in {"accepted", "unknown"}:
+        if row["status"] not in ({"accepted", "unknown", "sending"} if recovering else {"accepted", "unknown"}):
             return False
         if state == "failed":
             if ranks.get(previous, -1) >= ranks["delivered"]:
                 return False
         elif ranks[state] < ranks.get(previous, -1):
             return False
+        recovered_result = original
+        if recovering and not row["provider_message_id"]:
+            recovered_result = {"success": state != "failed", "message_id": str(provider_message_id),
+                                "delivery_state": state, "provider": "chatwoot", "reconciled": True,
+                                "retryable": False, **(provider_context or {})}
+            if state == "failed":
+                recovered_result["error"] = "provider_delivery_failed"
         conn.execute(
-            "UPDATE kellai_outbound_deliveries SET provider_state=?, status=?, updated_at=? "
+            "UPDATE kellai_outbound_deliveries SET provider_state=?, status=?, provider_message_id=?, result_json=?, updated_at=? "
             "WHERE team_id=? AND request_id=?",
-            (state, "failed" if state == "failed" else "accepted", _now(), team_id, row["request_id"]),
+            (state, "failed" if state == "failed" else "accepted", str(provider_message_id),
+             _json(recovered_result), _now(), team_id, row["request_id"]),
         )
         # Keep the existing message API in sync when its local projection exists.
         if row["projected"]:
@@ -446,4 +517,6 @@ def reconcile_receipt(
                     "UPDATE kellai_messages SET metadata_json=? WHERE team_id=? AND connection_id=? AND id=?",
                     (_json(metadata), team_id, row["connection_id"], row["message_id"]),
                 )
+    if state != "failed" and not row["projected"]:
+        _project_message(str(row["request_id"]), team_id=team_id, replayed=True)
     return True

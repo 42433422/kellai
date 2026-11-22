@@ -1,10 +1,21 @@
 """The sole inbox consumer persists messages; XCMAX owns business processing."""
 from __future__ import annotations
 
+import asyncio
+
 from app.services.tenant_context import resolve_team_id, tenant_scope
+
+SYNC_TIMEOUT_SECONDS = 20.0
 
 
 async def sync_inbox(*, team_id: int = 0, connection_id: str, limit: int = 50) -> dict:
+    # A stalled provider cannot hold up every other account or an operator's UI.
+    # Cancellation preserves durable inbox rows and the last committed cursor.
+    async with asyncio.timeout(SYNC_TIMEOUT_SECONDS):
+        return await _consume_inbox(team_id=team_id, connection_id=connection_id, limit=limit)
+
+
+async def _consume_inbox(*, team_id: int, connection_id: str, limit: int) -> dict:
     from app.channels import ChannelRegistry
     from app.channels.config_store import connection_scope, get_connection
     from app.services.message_store import mark_inbox_consumed, save_message

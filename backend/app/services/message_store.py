@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import secrets
 import sqlite3
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
@@ -60,6 +61,8 @@ def ensure_messages_schema() -> None:
             metadata_json TEXT, received_at TEXT NOT NULL, consumed INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(team_id,connection_id,id)
         )""")
+        if "last_checked_at" not in {row[1] for row in conn.execute("PRAGMA table_info(kellai_channel_inbox)")}:
+            conn.execute("ALTER TABLE kellai_channel_inbox ADD COLUMN last_checked_at REAL NOT NULL DEFAULT 0")
         for table in ("kellai_messages", "kellai_channel_inbox"):
             legacy = table + "_before_connections"
             info = conn.execute(f"PRAGMA table_info({legacy})").fetchall()
@@ -92,6 +95,11 @@ def ensure_messages_schema() -> None:
             contact_id TEXT NOT NULL, customer_id INTEGER NOT NULL, contact_name TEXT NOT NULL,
             last_message_at TEXT NOT NULL DEFAULT '', is_demo INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(team_id,connection_id,channel_type,contact_id)
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS kellai_channel_sync (
+            team_id INTEGER NOT NULL, connection_id TEXT NOT NULL, channel_type TEXT NOT NULL,
+            stream_key TEXT NOT NULL, position_json TEXT NOT NULL, revision INTEGER NOT NULL,
+            PRIMARY KEY(team_id,connection_id,channel_type,stream_key)
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tool_messages_contact ON kellai_messages(team_id,connection_id,customer_id,created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tool_inbox_pending ON kellai_channel_inbox(team_id,connection_id,consumed,received_at)")
@@ -279,14 +287,15 @@ def push_inbox(channel_type: str, *, contact_id: str, direction: str, content: s
             if (previous["channel_type"], previous["contact_id"], previous["direction"], previous["content"], previous["content_type"]) != (channel_type, contact_id, direction, content, content_type):
                 raise ValueError("回调编号已绑定其他消息")
             return mid
-        conn.execute("INSERT INTO kellai_channel_inbox VALUES(?,?,?,?,?,?,?,?,?,?,?,0)", (
+        conn.execute("INSERT INTO kellai_channel_inbox (team_id,connection_id,id,channel_type,contact_id,contact_name,"
+                     "direction,content,content_type,metadata_json,received_at,consumed) VALUES(?,?,?,?,?,?,?,?,?,?,?,0)", (
             tid, cid, mid, channel_type, contact_id, contact_name, direction, content,
             content_type, json.dumps(safe, ensure_ascii=False), _now_iso()))
     return mid
 
 
 def list_inbox(channel_type: str = "", *, limit: int = 50, include_consumed: bool = False,
-               team_id: int | None = None, connection_id: str = "") -> list[dict]:
+               team_id: int | None = None, connection_id: str = "", rotate: bool = False) -> list[dict]:
     clauses = ["team_id=?", "connection_id=?"]
     args: list[Any] = [_effective_team_id(team_id), _connection_id(connection_id)]
     if channel_type:
@@ -296,7 +305,13 @@ def list_inbox(channel_type: str = "", *, limit: int = 50, include_consumed: boo
         clauses.append("consumed=0")
     args.append(max(1, min(int(limit), 500)))
     with _connect() as conn:
-        rows = conn.execute("SELECT * FROM kellai_channel_inbox WHERE " + " AND ".join(clauses) + " ORDER BY received_at,id LIMIT ?", args).fetchall()
+        if rotate:
+            conn.execute("BEGIN IMMEDIATE")
+        order = "last_checked_at,received_at,id" if rotate else "received_at,id"
+        rows = conn.execute("SELECT * FROM kellai_channel_inbox WHERE " + " AND ".join(clauses) + " ORDER BY " + order + " LIMIT ?", args).fetchall()
+        if rotate:
+            conn.executemany("UPDATE kellai_channel_inbox SET last_checked_at=? WHERE team_id=? AND connection_id=? AND id=?",
+                             [(time.time(), row["team_id"], row["connection_id"], row["id"]) for row in rows])
     return [{**dict(row), "metadata": {**_metadata(row["metadata_json"]), "team_id": row["team_id"], "connection_id": row["connection_id"]}} for row in rows]
 
 
@@ -306,3 +321,26 @@ def mark_inbox_consumed(message_ids: list[str], *, team_id: int | None = None, c
     with _connect() as conn:
         return conn.execute("UPDATE kellai_channel_inbox SET consumed=1 WHERE team_id=? AND connection_id=? AND id IN (" + ",".join("?" for _ in message_ids) + ") AND consumed=0",
                             [_effective_team_id(team_id), _connection_id(connection_id), *message_ids]).rowcount
+
+
+def get_sync_progress(channel_type: str, stream_key: str) -> tuple[dict, int]:
+    """Provider pagination belongs to the same workspace and account as its inbox."""
+    with _connect() as conn:
+        row = conn.execute("SELECT position_json,revision FROM kellai_channel_sync "
+            "WHERE team_id=? AND connection_id=? AND channel_type=? AND stream_key=?",
+            (_effective_team_id(), _connection_id(), channel_type, stream_key)).fetchone()
+    return (json.loads(row[0]), int(row[1])) if row else ({}, 0)
+
+
+def save_sync_progress(channel_type: str, stream_key: str, position: dict, *, revision: int) -> bool:
+    """Checkpoint only after all page records are durable; stale readers cannot skip a page."""
+    args = (_effective_team_id(), _connection_id(), channel_type, stream_key)
+    encoded = json.dumps(position, sort_keys=True)
+    with _connect() as conn:
+        if revision == 0:
+            result = conn.execute("INSERT OR IGNORE INTO kellai_channel_sync VALUES(?,?,?,?,?,1)", (*args, encoded))
+        else:
+            result = conn.execute("UPDATE kellai_channel_sync SET position_json=?,revision=revision+1 "
+                "WHERE team_id=? AND connection_id=? AND channel_type=? AND stream_key=? AND revision=?",
+                (encoded, *args, revision))
+        return result.rowcount == 1

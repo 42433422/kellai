@@ -16,7 +16,7 @@ import httpx
 
 from app.channels.base import ChannelAdapter, UnifiedMessage
 from app.channels.config_store import get_field
-from app.channels.http_client import BaseChannelClient, CachedToken, ChannelHTTPError, read_env, checked_json, send_error
+from app.channels.http_client import BaseChannelClient, CachedToken, ChannelHTTPError, read_env, checked_json, send_error, check_send_authorization
 
 logger = logging.getLogger(__name__)
 
@@ -81,12 +81,13 @@ class _WeChatOfficialClient(BaseChannelClient):
     async def fetch_token(self) -> str:
         return await self.ensure_token().get()
 
-    async def post_with_token(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def post_with_token(self, path: str, payload: dict[str, Any], *, before_send) -> dict[str, Any]:
         try:
             token = await self.fetch_token()
         except Exception as exc:
             raise ChannelHTTPError("微信发送前获取凭据失败", delivery_state="failed") from exc
-        return await self.post_json(path, params={"access_token": token}, json=payload)
+        return await self.post_json(path, params={"access_token": token}, json=payload,
+                                    before_send=lambda: check_send_authorization(before_send))
 
 
 class WeChatAdapter(ChannelAdapter):
@@ -135,17 +136,18 @@ class WeChatAdapter(ChannelAdapter):
             return {"success": False, "message_id": "", "error": "contact_id/openid 不能为空", "delivery_state": "failed", "definitely_not_sent": True}
 
         if self._bot_webhook() and contact_id.startswith("@chat"):
-            return await self._send_via_bot(content, kwargs.get("mentioned_list", []))
+            return await self._send_via_bot(content, kwargs.get("mentioned_list", []), kwargs.get("before_send"))
 
         if self._has_official_account_config():
-            return await self._send_via_customer_service(contact_id, content)
+            return await self._send_via_customer_service(contact_id, content, kwargs.get("before_send"))
 
         return send_error("该联系人缺少公众号客服发信授权；固定群机器人仅支持明确的 @chat 目标",
                           definitely_not_sent=True)
 
-    async def _send_via_bot(self, content: str, mentioned: list[str]) -> dict:
+    async def _send_via_bot(self, content: str, mentioned: list[str], before_send) -> dict:
         try:
             async with httpx.AsyncClient(timeout=10.0) as http:
+                check_send_authorization(before_send)
                 resp = await http.post(
                     self._bot_webhook(),
                     json={
@@ -167,7 +169,7 @@ class WeChatAdapter(ChannelAdapter):
             logger.warning("微信 send_message 失败: %s", type(exc).__name__)
             return send_error(exc)
 
-    async def _send_via_customer_service(self, openid: str, content: str) -> dict:
+    async def _send_via_customer_service(self, openid: str, content: str, before_send) -> dict:
         try:
             client = _WeChatOfficialClient(self._official_app_id(), self._official_app_secret())
             try:
@@ -178,6 +180,7 @@ class WeChatAdapter(ChannelAdapter):
                         "msgtype": "text",
                         "text": {"content": content},
                     },
+                    before_send=before_send,
                 )
             finally:
                 await client.close()
