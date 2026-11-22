@@ -9,7 +9,7 @@
 - KELLAI_WHATSAPP_PHONE_NUMBER_ID
 - KELLAI_WHATSAPP_ACCESS_TOKEN
 - KELLAI_WHATSAPP_BUSINESS_ID
-- KELLAI_WHATSAPP_BASE_URL（默认 https://graph.facebook.com/v20.0）
+- 官方 API 固定为 https://graph.facebook.com/v25.0
 """
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ class WhatsAppAdapter(ChannelAdapter):
     channel_type = "whatsapp"
 
     def __init__(self) -> None:
-        self._base_url: str = read_env("KELLAI_WHATSAPP_BASE_URL", "https://graph.facebook.com/v20.0")
+        self._base_url: str = "https://graph.facebook.com/v25.0"
         self._client: httpx.AsyncClient | None = None
 
     def _is_configured(self) -> bool:
@@ -86,7 +86,7 @@ class WhatsAppAdapter(ChannelAdapter):
             body = checked_json(resp)
             if "error" in body:
                 err = body.get("error", {}) or {}
-                return send_error(f"WhatsApp 拒绝请求: {err.get('code')} {err.get('message', '')}",
+                return send_error("WhatsApp 拒绝请求",
                                   definitely_not_sent=True)
             messages = body.get("messages")
             if not isinstance(messages, list) or not messages or not messages[0].get("id"):
@@ -95,7 +95,7 @@ class WhatsAppAdapter(ChannelAdapter):
                     "delivery_state": "accepted", "error": ""}
 
         except Exception as exc:
-            logger.warning("WhatsApp send_message 异常: %s", exc)
+            logger.warning("WhatsApp send_message 异常: %s", type(exc).__name__)
             return send_error(exc)
 
     # ----------------- receive_messages -----------------
@@ -105,7 +105,7 @@ class WhatsAppAdapter(ChannelAdapter):
             from app.services.message_store import list_inbox
             rows = list_inbox(self.channel_type, limit=int(limit))
         except Exception as exc:
-            logger.warning("读取 WhatsApp 收件箱失败: %s", exc)
+            logger.warning("读取 WhatsApp 收件箱失败: %s", type(exc).__name__)
             return []
         out: list[UnifiedMessage] = []
         for r in rows:
@@ -178,4 +178,4 @@ class WhatsAppAdapter(ChannelAdapter):
                 "message": f"errcode={err.get('code')} {err.get('message', '')}",
             }
         except Exception as exc:
-            return {"connected": False, "message": f"WhatsApp 连接失败: {exc}"}
+            return {"connected": False, "message": f"WhatsApp 连接失败: {type(exc).__name__}"}

@@ -141,7 +141,7 @@ class PhoneAdapter(ChannelAdapter):
                 return await self._send_aliyun(contact_id, content, kwargs)
             return {"success": False, "message_id": "", "error": f"不支持的 provider: {self._provider}", "delivery_state": "failed", "definitely_not_sent": True}
         except Exception as exc:
-            logger.warning("短信发送异常: %s", exc)
+            logger.warning("短信发送异常: %s", type(exc).__name__)
             return send_error(exc)
 
     async def _send_twilio(self, to: str, body: str) -> dict:
@@ -208,7 +208,7 @@ class PhoneAdapter(ChannelAdapter):
         resp = await client.get("https://dysmsapi.aliyuncs.com/", params=params)
         result = checked_json(resp)
         if str(result.get("Code", "")).upper() != "OK":
-            return send_error(f"阿里云短信失败: {result.get('Code')} {result.get('Message')}",
+            return send_error("阿里云短信请求失败",
                               definitely_not_sent="Code" in result)
         if not result.get("BizId"):
             return send_error("阿里云未返回短信 BizId，发送结果未知")
@@ -227,7 +227,7 @@ class PhoneAdapter(ChannelAdapter):
             from app.services.message_store import list_inbox
             rows = list_inbox(self.channel_type, limit=int(limit))
         except Exception as exc:
-            logger.warning("读取电话收件箱失败: %s", exc)
+            logger.warning("读取电话收件箱失败: %s", type(exc).__name__)
             return []
         out: list[UnifiedMessage] = []
         for r in rows:
@@ -293,7 +293,7 @@ class PhoneAdapter(ChannelAdapter):
                 return {"connected": True, "verification_level": "authenticated",
                         "message": "Twilio账号鉴权通过；尚未进行真实短信收发验收"}
             except Exception as exc:
-                return {"connected": False, "message": f"Twilio鉴权失败: {exc}"}
+                return {"connected": False, "message": f"Twilio鉴权失败: {type(exc).__name__}"}
         return {"connected": False, "verification_level": "configured",
                 "message": "阿里云模板短信凭据已配置；尚未进行远端鉴权及真实发送验收"}
 

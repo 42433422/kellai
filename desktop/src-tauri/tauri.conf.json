@@ -1,5 +1,5 @@
 {
-  "$schema": "https://raw.githubusercontent.com/nicegui/tauri-v2/main/tooling/cli/schema.json",
+  "$schema": "https://schema.tauri.app/config/2",
   "productName": "客来来",
   "version": "1.0.1",
   "identifier": "com.kellai.desktop",
@@ -12,11 +12,11 @@
   "app": {
     "windows": [
       {
-        "title": "客来来",
+        "title": "客来来 · 账号与通道工具",
         "width": 1280,
         "height": 800,
-        "minWidth": 1024,
-        "minHeight": 680,
+        "minWidth": 640,
+        "minHeight": 560,
         "resizable": true,
         "fullscreen": false
       }
@@ -29,11 +29,9 @@
     "active": true,
     "targets": "all",
     "resources": {
-      "../../backend/dist/kellai-backend": "backend/kellai-backend"
+      "../../backend/dist/": "backend/"
     },
     "macOS": {
-      "entitlements": "Entitlements.plist",
-      "infoPlist": "Info.plist",
       "minimumSystemVersion": "11.0",
       "signingIdentity": "Developer ID Application: jialong Li (G26WSH472M)"
     },
@@ -44,5 +42,14 @@
       "icons/kellai-icon.icns",
       "icons/kellai-icon.ico"
     ]
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": [
+          "kellai"
+        ]
+      }
+    }
   }
 }

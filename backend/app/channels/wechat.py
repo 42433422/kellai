@@ -1,9 +1,8 @@
-"""微信开放平台 / 公众号渠道适配器。
+"""微信公众号渠道适配器。
 
-支持三条互补路径：
-- 微信开放平台网站应用 OAuth：扫码授权后保存 openid/unionid，作为客户身份绑定依据
+支持账号明确配置的公众号与群机器人：
 - 公众号客服消息：配置公众号 AppID/Secret 后，通过客服接口向 openid 发文本消息
-- 旧版群机器人 Webhook：继续兼容 KELLAI_WECHAT_BOT_WEBHOOK 或前端保存的 bot_webhook
+- 固定群机器人 Webhook：使用此连接保存的 bot_webhook
 
 接收侧统一复用 kellai_channel_inbox，微信回调写入后由这里消费。
 """
@@ -25,9 +24,7 @@ _UNCONFIGURED_MSG = "微信渠道未配置（缺少开放平台 AppID/Secret、�
 
 
 def _cfg(field: str, default: str = "") -> str:
-    from app.channels.config_store import environment_config_allowed
-    fallback = read_env(f"WECHAT_{field.upper()}", default=default) if environment_config_allowed() else default
-    return get_field("wechat", field, default=fallback)
+    return get_field("wechat", field, default=default)
 
 
 def _cfg_any(*fields: str) -> str:
@@ -112,12 +109,6 @@ class WeChatAdapter(ChannelAdapter):
     def _bot_webhook(self) -> str:
         return _cfg("bot_webhook")
 
-    def _oauth_openid(self) -> str:
-        return _cfg("oauth_openid")
-
-    def _oauth_authorized(self) -> bool:
-        return _cfg("oauth_authorized").lower() in {"1", "true", "yes", "ok"}
-
     def _has_official_account_config(self) -> bool:
         return bool(
             _cfg_any("official_app_id", "mp_app_id")
@@ -130,8 +121,6 @@ class WeChatAdapter(ChannelAdapter):
         if self._has_official_account_config():
             return True
         if self._app_id() and self._app_secret():
-            return True
-        if self._oauth_authorized() and self._oauth_openid():
             return True
         return False
 
@@ -150,14 +139,6 @@ class WeChatAdapter(ChannelAdapter):
 
         if self._has_official_account_config():
             return await self._send_via_customer_service(contact_id, content)
-
-        if self._oauth_authorized() and self._oauth_openid():
-            return {
-                "success": False,
-                "message_id": "",
-                "error": "微信开放平台 OAuth 已授权，可识别 openid/unionid；主动发消息还需配置公众号 AppID/Secret 并开通客服消息接口",
-                "delivery_state": "failed", "definitely_not_sent": True,
-            }
 
         return send_error("该联系人缺少公众号客服发信授权；固定群机器人仅支持明确的 @chat 目标",
                           definitely_not_sent=True)
@@ -183,7 +164,7 @@ class WeChatAdapter(ChannelAdapter):
                 "error": "",
             }
         except Exception as exc:
-            logger.warning("微信 send_message 失败: %s", exc)
+            logger.warning("微信 send_message 失败: %s", type(exc).__name__)
             return send_error(exc)
 
     async def _send_via_customer_service(self, openid: str, content: str) -> dict:
@@ -209,7 +190,7 @@ class WeChatAdapter(ChannelAdapter):
                 "error": "",
             }
         except Exception as exc:
-            logger.warning("微信客服消息发送失败: %s", exc)
+            logger.warning("微信客服消息发送失败: %s", type(exc).__name__)
             return send_error(exc)
 
     async def receive_messages(self, since: str = "", limit: int = 50) -> list[UnifiedMessage]:
@@ -218,7 +199,7 @@ class WeChatAdapter(ChannelAdapter):
 
             rows = list_inbox(self.channel_type, limit=int(limit))
         except Exception as exc:
-            logger.warning("读取微信收件箱失败: %s", exc)
+            logger.warning("读取微信收件箱失败: %s", type(exc).__name__)
             return []
 
         messages: list[UnifiedMessage] = []
@@ -282,9 +263,5 @@ class WeChatAdapter(ChannelAdapter):
                             "message": "微信公众号鉴权通过；客服消息权限、回复窗口和真实收发尚需验收"}
                 return {"connected": False, "message": "微信公众号 token 为空"}
             except Exception as exc:
-                return {"connected": False, "message": f"微信公众号连接失败: {exc}"}
-        if self._oauth_authorized() and self._oauth_openid():
-            return {"connected": True, "message": f"微信开放平台 OAuth 已授权（openid={self._oauth_openid()}）"}
-        if self._app_id() and self._app_secret():
-            return {"connected": False, "message": "微信开放平台 AppID/Secret 已保存，请扫码授权完成接入"}
+                return {"connected": False, "message": f"微信公众号连接失败: {type(exc).__name__}"}
         return {"connected": False, "message": _UNCONFIGURED_MSG}

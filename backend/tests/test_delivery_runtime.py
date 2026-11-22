@@ -18,18 +18,12 @@ from app.services.tenant_context import tenant_scope
 def delivery_db(monkeypatch, tmp_path):
     monkeypatch.setenv("KELLAI_DATA_DIR", str(tmp_path))
     db = tmp_path / "kellai.db"
-    monkeypatch.setattr(outbound_delivery, "_crm_db_path", lambda: db)
-    monkeypatch.setattr(message_store, "_crm_db_path", lambda: db)
-    from app.services import growth_loop, workforce_routing
-
-    monkeypatch.setattr(growth_loop, "apply_message_to_growth_loop", lambda _msg: {})
-    monkeypatch.setattr(workforce_routing, "touch_assignment", lambda *_a, **_kw: None)
     return db
 
 
 def message(*, team=3, contact="contact-7", content="您好"):
     return UnifiedMessage(
-        id="transient-client-id", customer_id=7, channel_type="telegram",
+        id="transient-client-id", customer_id=7, channel_type="telegram", connection_id="account-a",
         contact_id=contact, contact_name="客户", direction="outbound", content=content,
         metadata={"team_id": team}, created_at=datetime.now(timezone.utc).isoformat(),
     )
@@ -65,7 +59,7 @@ async def test_replay_is_one_provider_post_and_one_durable_message(delivery_db):
     assert calls == [{"text": "您好"}]
     with sqlite3.connect(str(delivery_db)) as conn:
         assert conn.execute("SELECT COUNT(*) FROM kellai_messages").fetchone()[0] == 1
-    rows = message_store.get_messages(7, team_id=3)
+    rows = message_store.get_messages(7, connection_id="account-a", team_id=3)
     assert rows[0].metadata["provider_message_id"] == "provider-1"
 
 
@@ -117,7 +111,7 @@ async def test_provider_timeout_is_unknown_and_never_retried(delivery_db):
     assert calls == 1
 
 
-def test_desktop_reservation_is_single_use_and_receipt_is_fenced(delivery_db):
+def test_delivery_reservation_is_single_use_and_receipt_is_fenced(delivery_db):
     first = outbound_delivery.prepare_external(message(), idempotency_key="native", team_id=3)
     again = outbound_delivery.prepare_external(message(), idempotency_key="native", team_id=3)
     assert first["dispatch_allowed"]
@@ -168,7 +162,7 @@ async def test_provider_receipt_survives_projection_failure(monkeypatch, deliver
 
 
 @pytest.mark.asyncio
-async def test_recovery_after_message_commit_does_not_repeat_crm_projection(monkeypatch, delivery_db):
+async def test_recovery_after_message_commit_does_not_repeat_projection(monkeypatch, delivery_db):
     async def send():
         return {"success": True, "message_id": "remote-1"}
 
@@ -177,7 +171,7 @@ async def test_recovery_after_message_commit_does_not_repeat_crm_projection(monk
         conn.execute("UPDATE kellai_outbound_deliveries SET projected=0")
 
     def unexpected(_msg):
-        pytest.fail("existing message was projected to CRM again")
+        pytest.fail("existing durable message was projected again")
 
     monkeypatch.setattr(message_store, "save_message", unexpected)
     restored = await outbound_delivery.dispatch(message(), idempotency_key="projection", sender=send, team_id=3)
@@ -190,13 +184,13 @@ async def test_provider_receipts_are_tenant_scoped_and_monotonic(delivery_db):
         return {"success": True, "message_id": "provider-1", "delivery_state": "accepted"}
 
     await outbound_delivery.dispatch(message(), idempotency_key="receipts", sender=send, team_id=3)
-    assert not outbound_delivery.reconcile_receipt(team_id=4, channel_type="telegram", provider_message_id="provider-1", state="delivered")
-    assert not outbound_delivery.reconcile_receipt(team_id=3, channel_type="other", provider_message_id="provider-1", state="delivered")
-    assert outbound_delivery.reconcile_receipt(team_id=3, channel_type="telegram", provider_message_id="provider-1", state="delivered")
-    assert not outbound_delivery.reconcile_receipt(team_id=3, channel_type="telegram", provider_message_id="provider-1", state="sent")
-    assert not outbound_delivery.reconcile_receipt(team_id=3, channel_type="telegram", provider_message_id="provider-1", state="failed")
-    assert outbound_delivery.reconcile_receipt(team_id=3, channel_type="telegram", provider_message_id="provider-1", state="read")
-    assert message_store.get_messages(7, team_id=3)[0].metadata["delivery_state"] == "read"
+    assert not outbound_delivery.reconcile_receipt(connection_id="account-a", team_id=4, channel_type="telegram", provider_message_id="provider-1", state="delivered")
+    assert not outbound_delivery.reconcile_receipt(connection_id="account-a", team_id=3, channel_type="other", provider_message_id="provider-1", state="delivered")
+    assert outbound_delivery.reconcile_receipt(connection_id="account-a", team_id=3, channel_type="telegram", provider_message_id="provider-1", state="delivered")
+    assert not outbound_delivery.reconcile_receipt(connection_id="account-a", team_id=3, channel_type="telegram", provider_message_id="provider-1", state="sent")
+    assert not outbound_delivery.reconcile_receipt(connection_id="account-a", team_id=3, channel_type="telegram", provider_message_id="provider-1", state="failed")
+    assert outbound_delivery.reconcile_receipt(connection_id="account-a", team_id=3, channel_type="telegram", provider_message_id="provider-1", state="read")
+    assert message_store.get_messages(7, connection_id="account-a", team_id=3)[0].metadata["delivery_state"] == "read"
 
 
 def test_authenticated_context_rejects_explicit_other_tenant(delivery_db):
@@ -215,7 +209,7 @@ async def test_same_request_key_in_two_tenants_is_independent(delivery_db):
     first = await outbound_delivery.dispatch(message(team=3), idempotency_key="shared", sender=send, team_id=3)
     second = await outbound_delivery.dispatch(message(team=4), idempotency_key="shared", sender=send, team_id=4)
     assert first["message_id"] != second["message_id"]
-    assert len(message_store.get_messages(7, team_id=3)) == len(message_store.get_messages(7, team_id=4)) == 1
+    assert len(message_store.get_messages(7, connection_id="account-a", team_id=3)) == len(message_store.get_messages(7, connection_id="account-a", team_id=4)) == 1
 
 
 @pytest.mark.asyncio
@@ -240,7 +234,7 @@ async def test_provider_receipt_is_bound_to_original_gateway_configuration(deliv
                     "account_id": 1, "inbox_id": 2, "conversation_id": 3}
         await outbound_delivery.dispatch(message().model_copy(update={"channel_type": "chatwoot"}),
                                          idempotency_key=key, team_id=3, sender=send)
-    args = {"team_id": 3, "channel_type": "chatwoot", "provider_message_id": "1", "state": "delivered"}
+    args = {"connection_id": "account-a", "team_id": 3, "channel_type": "chatwoot", "provider_message_id": "1", "state": "delivered"}
     assert not outbound_delivery.reconcile_receipt(**args)
     assert not outbound_delivery.reconcile_receipt(**args, provider_context={"gateway_id": "unbound"})
     assert outbound_delivery.reconcile_receipt(**args, provider_context={

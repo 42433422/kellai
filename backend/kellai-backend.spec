@@ -1,12 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_submodules, copy_metadata
 
 
 a = Analysis(
     ['kellai_backend_entry.py'],
     pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=[],
+    datas=copy_metadata("keyring"),
+    hiddenimports=collect_submodules("keyring.backends"),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

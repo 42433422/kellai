@@ -12,8 +12,6 @@ jobs:
   backend:
     runs-on: ubuntu-latest
     env:
-      KELLAI_APP_ENV: development
-      KELLAI_JWT_SECRET: isolated-ci-test-secret
       KELLAI_CHANNEL_WORKER_ENABLED: "0"
       KELLAI_DATA_DIR: /tmp/kellai-test-data
     steps:
@@ -23,6 +21,8 @@ jobs:
           version: "0.13.9"
           python-version: "3.12"
       - run: uv sync --locked --project backend --group test
+      - name: Create isolated test vault key
+        run: uv run --project backend python -c 'import os; from cryptography.fernet import Fernet; open(os.environ["GITHUB_ENV"], "a").write("KELLAI_VAULT_KEY=" + Fernet.generate_key().decode() + "\n")'
       - run: uv run --project backend --group test python -m pytest backend/tests -q
         env:
           PYTHONPATH: backend
@@ -41,6 +41,21 @@ jobs:
         working-directory: desktop
       - run: npm run build
         working-directory: desktop
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.9"
+          python-version: "3.12"
+      - run: uv sync --locked --project backend --group browser
+      - run: uv run --project backend --group browser playwright install --with-deps chromium
+      - name: Exercise the real local tool UI with isolated accounts
+        run: uv run --project backend --group browser python desktop/tests/smoke_tool_ui.py
+        env:
+          KELLAI_UI_ARTIFACT_DIR: ui-test-artifacts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tool-ui-test-evidence
+          path: ui-test-artifacts
   container:
     runs-on: ubuntu-latest
     steps:
@@ -48,13 +63,7 @@ jobs:
       - name: Build the production dependency lock
         run: docker build -t kellai-closed-loop:ci backend
       - name: Start isolated production backend
-        run: >-
-          docker run --detach --name kellai-smoke
-          --publish 127.0.0.1:8793:8790
-          --env KELLAI_JWT_SECRET=isolated-container-test-secret-at-least-32-characters
-          --env KELLAI_PASSWORD_SALT=isolated-container-test-salt
-          --env KELLAI_CHANNEL_WORKER_ENABLED=0
-          kellai-closed-loop:ci
+        run: docker run --detach --name kellai-smoke --network host --env KELLAI_CHANNEL_WORKER_ENABLED=0 kellai-closed-loop:ci python -m uvicorn app.main:app --host 127.0.0.1 --port 8793
       - name: Check health and authentication boundary
         run: |
           for attempt in $(seq 1 30); do
@@ -69,3 +78,37 @@ jobs:
       - name: Stop container
         if: always()
         run: docker rm --force kellai-smoke
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.9"
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - run: uv sync --locked --project backend --group build
+      - run: uv run --group build pyinstaller --clean --noconfirm kellai-backend.spec
+        working-directory: backend
+      - name: Verify the real packaged backend
+        shell: bash
+        run: |
+          binary=backend/dist/kellai-backend
+          if [[ "$RUNNER_OS" == "Windows" ]]; then binary="$binary.exe"; fi
+          uv run --project backend python backend/tests/smoke_packaged_backend.py "$binary"
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+        working-directory: desktop
+      - run: npm run build
+        working-directory: desktop
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
+      - run: cargo check --locked --manifest-path desktop/src-tauri/Cargo.toml

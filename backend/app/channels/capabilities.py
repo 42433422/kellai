@@ -12,7 +12,7 @@ def _cap(*, receive: bool, send: bool, transport: str, receive_mode: str,
          readiness: str, limitations: list[str], auto_reply: bool = True, **extra: Any) -> dict:
     return {"receive": receive, "send": send, "contacts": True, "sync": True,
             "transport": transport, "receive_mode": receive_mode, "readiness": readiness,
-            "auto_reply": auto_reply and send and receive,
+            "auto_reply": False,
             "verification_level": "code_reviewed", "live_verified": False,
             "contact_source": "known_contacts", "limitations": limitations, **extra}
 
@@ -29,12 +29,11 @@ CAPABILITIES = {
             "公众号客服消息需要公众号权限、openid及平台回复窗口。",
             "开放平台扫码登录只证明身份授权；不支持个人微信好友任意私聊。"],
         send_modes=["official_account_customer_service", "fixed_group_bot"]),
-    "douyin": _cap(receive=True, send=True, transport="hybrid", receive_mode="webhook_or_native_capture",
+    "douyin": _cap(receive=True, send=True, transport="api", receive_mode="signed_webhook",
         readiness="conditional", limitations=[
-            "官方私信需相应scope及真实入站会话；miniapp回复需owner/conversation/server_message上下文。",
-            "网页会话的桌面发送需原生运行时，云端无原生运行时时必须拦截。"],
-        transports=["official_api", "remote_bridge", "native_desktop"], native_only=False,
-        native_sources=["douyin_web_portal", "manual"]),
+            "仅官方企业号私信API；需要对应scope、已绑定openid与真实入站会话。",
+            "历史集中桥接、第三方门户和坐标发送已移除，需重新授权明确账号。"],
+        message_types=["text"]),
     "miniprogram": _cap(receive=False, send=True, transport="api", receive_mode="local_inbox_only",
         readiness="outbound_only", auto_reply=False, limitations=[
             "这里只实现用户订阅的模板通知，不是任意文本私聊；需要template_id和匹配的模板字段。",
@@ -87,25 +86,5 @@ CHATWOOT_CONFIG_SCHEMA = {
 }
 
 
-def resolve_send_capability(channel_type: str, *, contact_id: str, customer_id: int = 0,
-                            contact_name: str = "", metadata: dict | None = None, team_id: int = 0) -> dict:
-    """Resolve transport for this recipient before reserving an outbound send."""
-    from app.services.tenant_context import resolve_team_id
-    from app.channels.registry import ChannelRegistry
-    kind = ChannelRegistry._aliases.get(channel_type, channel_type)
-    capability = dict(CAPABILITIES.get(kind, {"send": False, "transport": "unverified"}))
-    if kind != "douyin":
-        return capability
-    from app.channels.douyin import DouyinAdapter
-    resolved_team = resolve_team_id(team_id, required=True)
-    source = (metadata or {}).get("source")
-    target = DouyinAdapter._resolve_desktop_target(
-        customer_id=customer_id, contact_id=contact_id, contact_name=contact_name, team_id=resolved_team,
-    )
-    if source == "douyin_web_portal" or target:
-        capability.update(transport="desktop", send=False, auto_reply=False,
-                          requires_desktop_execution=True, error="requires_desktop_execution",
-                          definitely_not_sent=True)
-    else:
-        capability.update(transport="api", requires_desktop_execution=False)
-    return capability
+def resolve_send_capability(channel_type: str, **kwargs) -> dict:
+    return dict(CAPABILITIES.get(channel_type, {"send": False, "transport": "unverified"}))

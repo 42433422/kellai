@@ -135,6 +135,6 @@ async def reconcile_pending_receipts(adapter: ChatwootAdapter, *, team_id: int) 
                 provider_context={key: metadata[key] for key in ("gateway_id", "account_id", "inbox_id", "conversation_id")},
             ):
                 mark_inbox_consumed([row["id"]], team_id=team_id)
-        except Exception:
+        except Exception as exc:
             # Failed API lookup and unbound ACKs stay pending, never guessed or resent.
-            logger.warning("Chatwoot 消息状态尚未确认: team=%s", team_id, exc_info=True)
+            logger.warning("Chatwoot 消息状态尚未确认: team=%s (%s)", team_id, type(exc).__name__)

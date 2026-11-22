@@ -4,7 +4,7 @@
 - 群机器人 Webhook（最简）：配置 bot_webhook，无需 access_token
 - 应用消息：配置 corp_id + secret + agent_id
 
-配置来源：config_store（前端保存）优先，环境变量兜底。
+配置来源：当前 connection_id 的加密凭据库。
 
 接收：
 - 主动轮询：读取 kellai_channel_inbox 表（webhook 接收方写入）
@@ -28,7 +28,7 @@ _UNCONFIGURED_MSG = "企业微信渠道未配置（缺少 corp_id/secret/agent_i
 
 
 def _cfg(field: str, default: str = "") -> str:
-    """从 config_store 读取配置，环境变量兜底。"""
+    """从当前账号的凭据库读取配置。"""
     from app.channels.config_store import get_field
     return get_field("wework", field, default=default)
 
@@ -84,7 +84,7 @@ class _WeComClient(BaseChannelClient):
         )
         if int(body.get("errcode", 0)) != 0:
             raise RuntimeError(
-                f"企微 gettoken 失败: errcode={body.get('errcode')} errmsg={body.get('errmsg')}"
+                "企业微信 gettoken 失败"
             )
         token = str(body.get("access_token", ""))
         ttl = int(body.get("expires_in", 7200))
@@ -139,19 +139,11 @@ class WeComAdapter(ChannelAdapter):
     def _open_kfid(self) -> str:
         return _cfg("open_kfid") or _extract_open_kfid(self._kf_url())
 
-    def _suite_authorization(self) -> dict[str, Any]:
-        from app.services.tenant_context import current_team_id
-        from app.services.wework_suite import load_authorization
-        team_id = current_team_id()
-        return load_authorization(team_id) if team_id > 0 else {}
-
     def _is_configured(self) -> bool:
         """是否已配置（任一方式）。"""
         if self._bot_webhook():
             return True
         if self._corp_id() and self._corp_secret() and self._agent_id():
-            return True
-        if self._suite_authorization():
             return True
         if self._kf_url() and self._open_kfid():
             return True
@@ -183,8 +175,7 @@ class WeComAdapter(ChannelAdapter):
             return {"success": False, "message_id": "", "error": "消息内容为空", "delivery_state": "failed", "definitely_not_sent": True}
         if not contact_id:
             return {"success": False, "message_id": "", "error": "contact_id 不能为空", "delivery_state": "failed", "definitely_not_sent": True}
-        if self._kf_url() and not (self._bot_webhook() or self._suite_authorization()
-                                  or (self._corp_id() and self._corp_secret() and self._agent_id())):
+        if self._kf_url() and not (self._bot_webhook() or (self._corp_id() and self._corp_secret() and self._agent_id())):
             return {
                 "success": False,
                 "message_id": "",
@@ -197,7 +188,7 @@ class WeComAdapter(ChannelAdapter):
                 return await self._send_via_bot(content, kwargs.get("mentioned_list", []))
             return await self._send_via_app(contact_id, content, kwargs)
         except Exception as exc:
-            logger.warning("企微 send_message 失败: %s", exc)
+            logger.warning("企微 send_message 失败: %s", type(exc).__name__)
             return send_error(exc)
 
     async def _send_via_bot(self, content: str, mentioned: list[str]) -> dict:
@@ -231,14 +222,8 @@ class WeComAdapter(ChannelAdapter):
         corp_id = self._corp_id()
         corp_secret = self._corp_secret()
         agent_id = self._agent_id()
-        suite_auth = self._suite_authorization()
-        if suite_auth and corp_id and corp_id != suite_auth["auth_corpid"]:
-            return send_error("已授权企业与手动配置的 CorpID 不一致，请统一渠道绑定", definitely_not_sent=True)
-        local_credentials = bool(corp_id and corp_secret and agent_id)
-        if not local_credentials:
-            if not suite_auth or not suite_auth.get("agent_id"):
-                return send_error("未配置 corp_id/secret/agent_id 或企业第三方授权", definitely_not_sent=True)
-            agent_id = str(suite_auth["agent_id"])
+        if not (corp_id and corp_secret and agent_id):
+            return send_error("请配置当前账号的 corp_id/secret/agent_id", definitely_not_sent=True)
         # 每次发送时用最新配置创建 client（配置可能已变更）
         client = _WeComClient(corp_id, corp_secret)
         payload = {
@@ -249,18 +234,7 @@ class WeComAdapter(ChannelAdapter):
             "safe": 0,
         }
         try:
-            if local_credentials:
-                body = await client.post_with_token("/cgi-bin/message/send", payload)
-            else:
-                from app.services.wework_suite import get_corp_access_token
-                try:
-                    token = await get_corp_access_token(int(suite_auth["team_id"]))
-                except Exception as exc:
-                    return send_error(f"企业第三方授权凭据不可用: {type(exc).__name__}", definitely_not_sent=True)
-                # Reuse the existing suite token exchange; application messages
-                # still address internal members, not external customer chats.
-                body = await client.post_json("/cgi-bin/message/send",
-                                              params={"access_token": token}, json=payload)
+            body = await client.post_with_token("/cgi-bin/message/send", payload)
         finally:
             await client.close()
         if body.get("errcode") != 0:
@@ -286,7 +260,7 @@ class WeComAdapter(ChannelAdapter):
             rows.sort(key=lambda item: str(item.get("received_at", "")), reverse=True)
             rows = rows[: int(limit)]
         except Exception as exc:
-            logger.warning("读取企微收件箱失败: %s", exc)
+            logger.warning("读取企微收件箱失败: %s", type(exc).__name__)
             return []
         msgs: list[UnifiedMessage] = []
         for r in rows:
@@ -330,7 +304,7 @@ class WeComAdapter(ChannelAdapter):
                 )
             body = resp.json()
             if int(body.get("errcode", 0)) != 0:
-                logger.warning("企微通讯录拉取失败: %s", body.get("errmsg"))
+                logger.warning("企业微信通讯录拉取失败")
                 return []
             users = body.get("userlist", []) or []
             if keyword:
@@ -347,7 +321,7 @@ class WeComAdapter(ChannelAdapter):
                 for u in users
             ]
         except Exception as exc:
-            logger.warning("企微 get_contacts 异常: %s", exc)
+            logger.warning("企微 get_contacts 异常: %s", type(exc).__name__)
             return self._contacts_from_inbox(keyword=keyword, limit=limit)
 
     def _contacts_from_inbox(self, keyword: str = "", limit: int = 80) -> list[dict]:
@@ -390,14 +364,6 @@ class WeComAdapter(ChannelAdapter):
                 "connected": False, "verification_level": "configured",
                 "message": "企微群机器人 Webhook 已配置；尚未进行远端收发验收",
             }
-        if self._suite_authorization() and not (self._corp_id() and self._corp_secret() and self._agent_id()):
-            from app.services.wework_suite import get_corp_access_token
-            try:
-                await get_corp_access_token(int(self._suite_authorization()["team_id"]))
-                return {"connected": True, "verification_level": "authenticated",
-                        "message": "企业微信第三方应用授权鉴权通过；可见成员的真实收发尚需验收"}
-            except Exception as exc:
-                return {"connected": False, "message": f"企业第三方授权鉴权失败: {type(exc).__name__}"}
         if self._kf_url() and self._open_kfid() and not (self._corp_id() and self._corp_secret() and self._agent_id()):
             return {
                 "connected": False, "verification_level": "configured",
@@ -416,4 +382,4 @@ class WeComAdapter(ChannelAdapter):
                         "message": "企微应用鉴权通过；成员可见范围和真实收发尚需验收"}
             return {"connected": False, "message": "企微 token 为空"}
         except Exception as exc:
-            return {"connected": False, "message": f"企微连接失败: {exc}"}
+            return {"connected": False, "message": f"企微连接失败: {type(exc).__name__}"}

@@ -10,11 +10,9 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import sqlite3
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
@@ -89,8 +87,10 @@ def tenant_data_root(team_id: int | None = None, *, required: bool = True) -> Pa
     return root / "tenants" / str(resolved)
 
 
-def _legacy_pipeline_teams(root: Path) -> set[int]:
-    teams: set[int] = set()
+def legacy_owner_candidates(root: Path | None = None) -> set[int]:
+    root = root or base_data_root()
+    teams = {int(path.name) for path in (root / "tenants").glob("*")
+             if path.is_dir() and path.name.isdigit() and int(path.name) > 0}
     pipeline_dir = root / "pipelines"
     if pipeline_dir.is_dir():
         for path in pipeline_dir.glob("*.json"):
@@ -105,93 +105,27 @@ def _legacy_pipeline_teams(root: Path) -> set[int]:
     if db_path.is_file():
         try:
             with sqlite3.connect(str(db_path)) as conn:
-                for table in ("kellai_messages", "kellai_channel_inbox"):
-                    exists = conn.execute(
-                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                        (table,),
-                    ).fetchone()
-                    if not exists:
+                for table in ("kellai_teams", "kellai_messages", "kellai_channel_inbox", "kellai_outbound_deliveries"):
+                    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
                         continue
                     columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
-                    if "team_id" in columns:
-                        rows = conn.execute(
-                            f"SELECT DISTINCT team_id FROM {table} WHERE team_id > 0"
-                        ).fetchall()
-                    else:
-                        rows = conn.execute(
-                            f"SELECT DISTINCT CAST(json_extract(metadata_json, '$.team_id') AS INTEGER) "
-                            f"FROM {table} WHERE json_valid(metadata_json)"
-                        ).fetchall()
-                    teams.update(int(row[0]) for row in rows if int(row[0] or 0) > 0)
+                    column = "id" if table == "kellai_teams" else "team_id"
+                    if column in columns:
+                        rows = conn.execute(f"SELECT DISTINCT {column} FROM {table} WHERE {column}>0").fetchall()
+                        teams.update(int(row[0]) for row in rows)
+                    if "metadata_json" in columns:
+                        rows = conn.execute(f"SELECT DISTINCT CAST(json_extract(metadata_json,'$.team_id') AS INTEGER) "
+                                            f"FROM {table} WHERE json_valid(metadata_json)" +
+                                            (" AND team_id<=0" if "team_id" in columns else "")).fetchall()
+                        teams.update(int(row[0]) for row in rows if int(row[0] or 0) > 0)
         except sqlite3.Error:
             pass
     return teams
 
 
 def infer_legacy_owner_team_id() -> int:
-    teams = _legacy_pipeline_teams(base_data_root())
+    teams = legacy_owner_candidates()
     return next(iter(teams)) if len(teams) == 1 else 0
-
-
-def migrate_legacy_single_tenant_files() -> dict[str, object]:
-    """Copy legacy single-tenant files into an isolated namespace.
-
-    The old files remain untouched as a recovery copy. Automatic migration is
-    deliberately disabled when legacy records mention more than one tenant.
-    """
-
-    root = base_data_root()
-    owner_team_id = infer_legacy_owner_team_id()
-    if owner_team_id <= 0:
-        return {"migrated": False, "team_id": 0, "reason": "ambiguous_or_empty"}
-
-    target = root / "tenants" / str(owner_team_id)
-    target.mkdir(parents=True, exist_ok=True)
-    marker = target / ".legacy-tenant-migration-v1.json"
-    if marker.is_file():
-        return {"migrated": False, "team_id": owner_team_id, "reason": "already_done"}
-
-    copied: list[str] = []
-    file_names = (
-        "channel_configs.json",
-        "llm_config.json",
-        "open_platform.json",
-        "knowledge_base.json",
-        "outbound_calls.json",
-        "service_tickets.json",
-        "self_service_resolutions.json",
-        "douyin-desktop-automation.json",
-        "closed_loop_audit_latest.json",
-    )
-    directory_names = ("pipelines", "passive_poll", "wechat_bindings", "tts_recordings", "integrations")
-    for name in file_names:
-        source = root / name
-        destination = target / name
-        if source.is_file() and not destination.exists():
-            shutil.copy2(source, destination)
-            copied.append(name)
-    for name in directory_names:
-        source = root / name
-        destination = target / name
-        if source.is_dir() and not destination.exists():
-            shutil.copytree(source, destination)
-            copied.append(name)
-
-    marker.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "team_id": owner_team_id,
-                "copied": copied,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "legacy_files_retained": True,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    return {"migrated": True, "team_id": owner_team_id, "copied": copied}
 
 
 __all__ = [
@@ -201,7 +135,7 @@ __all__ = [
     "current_team_id",
     "current_user_id",
     "infer_legacy_owner_team_id",
-    "migrate_legacy_single_tenant_files",
+    "legacy_owner_candidates",
     "reset_request_tenant",
     "resolve_team_id",
     "tenant_data_root",

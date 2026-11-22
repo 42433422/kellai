@@ -10,6 +10,7 @@ desktop/dist/
 backend/build/
 backend/dist/
 release/
+ui-test-artifacts/
 
 # Environment
 .env

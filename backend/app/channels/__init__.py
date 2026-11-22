@@ -19,6 +19,7 @@ from app.channels.telegram import TelegramAdapter
 from app.channels.line import LineAdapter
 from app.channels.chatwoot import ChatwootAdapter
 from app.channels.capabilities import CAPABILITIES, CHATWOOT_CONFIG_SCHEMA
+from app.services.oauth_client import OAuthAccountAdapter, CONFIG_SCHEMA as OAUTH_CONFIG_SCHEMA
 
 __all__ = [
     "ChannelAdapter",
@@ -60,6 +61,9 @@ def _auto_register() -> None:
     reg.register("line", LineAdapter, capabilities=CAPABILITIES["line"])
     reg.register("chatwoot", ChatwootAdapter, config_schema=CHATWOOT_CONFIG_SCHEMA,
                  capabilities=CAPABILITIES["chatwoot"])
+    reg.register("oauth2", OAuthAccountAdapter, config_schema=OAUTH_CONFIG_SCHEMA,
+                 capabilities={"receive": False, "send": False, "contacts": False, "sync": False,
+                               "transport": "oauth2", "receive_mode": "none", "readiness": "credential_only"})
 
 
 _auto_register()

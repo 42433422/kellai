@@ -48,7 +48,7 @@ def send_error(error: Exception | str, *, definitely_not_sent: bool = False) -> 
     """Do not turn a transport failure into permission to automatically send again."""
     if isinstance(error, ChannelHTTPError):
         definitely_not_sent = error.delivery_state == "failed"
-    message = f"渠道网络异常 ({type(error).__name__})" if isinstance(error, httpx.TransportError) else str(error)
+    message = f"渠道操作未完成 ({type(error).__name__})" if isinstance(error, Exception) else str(error)
     return {"success": False, "message_id": "", "error": message,
             "delivery_state": "failed" if definitely_not_sent else "unknown",
             "definitely_not_sent": definitely_not_sent, "retryable": False}
@@ -131,7 +131,7 @@ class BaseChannelClient:
             self._client = httpx.AsyncClient(
                 base_url=self._base_url,
                 timeout=self._timeout_sec,
-                headers=self._default_headers,
+                headers=self._default_headers, follow_redirects=False, trust_env=False,
             )
         return self._client
 
@@ -182,9 +182,9 @@ class BaseChannelClient:
                         # the stale token already embedded in params.
                         await self._on_token_invalid()
                     raise ChannelHTTPError(
-                        f"渠道拒绝请求: errcode={errcode} {body.get('errmsg', '')}",
+                        f"渠道拒绝请求: errcode={errcode}",
                         status_code=resp.status_code, errcode=errcode,
-                        errmsg=str(body.get("errmsg", "")), delivery_state="failed",
+                        delivery_state="failed",
                     )
                 return body
             except httpx.TransportError as exc:

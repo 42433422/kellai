@@ -201,4 +201,4 @@ class ChatwootAdapter(ChannelAdapter):
                     "webhook_configured": bool(settings.webhook_secret)}
         except Exception as exc:
             return {"connected": False, "verification_level": "unverified",
-                    "message": f"Chatwoot 连接失败: {exc}"}
+                    "message": f"Chatwoot 连接失败: {type(exc).__name__}"}

@@ -69,7 +69,7 @@ class PddAdapter(ChannelAdapter):
         token = str(body.get("access_token", ""))
         ttl = int(body.get("expires_in", 7200))
         if not token:
-            raise RuntimeError(f"拼多多 token 拉取失败: {body}")
+            raise RuntimeError("拼多多 token 拉取失败")
         return token, ttl
 
     def _ensure_token_cache(self) -> CachedToken:
@@ -97,7 +97,7 @@ class PddAdapter(ChannelAdapter):
             from app.services.message_store import list_inbox
             rows = list_inbox(self.channel_type, limit=int(limit))
         except Exception as exc:
-            logger.warning("读取拼多多收件箱失败: %s", exc)
+            logger.warning("读取拼多多收件箱失败: %s", type(exc).__name__)
             return []
         out: list[UnifiedMessage] = []
         for r in rows:
