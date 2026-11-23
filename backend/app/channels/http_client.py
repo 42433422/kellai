@@ -13,6 +13,7 @@ import logging
 import os
 import time
 from typing import Any, Mapping, Optional
+from collections.abc import Callable
 
 import httpx
 
@@ -48,10 +49,23 @@ def send_error(error: Exception | str, *, definitely_not_sent: bool = False) -> 
     """Do not turn a transport failure into permission to automatically send again."""
     if isinstance(error, ChannelHTTPError):
         definitely_not_sent = error.delivery_state == "failed"
-    message = f"渠道网络异常 ({type(error).__name__})" if isinstance(error, httpx.TransportError) else str(error)
+    message = f"渠道操作未完成 ({type(error).__name__})" if isinstance(error, Exception) else str(error)
     return {"success": False, "message_id": "", "error": message,
             "delivery_state": "failed" if definitely_not_sent else "unknown",
             "definitely_not_sent": definitely_not_sent, "retryable": False}
+
+
+def check_send_authorization(guard: Callable | None, *, config_version: int | None = None) -> None:
+    """Explicit final check for a message side effect, after awaited preflight."""
+    try:
+        if not callable(guard):
+            raise PermissionError("发送授权检查缺失")
+        if config_version is None:
+            guard()
+        else:
+            guard(config_version=config_version)
+    except Exception as exc:
+        raise ChannelHTTPError("发送授权已变化，未发送消息", delivery_state="failed") from exc
 
 
 class TokenBucket:
@@ -131,7 +145,7 @@ class BaseChannelClient:
             self._client = httpx.AsyncClient(
                 base_url=self._base_url,
                 timeout=self._timeout_sec,
-                headers=self._default_headers,
+                headers=self._default_headers, follow_redirects=False, trust_env=False,
             )
         return self._client
 
@@ -157,6 +171,7 @@ class BaseChannelClient:
         data: Any = None,
         headers: Optional[Mapping[str, str]] = None,
         expect_json: bool = True,
+        before_send: Callable[[], None] | None = None,
     ) -> Any:
         """Retry only safe reads; a timed-out mutation may already have been sent."""
         await self._bucket.acquire()
@@ -166,6 +181,8 @@ class BaseChannelClient:
                 merged = dict(await self._auth_headers())
                 merged.update({str(k): str(v) for k, v in (headers or {}).items()})
                 client = await self._get_client()
+                if before_send is not None:
+                    before_send()
                 resp = await client.request(method, path, params=params, json=json, data=data, headers=merged)
                 if resp.status_code >= 500 and attempt < retries:
                     await asyncio.sleep(0.3 * (2 ** attempt))
@@ -182,9 +199,9 @@ class BaseChannelClient:
                         # the stale token already embedded in params.
                         await self._on_token_invalid()
                     raise ChannelHTTPError(
-                        f"渠道拒绝请求: errcode={errcode} {body.get('errmsg', '')}",
+                        f"渠道拒绝请求: errcode={errcode}",
                         status_code=resp.status_code, errcode=errcode,
-                        errmsg=str(body.get("errmsg", "")), delivery_state="failed",
+                        delivery_state="failed",
                     )
                 return body
             except httpx.TransportError as exc:

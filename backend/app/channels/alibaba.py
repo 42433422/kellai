@@ -74,7 +74,7 @@ class AlibabaAdapter(ChannelAdapter):
             from app.services.message_store import list_inbox
             rows = list_inbox(self.channel_type, limit=int(limit))
         except Exception as exc:
-            logger.warning("读取 1688 收件箱失败: %s", exc)
+            logger.warning("读取 1688 收件箱失败: %s", type(exc).__name__)
             return []
         out: list[UnifiedMessage] = []
         for r in rows:

@@ -27,7 +27,7 @@ import httpx
 
 from app.channels.base import ChannelAdapter, UnifiedMessage
 from app.channels.config_store import get_field
-from app.channels.http_client import read_env, checked_json, send_error
+from app.channels.http_client import read_env, checked_json, send_error, check_send_authorization
 
 logger = logging.getLogger(__name__)
 
@@ -128,26 +128,26 @@ class PhoneAdapter(ChannelAdapter):
         """发送短信到 contact_id（手机号）。"""
         if not self._is_configured():
             return {"success": False, "message_id": "", "error": _UNCONFIGURED_MSG, "delivery_state": "failed", "definitely_not_sent": True}
-        content = (content or "").strip()
-        if not content and self._provider == "twilio":
+        if not (content or "").strip() and self._provider == "twilio":
             return {"success": False, "message_id": "", "error": "消息内容为空", "delivery_state": "failed", "definitely_not_sent": True}
         if not contact_id:
             return {"success": False, "message_id": "", "error": "contact_id (手机号) 不能为空", "delivery_state": "failed", "definitely_not_sent": True}
 
         try:
             if self._provider == "twilio":
-                return await self._send_twilio(contact_id, content)
+                return await self._send_twilio(contact_id, content, kwargs.get("before_send"))
             if self._provider == "aliyun":
                 return await self._send_aliyun(contact_id, content, kwargs)
             return {"success": False, "message_id": "", "error": f"不支持的 provider: {self._provider}", "delivery_state": "failed", "definitely_not_sent": True}
         except Exception as exc:
-            logger.warning("短信发送异常: %s", exc)
+            logger.warning("短信发送异常: %s", type(exc).__name__)
             return send_error(exc)
 
-    async def _send_twilio(self, to: str, body: str) -> dict:
+    async def _send_twilio(self, to: str, body: str, before_send) -> dict:
         """Twilio Programmable SMS API。"""
         client = await self._get_client()
         url = f"https://api.twilio.com/2010-04-01/Accounts/{self._account_sid}/Messages.json"
+        check_send_authorization(before_send)
         resp = await client.post(
             url,
             auth=(self._account_sid, self._auth_token),
@@ -205,10 +205,11 @@ class PhoneAdapter(ChannelAdapter):
         params["Signature"] = base64.b64encode(signature).decode("utf-8")
 
         client = await self._get_client()
+        check_send_authorization(kwargs.get("before_send"))
         resp = await client.get("https://dysmsapi.aliyuncs.com/", params=params)
         result = checked_json(resp)
         if str(result.get("Code", "")).upper() != "OK":
-            return send_error(f"阿里云短信失败: {result.get('Code')} {result.get('Message')}",
+            return send_error("阿里云短信请求失败",
                               definitely_not_sent="Code" in result)
         if not result.get("BizId"):
             return send_error("阿里云未返回短信 BizId，发送结果未知")
@@ -227,7 +228,7 @@ class PhoneAdapter(ChannelAdapter):
             from app.services.message_store import list_inbox
             rows = list_inbox(self.channel_type, limit=int(limit))
         except Exception as exc:
-            logger.warning("读取电话收件箱失败: %s", exc)
+            logger.warning("读取电话收件箱失败: %s", type(exc).__name__)
             return []
         out: list[UnifiedMessage] = []
         for r in rows:
@@ -293,7 +294,7 @@ class PhoneAdapter(ChannelAdapter):
                 return {"connected": True, "verification_level": "authenticated",
                         "message": "Twilio账号鉴权通过；尚未进行真实短信收发验收"}
             except Exception as exc:
-                return {"connected": False, "message": f"Twilio鉴权失败: {exc}"}
+                return {"connected": False, "message": f"Twilio鉴权失败: {type(exc).__name__}"}
         return {"connected": False, "verification_level": "configured",
                 "message": "阿里云模板短信凭据已配置；尚未进行远端鉴权及真实发送验收"}
 

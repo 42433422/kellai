@@ -19,7 +19,7 @@ import httpx
 
 from app.channels.base import ChannelAdapter, UnifiedMessage
 from app.channels.config_store import get_field
-from app.channels.http_client import read_env, checked_json, send_error
+from app.channels.http_client import read_env, checked_json, send_error, check_send_authorization
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ class LineAdapter(ChannelAdapter):
     channel_type = "line"
 
     def __init__(self) -> None:
-        self._base_url: str = read_env("KELLAI_LINE_BASE_URL", "https://api.line.me")
+        self._base_url: str = "https://api.line.me"
         self._client: httpx.AsyncClient | None = None
 
     def _is_configured(self) -> bool:
@@ -71,16 +71,22 @@ class LineAdapter(ChannelAdapter):
                 "to": contact_id,
                 "messages": [{"type": "text", "text": content}],
             }
+            check_send_authorization(kwargs.get("before_send"))
             resp = await client.post("/v2/bot/message/push", json=payload)
             body = checked_json(resp)
             if "message" in body:
-                return send_error(f"LINE 拒绝请求: {body.get('message')}", definitely_not_sent=True)
-            messages = body.get("sentMessages", [])
-            message_id = str(messages[0].get("id", "")) if messages else ""
-            return {"success": True, "message_id": message_id, "delivery_state": "accepted", "error": ""}
+                return send_error("LINE 拒绝请求", definitely_not_sent=True)
+            messages = body.get("sentMessages")
+            if not isinstance(messages, list) or len(messages) != 1 or not isinstance(messages[0], dict):
+                return send_error("LINE 未返回唯一消息凭据，发送结果未知")
+            message_id = messages[0].get("id")
+            if not ((type(message_id) is int and message_id > 0)
+                    or (isinstance(message_id, str) and message_id.strip())):
+                return send_error("LINE 未返回有效消息编号，发送结果未知")
+            return {"success": True, "message_id": str(message_id), "delivery_state": "accepted", "error": ""}
 
         except Exception as exc:
-            logger.warning("LINE send_message 异常: %s", exc)
+            logger.warning("LINE send_message 异常: %s", type(exc).__name__)
             return send_error(exc)
 
     # ----------------- receive_messages -----------------
@@ -90,7 +96,7 @@ class LineAdapter(ChannelAdapter):
             from app.services.message_store import list_inbox
             rows = list_inbox(self.channel_type, limit=int(limit))
         except Exception as exc:
-            logger.warning("读取 LINE 收件箱失败: %s", exc)
+            logger.warning("读取 LINE 收件箱失败: %s", type(exc).__name__)
             return []
         out: list[UnifiedMessage] = []
         for r in rows:
@@ -159,7 +165,7 @@ class LineAdapter(ChannelAdapter):
                 }
             return {
                 "connected": False,
-                "message": f"errcode={body.get('code', resp.status_code)} {body.get('message', '')}",
+                "message": "LINE 鉴权失败",
             }
         except Exception as exc:
-            return {"connected": False, "message": f"LINE 连接失败: {exc}"}
+            return {"connected": False, "message": f"LINE 连接失败: {type(exc).__name__}"}

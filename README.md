@@ -1,176 +1,97 @@
 # 客来来
 
-客来来负责外部渠道、账号连接、客户身份、消息收发和回复任务。XCMAX 通过可撤销的授权读取这些能力，并在“智能生态 / 客来来”模块中复用宿主模型、ELT、客户消息组件和已有 Agent 审批运行时。
+**XCMAX 的本地账号连接与收发工具。**保存外部账号授权，接收通道消息，执行宿主已批准的发送，保留可查询的原始回执。
 
-## 当前交付边界
+界面保留 **账号连接、统一聊天、XCMAX 授权**。统一聊天汇总多个账号的会话，支持按账号筛选、添加明确账号的通道联系人、同步已接入的收件箱、查看消息和查询原发送请求；业务处理、员工权限、审批及对外发送入口统一放在 XCMAX。
 
-本轮审计基线为 Kellai `cbe783af897a746320f220a8fe4bbea7f66d5976`、XCMAX `48f8f40d14dfc373afd4ca43790c560f78b44481`。下面的“已实现”指代码与持久化协议已接通；候选分支、协议隔离测试、已保存配置都不代表上线或真实送达。渠道目录统一保留 `live_verified=false`，真实账号验收需另外取得平台消息 ID、回执和收件端证据。
+## 产品边界
 
-核心路径已落实为：**签名回调 → 持久收件箱 → 客户与消息 → 人工或真实模型回复 → 授权与发送账本 → 渠道受理 → 回执查询及会话回写**。未实现的电商聊天协议、任意个人微信私聊、语音外呼、图形流程执行及其他占位业务，均不能计入这个闭环。
+- 一个本地工具实例绑定一个明确工作区；同平台可配置多个账号，每个账号拥有稳定的 `connection_id`。
+- 账号连接、适配器、入站、联系人、出站幂等及回执全部携带连接 ID，不自动选择“第一个账号”。
+- 复用现有持久发送账本。结果不确定时查询原请求，不自动再次发送。
+- 独立注册、密码登录、订阅、CRM、销售、财务、业务 AI、自动回复、工作流市场及原生坐标发送入口已移除。
+- 历史业务数据留在原数据目录；删除账号清除其凭据，保留用于读取历史消息的连接归属记录。
+- 客来来不运行第二个 Agent，也不建立另一套企业审批。
 
-### 架构与节点职责
+## 成熟组件与版本
 
-```mermaid
-flowchart TD
-  P["外部平台与客户"] --> G["官方适配器 / Chatwoot 网关"]
-  G --> V["回调验签与团队绑定"]
-  V --> I["持久 inbox 与去重"]
-  I --> C["客户与消息 SSOT"]
-  C --> Q["实时回复队列与租约"]
-  Q --> M["现有模型路由"]
-  M --> A["当前阶段与发送授权检查"]
-  U["客来来桌面 / XCMAX 模块"] --> A
-  X["小 C 既有审批工具"] --> A
-  A --> O["outbox 与稳定请求号"]
-  O --> T{"目标传输"}
-  T --> G
-  T --> N["本机原生执行租约"]
-  N --> P
-  G --> P
-  G --> R["受理与真实状态回执"]
-  N --> R
-  R --> O
-  O --> C
-  C --> U
-```
+| 能力 | 组件 | 锁定版本 | 许可证 |
+| --- | --- | --- | --- |
+| 系统凭据库 | [keyring](https://github.com/jaraco/keyring) | 25.7.0 | MIT |
+| 凭据认证加密 | [cryptography](https://github.com/pyca/cryptography) / Fernet | 50.0.2 | Apache-2.0 OR BSD-3-Clause |
+| 标准 OAuth / PKCE / token 刷新 | [Authlib](https://github.com/authlib/authlib) | 1.9.10 | BSD-3-Clause |
+| Authlib 异步 HTTP 传输 | [HTTPX2](https://github.com/pydantic/httpx2) | 2.16.2 | BSD-3-Clause |
+| 账号配置表单与校验 | [react-jsonschema-form](https://github.com/rjsf-team/react-jsonschema-form) / AJV8 | 6.11.1 | Apache-2.0 / MIT |
+| 桌面运行时 | [Tauri](https://github.com/tauri-apps/tauri) | 2.12.7 | Apache-2.0 OR MIT |
+| 桌面协议唤起 | [Tauri deep-link / single-instance](https://github.com/tauri-apps/plugins-workspace) | 2.6.3 / 2.5.5 | Apache-2.0 OR MIT |
+| 自包含 Python 服务打包 | [PyInstaller](https://github.com/pyinstaller/pyinstaller) | 6.22.3 | GPL-2.0-or-later，附发行例外 |
+| 浏览器流程回归 | [Playwright](https://github.com/microsoft/playwright-python) | 1.62.0 | Apache-2.0，仅测试环境 |
+| 外部渠道网关 | [Chatwoot](https://github.com/chatwoot/chatwoot/tree/v4.20.1) 官方账号 API | 4.20.1 / b2f94636 | MIT（企业版目录另有许可，未引入） |
 
-| 节点 | 实际用途 | 实现位置 |
-|---|---|---|
-| 渠道目录 | 声明每个渠道实际能收、能发、传输类型、模板限制；能力不由前端名称推断 | `backend/app/channels/capabilities.py`、`registry.py` |
-| 渠道配置 | 每个团队保存凭据，掩码展示，明确清空撤销；缓存按团队与配置指纹隔离 | `channels/config_store.py` |
-| 回调入口 | 验证签名、时间、账号及团队，拒绝错账号/错 inbox/外发 echo | `api/wechat_callbacks.py`、`api/channel_gateway.py` |
-| 持久 inbox | 先落消息再处理；保存或入队失败不确认消费，可重放 | `services/channel_ingest.py`、`message_store.py` |
-| 客户与会话 | 绑定稳定渠道身份，保留消息和时间线；跨渠道同名或同编号不自动合并 | `services/growth_loop.py`、`pipeline.py` |
-| 回复队列 | 合并同会话最新消息，租约防并发；发送前重读阶段和新入/出站 | `services/auto_reply_runtime.py` |
-| 模型 | 复用已配置模型与上下文；模板兜底不能获得自动外发资格 | `services/ai_copilot.py`、`llm_config.py` |
-| 发送入口 | 校验用户、团队、真实客户、稳定目标和自动回复租约 | `services/messaging.py` |
-| outbox | 以团队和请求号去重；保存受理结果并修复会话投影；未知结果不盲重发 | `services/outbound_delivery.py` |
-| worker | 无需打开网页也能处理 API 渠道；按具体目标区分 API 与原生桌面 | `services/channel_worker.py` |
-| 原生执行 | 只有本机授权 prepare 能获得一次执行令牌；完成后提交受限回执 | `desktop/src/api/messages.ts`、`deliveryState.ts` |
-| XCMAX 授权桥 | 固定 loopback、只读默认、显式发送 scope、批准人撤销校验 | `services/xcmax_integration.py`、`api/xcmax_channels.py` |
+React、TanStack Query、FastAPI、SQLite 与既有 HTTP 渠道适配器继续复用。产品代码只负责工作区/账号归属、宿主授权、平台协议适配、原子迁移和发送账本。以上核心组件均在本地进程中使用，不要求注册外部托管连接平台。
 
-## 本轮确认的缺口及处理
+Python 依赖真相源为 `backend/pyproject.toml`，解析锁为 `backend/uv.lock`；容器使用从该锁导出的 `backend/requirements.lock`。前端与原生依赖分别锁在 `desktop/package-lock.json` 和 `desktop/src-tauri/Cargo.lock`。
 
-| 编号 | 原缺口与影响 | 当前处理和证据 |
-|---|---|---|
-| C01 | 数据来源、客来来渠道和前端菜单各自声明能力 | XCMAX 普通 `kellai` Mod 统一五个工作区；能力只读 Kellai registry；旧路由兼容。见 XCMAX `FHD/README.md` |
-| C02 | 全局 adapter 缓存让后一租户复用前一租户 token | 按 tenant/channel/config 指纹隔离；配置切换淘汰缓存，关闭时释放客户端。`test_channel_gateway.py` |
-| C03 | 保存配置、实际读取配置的优先级不同，清空后 env 又恢复旧密钥 | 保存值优先，显式空值撤销，别名同步；多租户 env 凭据必须有明确归属。`test_channel_gateway.py` |
-| C04 | 密钥原样返回、掩码回写、磁盘失败仍报成功 | 公共配置脱敏、掩码保留原值、原子保存失败向上传递；配置管理限制 owner/admin。`test_messaging_api.py` |
-| C05 | 本地签名、URL 或空响应被当成已连接/已发送 | 验证层级区分 configured/authenticated；四个电商通道明确 blocked；无有效成功凭据保持 unknown。`test_channel_gateway.py` |
-| C06 | 多个海外渠道只有发送函数，接收注释没有实际入口 | 新增 Chatwoot 官方 API + 签名 webhook 薄适配器，复用上游已有平台接入。原生能力仍如实标 outbound_only |
-| C07 | 微信、企微回调缺少完整团队与消息绑定 | 公众号明文签名回调、企微现有 AES/suite 授权链统一进持久 inbox。`test_wechat_callbacks.py` |
-| C08 | 入队失败仍消费消息，重复重放又重置已读/旧预览 | 公共 ingest 与抖音网页捕获先持久化、失败不 ack；已存消息重放不重复业务更新。`test_message_boundary_review.py`、`test_douyin_web_portal.py` |
-| C09 | 不同渠道相同 contact_id 合并成一个人，迟到历史推进当前客户阶段 | 仅精确渠道映射或同渠道旧身份可匹配；迟到历史不回退当前预览、待办和阶段。`test_message_boundary_review.py` |
-| C10 | 20 条历史会话可能被分批自动回复，演示消息也可入队 | 历史、模拟、演示、未解析媒体拒绝自动外发；先取全队列每会话最新，再限制数量。`test_auto_reply_runtime.py` |
-| C11 | 生成期间新消息/人工回复/阶段变化不能取消旧草稿 | 生成完成和 begin_delivery 都核验原消息、当前客户、阶段与后续消息；原消息时间 900 秒窗口，最多允许 60 秒平台时钟偏差 |
-| C12 | 多 worker 与前端重复重试会多发；超时被当失败重发 | SQLite 租约和 outbox 唯一请求号；一个请求只放行一次渠道调用；unknown 只查询。`test_delivery_runtime.py` |
-| C13 | 原生执行结果可伪造、重复领取或换号上报；恢复记录损坏后可能重新外发 | prepare/complete 绑定令牌及原请求；已知执行结果恢复仅上报回执，不再次操作设备；请求存储读取或解析失败时停止新外发。`desktop/tests/message_delivery_state.test.mjs` |
-| C14 | 抖音 bridge 无幂等、递归远端、云端客户 ID 与桌面混用 | 透传同一个 request ID；云端独立账本和稳定联系人解析；内部执行禁止回环与 native。`test_messaging_api.py` |
-| C15 | 云 worker 抢走 relay inbox；hybrid 渠道永远不由 API worker 处理 | relay 角色不消费抖音游标；普通 CRM 按真实目标在领租约前分流 API/native。`test_channel_worker.py` |
-| C16 | 企微取 token 自锁，suite 入站可用但出站未复用授权 | 修复锁递归，复用 tenant suite token/agent，并保留内部成员的实际能力范围。`test_channel_gateway.py` |
-| C17 | 保存任意模型 URL 可能携带全局 key，旧探测结果误显示连通 | 模型 key 与 provider/endpoint 绑定；自有 key 优先、变更清旧验证、探测错误脱敏。`test_llm_config_boundary.py` |
-| C18 | 账号切换后的旧 401 会用新账号 token 重放配置写请求 | 所有普通/loopback 请求捕获账户；延迟成功、401、刷新前后均校验，刷新按账户与 token 隔离。`desktop/tests/account_request_boundary.test.mjs` |
-| C19 | 短信页面只有虚构语音线路，实际 adapter 无法配置 | 改真实 Twilio/阿里云字段；Twilio 文本短信可用；阿里云显式模板参数，通用文本界面不能冒充模板发送 |
-| C20 | 旧微信姓名发送、隐式欢迎语、猎手私信、内容发布绕过真实边界或直接报成功 | 关闭姓名自动化旁路及隐式外发；未实现的内容发布/猎手私信返回 501。`test_legacy_send_boundary.py` |
-| C21 | 图形流程用全局内存、固定日期和 completed 返回值 | 持久化租户流程草稿；类型/config 保留；执行和 webhook 未接通则 501；自动化率未统计显示空值，模板明确为示例 |
-| C22 | 只读 XCMAX 配对可能被当发送授权 | 新增独立 channels.read/messages.send；发送显式申请并在 Kellai 确认，旧连接不升级；小 C 沿宿主审批核对精确收件人与正文 |
-| C23 | 后端/桌面端口不一致，依赖和生产部署缺少可复现验证 | 本机统一 8793；Docker 内部 8790；固定 uv/npm lock，补后端/前端/容器 CI；生产强制认证，JSON CRM 当前单进程运行 |
-| C24 | “闭环审计”把演示销售、财务、发布、插件状态算已实现 | 审计改为本地实现检查，明确 `live_verified=false`；缺真实执行/业务数据的六类检查返回未实现及原因，不再给假闭环通过 |
-| C25 | 同一联系人连续发送时，新回执覆盖旧请求的查询入口 | XCMAX 按请求号保留独立回执，按目标判断未决阻塞；客来来消息气泡沿服务端 `delivery_request_id` 逐条查询，旧消息的送达/失败不被后一次发送覆盖 |
-| C26 | `success=false` 的真实失败回执被宿主代理改成网络错误，明确未执行的桌面请求被当成永久 unknown | 发送与查询按原请求号校验回执，保留 failed/unknown 实际结果；桌面专用拒绝先核对账本，仅确认没有原记录才标未执行并移出待查请求；原记录存在时保持冲突，必须按原号查询 |
+## 账号如何保存
 
-上述测试验证实际生产方法、SQLite、ASGI 和 HTTPX 请求构造；平台 HTTP、模型或原生设备的外部边界受控隔离，不能代替真实账号验收。
+系统原生 keyring 保存凭据库主密钥，账号配置以 Fernet 密文保存于对应工作区的 `connections.sqlite3`。密文同时绑定工作区、连接 ID 和用途，其他账号不能复用复制过来的密文。
 
-## 还未落实的能力
+凭据 API 只返回元数据和掩码。没有可用的原生安全 keyring 时拒绝明文降级；无桌面环境必须显式注入持久的 `KELLAI_VAULT_KEY`。主密钥需单独妥善保管，遗失后不能用新密钥恢复旧密文。凭据库暂不可用时仍可停用账号。
 
-以下是本轮发现的完整剩余清单，按审计范围列出；不代表已对仓库所有历史文件做形式化正确性证明。
+Authlib 管理标准 OAuth 授权与 PKCE。授权事务有有效期、归属、配置版本和一次性消费检查；刷新按连接获得数据库 lease，更新采用版本检查。撤销时先本地停用，再尝试供应商撤销，分别报告结果。GitHub、Google、Microsoft 的标准授权连接支持账号鉴权；可发送哪些消息以渠道能力目录为准。
 
-| 编号 | 剩余缺口 | 可复用方向 / 完成条件 |
-|---|---|---|
-| R01 | 真实平台授权、可达 HTTPS 回调、收件人实际收到、真实模型连通验收 | 使用已有账号与服务部署候选后保存入站 ID、出站 ID、回执和设备证据；本轮未外发 |
-| R02 | 公众号 AES 安全模式 | 本轮仅明文回调；可复用 wechatpy 的 WeChatCrypto，再补 AppID/原始 XML 绑定与错误路径验收 |
-| R03 | 任意个人微信好友聊天、微信客服完整协议 | 官方公众号、企微内部成员、固定群和 kf_url 的能力互不等同；候选 AstrBot 的相应官方平台适配仍需资格和协议核验 |
-| R04 | 淘宝、京东、拼多多、1688 真实客服聊天 | 缺完整获批聊天协议；当前禁止外发。SDK 或其他开源仓库不能替代平台批准的接口和账号权限 |
-| R05 | 同团队同渠道多账号、多 Chatwoot inbox | 当前每种渠道一个 primary，Chatwoot 一个 account/inbox；需扩展 connection 实例并带入客户、账本、配置及回调全链路 |
-| R06 | 统一媒体发送、窗口外模板、阿里云/小程序模板操作界面 | 网关当前仅文本；平台模板与媒体需要独立 schema、上传/模板审批和发送指纹；不能用自由文本假装模板 |
-| R07 | Telegram/LINE/WhatsApp/SMS 原生入站与原生状态回调 | 双向路径本轮复用 Chatwoot；原生直连仍仅出站。未启用 Chatwoot 时不能宣称这些通道双向可用 |
-| R08 | 丢失响应且无 provider ID 的自动对账 | 保留 unknown，不自动重发；当前无通用跨平台恢复算法，需按平台官方查询能力补确定性对账 |
-| R09 | 独立 Kellai 自动继承 XCMAX 账户模型授权 | 宿主副驾驶已复用模型；独立客户端需明确的账户模型凭据。尚无自动委托/刷新 scope 桥，pairing token 不能作为模型 token |
-| R10 | 图形流程所有节点执行、流程级触发器和外发 webhook | 复用 XCMAX 已有审批、workflow/AgentOrchestrator；当前 Kellai 图形侧只保存草稿。渠道实时自动回复和小 C 审批发送已单独接通 |
-| R11 | 销售、报价、合同与真实回款的完整业务闭环 | `api/sales.py` 仍有内存演示状态/模板和固定成交预测；需接真实订单、电子签章和支付事件，不能用消息中的“已付款”证明收款 |
-| R12 | 财务实际账务、成本、营收分析 | `api/finance.py` 仍为固定演示数字；需要真实账务 SSOT，可优先复用宿主既有 ERP 接口，再评估 ERPNext |
-| R13 | 内容真实模型创作、跨平台发布、曝光转化回流 | `api/content.py` 的文字/图片/视频脚本仍有样例；发布已明确 501。候选 Postiz 只覆盖其官方支持平台，国内平台需另核实 |
-| R14 | 公域实际线索采集、舆情和猎手转入客户 | `api/scout.py` 仍有静态样例及规则评分；auto-dm 已明确 501。需要授权数据源和稳定身份映射，不能把样例昵称当真实客户 |
-| R15 | 开放平台插件运行、完整开发者 API 鉴权与事件实际投递 | `api/open.py` 已有状态登记；安装/订阅状态不等于运行与投递。候选复用宿主 Mod 运行时和 Outpost 事件投递 |
-| R16 | 实际语音电话、SIP、语音识别及通话回执 | 当前 outbound_call 是本地模拟，phone adapter 是短信；候选 LiveKit Agents + SIP，需要线路、号码及通话验收 |
-| R17 | 多进程/多副本 CRM 与配置并发写协调 | inbox/outbox 使用 SQLite 事务；JSON 客户/配置层仍为单写约束，不能据此宣称整个 CRM 已分布式安全 |
-| R18 | 主干合入、桌面安装包与线上版本验收 | 需两仓联动 PR、XCMAX 主序列/架构批准、required CI、精确 main SHA 构建和运行身份校验；候选测试通过不等于已经发布 |
+平台 token 和外部账号身份只能由授权流程写入，普通配置编辑不能伪造或替换授权结果。标准 OAuth 与抖音刷新共用持久租约；取消、超时或进程崩溃后无法确认是否完成 token 轮换时，要求重新授权，不重复兑换旧 token。抖音撤销会清除本地 token；钥匙串暂不可用时，撤销状态仍立即生效，普通编辑和启用不能复活旧授权。账号界面提供授权、撤销和刷新状态入口。
 
-## 成熟实现的复用选择
+浏览器和桌面自动化由 XCMAX 执行器负责。未绑定真实执行器的浏览器连接不能标为可用，也不能回退到旧原生坐标发送。
 
-| 对应缺口 | 成熟仓库 / 内部资源 | 本轮决策 |
-|---|---|---|
-| C06、R07 | [chatwoot/chatwoot](https://github.com/chatwoot/chatwoot/tree/v4.20.1)，v4.20.1，提交 `b2f94636d325a126a67c6c4c808303d8aa8cbeea` | 已写官方 API/webhook 薄桥；社区代码 MIT/Expat，enterprise 和第三方组件另有许可证；实例部署仍待完成 |
-| C10–C15 | 既有 SQLite、HTTPX/FastAPI/Pydantic、原生 Tauri 接口 | 复用现有运行时和数据表，新增的租户、请求归属、租约和回执是产品必需的边界胶水；无需引入第二个任务/CRM 系统 |
-| C22、R10 | XCMAX `execute_erp_capability`、workflow、AgentOrchestrator、现有 LangGraph 1.2.10 | 已接 `kellai.channels/customers/conversations/send/receipt`；图形任意节点执行仍待适配 |
-| C17、R09 | XCMAX `customer_copilot`、已有账户 OpenAI 兼容网关与服务端 LiteLLM | 已复用宿主模型入口；独立客户端可用现有自定义配置接账户网关，不复制主密钥 |
-| R02 | [wechatpy/wechatpy](https://github.com/wechatpy/wechatpy)，[官方加密示例](https://github.com/wechatpy/wechatpy/blob/master/docs/quickstart.rst)，MIT | 已核对候选能力，未安装/未声称已实现；正式采用时需锁定具体发布版本 |
-| R03 | [AstrBotDevs/AstrBot](https://github.com/AstrBotDevs/AstrBot)，AGPL-3.0-or-later | 可参考其公众号、企微及客服适配；本轮未嵌入另一套 Agent，也未假设具备个人微信官方授权 |
-| R11、R12 | 宿主已实现的 sales 工具与 SQLAlchemy 财务服务；[frappe/erpnext](https://github.com/frappe/erpnext)，GPL-3.0 | 优先接已有宿主，不新建账务 SSOT；ERPNext 仅作外部候选，未部署。客户/商品/订单与团队映射仍缺 |
-| R13 | [gitroomhq/postiz-app](https://github.com/gitroomhq/postiz-app)，AGPL-3.0 | 社交发布调度候选，未集成；需先核对目标平台支持和官方 OAuth 范围 |
-| R15 | 既有 XCMAX Mod/MCP、MODstore webhook dispatcher；[hookdeck/outpost](https://github.com/hookdeck/outpost)，Apache-2.0 | 插件及事件优先用宿主已有 HMAC/HTTP/日志/重试；Outpost 只是外部候选，未部署。消息 outbox 不等同任意 webhook 分发器 |
-| R16 | [livekit/agents](https://github.com/livekit/agents)，Apache-2.0；[官方 outbound caller 示例](https://github.com/livekit-examples/outbound-caller-python)，MIT | 语音/SIP 候选未集成，不能把短信配置视为电话线路 |
+## 从 XCMAX 使用
 
-本轮新增网关固定版本；其余外部候选只是缺口映射，未作为依赖安装，不属于已实现清单。完整十三渠道矩阵、上游签名源码、消息状态读取限制和部署配置见 [渠道专项审计](docs/channel-gateway-audit-2026-11-21.md)。
+1. 启动 XCMAX，在客来来工具中发起连接。
+2. 打开客来来，选择“接收连接请求”。双方通过本机一次性交接建立短期操作者会话。
+3. 在“XCMAX 授权”中选择并确认访问范围：`channels.read`、`messages.read`、`messages.send`。
+4. 添加外部账号，完成平台授权或填写凭据，并验证连接。
+5. 在统一聊天中查看会话；在 XCMAX 中选择明确账号和联系人，发起受控发送并核对回执。
 
-### 已查证可复用的内部资源
+旧协议的客户资料权限不会自动转换为新权限，升级后需要重新配对。普通网页不能依靠跨站请求创建本机操作者会话。此边界不隔离同一操作系统用户下的恶意本地程序。
 
-以下代码已在 XCMAX 基线中查到，但“宿主存在”不代表已完成客来来业务映射或真实平台验收：
+`xcagi://data-sources` 唤起宿主已有客来来入口；`kellai://` 只用于唤起本工具，不承载密码、token 或免审批命令。
 
-| 资源 | 已有真实实现 | 需要补的连接 |
-|---|---|---|
-| 销售报价与订单 | `FHD/app/application/sales/quotes.py` 校验商品、Decimal 金额和幂等写入；既有 `/api/tools/execute` 的 sales.quote/create_order/confirm/deliver/invoice/payment | Kellai 客户与 ERP 客户、商品、订单的团队归属映射；`send_quote` 状态变更不等于已发给客户 |
-| 合同文件 | `infrastructure/documents/sales_contract_generator.py`、`sales_contract_excel.py`、`domain/shared_services/service_contract_fill.py` 生成 DOCX/XLSX 草稿 | 电子签 `infrastructure/esign/esign_adapter.py` 及 fadada client 仍为 WIP/NotImplemented；不能把路由存在计为已签署 |
-| 财务与支付 | `application/finance_app_service.py` 真实写交易和业务去重；`finance_unified_archive.py` 归档；MODstore payment checkout/notify/query 实际使用支付 SDK | 宿主账务不等于客户资金已到账；平台购买订单不自动成为 Kellai 销售收款。税票 tax-channel 仍有 stub |
-| 通用外部 API | MODstore `openapi_connector_execution.py` 实际 HTTP 请求、归属凭据、DNS 绑定、调用日志，可发布 workflow 节点 | 具体平台 schema、scope、payload 与回执语义；`operations/.../test` 会真实请求，不能用于无授权试发 |
-| 对外 Webhook | MODstore `webhook_subscription_api.py`、`webhook_dispatcher.py` 已有 HMAC、HTTP 投递、日志和重试，`eventing/contracts.py` 是事件目录 | 将真实 Kellai 事件与正确 owner/tenant 接入；现有 generic 入站的首 admin/用户归属不能直接照搬为客户消息入口 |
-| MCP 与工具 | `FHD/app/application/tools/mcp/registry.py`、`infrastructure/mcp/client.py` 实际 stdio/HTTP call_tool，沿宿主写审批与 unknown 语义 | 选择已授权服务并补业务操作契约；插件列表中的 installed 标志不能证明实际加载或外发完成 |
+工具撤销先使本机授权立即失效。XCMAX 用绑定凭据检查专用授权状态，明确撤销才标记 `revoked`；离线和超时不会冒充撤销。宿主清理连接须由原操作者完成，历史请求号仍保留供原回执核验。
 
-这些连接优先复用内部实现，新增外部整套 ERP、工作流或插件系统并不能自动补齐业务身份和授权。
+“锁定工具”同时撤销当前操作者的服务端会话；不删除历史消息，也不撤销其他会话或宿主授权。网络异常时仍清除本地会话，并明确提示服务端撤销未确认。
 
-## 模型、接口与运行
+## 当前渠道能力
 
-XCMAX 消息副驾驶沿 `chat_completion_openai_format(profile="customer_copilot", request=request)` 使用当前宿主账户模型。独立 Kellai 在“设置 → AI 助手”配置自有模型，或使用已有账户网关：base URL `https://xiu-ci.com/v1`，模型 `xcauto-account`，兼容调用 `stream=false`。账户 JWT/PAT 需有效且具备相应模型权限及计费配置；内部 LiteLLM 主密钥不能下发，渠道 pairing token 也不具备模型授权。
+下表说明已实现的协议范围；账号是否获得平台权限、消息是否实际送达，分别由鉴权和原始回执确认。
 
-| 接口 | 用途 / 权限 |
-|---|---|
-| `GET /api/kellai/channels` | 登录后读取脱敏配置、能力、连接 ID |
-| `PUT /api/kellai/channels/{channel}/config` | owner/admin 保存真实渠道配置 |
-| `POST /api/kellai/channels/sync-inbox` | 从当前团队渠道接入持久消息；relay 不抢桌面游标 |
-| `POST /api/kellai/messages/send` | 登录用户、已绑定真实客户、稳定 `client_request_id` 的文本发送 |
-| `GET /api/kellai/messages/requests/{client_request_id}` | 查询原发送请求，不产生第二次外发 |
-| `POST /api/kellai/messages/prepare` | 仅本机原生桌面执行申请一次令牌 |
-| `POST /api/kellai/webhook/chatwoot/{team_id}` | Chatwoot 签名回调，绑定一个 gateway/account/inbox |
-| `/api/kellai/webhook/wechat/{team_id}` | 公众号明文服务器验证及签名消息 |
-| `/api/kellai/webhook/wework` | 企微既有 AES/suite 授权入口 |
-| `/api/kellai/integrations/xcmax/channels` | loopback 配对令牌 + `channels.read` |
-| `/api/kellai/integrations/xcmax/messages/send` | loopback 配对令牌 + `messages.send`，复用同一发送服务 |
-| `/api/kellai/integrations/xcmax/messages/requests/{id}` | 同一授权范围内查询回执 |
+| 渠道 | 当前可用范围 | 明确限制 |
+| --- | --- | --- |
+| 企业微信自建应用 | 内部成员应用消息、固定群机器人、验签入站 | 不等于外部联系人任意私聊 |
+| 微信公众号 | 客服文本消息、明文验签回调 | 受公众号权限和回复窗口限制；AES 回调未接入 |
+| 抖音 | 官方账号 OAuth 与企业号私信适配 | 需要 `enterprise.im` 等平台许可和真实会话，尚无实号验收 |
+| Chatwoot | 文本发送、本机 API 分页收件、可选验签入站、原请求状态回读 | 上游平台能力取决于实际配置的收件箱 |
+| Telegram / LINE / WhatsApp / Twilio | 原生发送适配 | 原生接收尚未实现；双向可通过 Chatwoot 收件箱接入 |
+| 阿里云短信 / 小程序 | 模板通知适配 | 通用聊天文字发送会被阻止 |
+| 淘宝 / 京东 / 拼多多 / 1688 | 保留旧配置及历史 | 缺少可验证的官方客服协议，发送保持阻止 |
+| GitHub / Google / Microsoft OAuth | 账号授权、加密存储、刷新与撤销 | 不表示具备聊天发送能力 |
+| 浏览器账号 | 预留明确连接身份 | 未绑定宿主真实执行器时为 `executor_required` |
 
-`accepted` 只表示渠道受理；真实平台状态保存在 `provider_state`，界面与小 C 分别显示 `sent/delivered/read/failed`，不会把未知请求升级为成功。网络超时可能已经产生外部效果，保持 `unknown`；重试原 request ID 只返回原账本，不重新发送。同一 request ID 改正文、目标或关键上下文会冲突。原生执行中断后已知结果优先补记回执，不重新操作设备；无法读取或解析原请求记录时停止新外发。
+Chatwoot 本机连接只需填写服务地址、Account ID、Inbox ID 和 API Access Token；无需公网桌面地址或回调密钥。后台和“同步收件箱”共用官方会话/消息 API，将收件与分页进度按工作区、连接和远端账号持久保存。每轮工作有界、不同会话轮转，消息先落入原 inbox 再推进游标；断网、落库中断或重启后只读续传。上游消息按创建时间排序，满页时会按消息 ID 区间补齐，避免回填旧日期的大编号跳过较小编号。
 
-### 启动与验证
+Chatwoot 已受理但 POST 响应丢失时，通过签名回调或 API 拉取发现原消息，再以认证 API 核对原请求号、账号、会话和内容，恢复同一账本；已知消息持续只读核对送达/已读状态。无法核对的请求继续保持未知，不重新 POST。供应商送达/已读与本地受理状态分别显示。其他仅提供回调的渠道仍需要供应商可达、经过验签的回调地址；本机监听不等于公网回调已经接通。
 
-Python 3.12、Node 22；依赖以 `backend/uv.lock` 与 `desktop/package-lock.json` 为准。复制 `.env.example` 后设置有效 JWT 密钥。真实渠道凭据在管理设置中保存；多租户服务使用环境渠道凭据时须明确 `KELLAI_CHANNEL_ENV_TEAM_ID`。
+收件与已验签回调在本地提交前重新核对账号版本，提交批次与撤销在同一账号数据库锁下排序；网络请求不占用该锁。微信公众号还必须配置 `official_original_id` 并匹配回调接收账号。已批准发送正文与入站文本保留原始空白；LINE 等渠道缺失有效平台消息编号的响应保存为未知，不冒充受理成功。
+
+## 本地开发
+
+需要 Python 3.11+、Node.js 22 和 uv。原生构建还需要 Rust 与 Tauri 对应系统开发依赖。
 
 ```bash
 uv sync --locked --project backend --group test
-cd backend
-uv run python -m uvicorn app.main:app --host 127.0.0.1 --port 8793
+KELLAI_PORT=8793 uv run --project backend kellai
 ```
 
-另一个终端启动桌面前端：
+另开终端：
 
 ```bash
 cd desktop
@@ -178,15 +99,66 @@ npm ci --ignore-scripts --no-audit --no-fund
 npm run dev
 ```
 
-后端默认启用 API worker，但**每个团队的自动回复仍需显式启用**。完成渠道配置和模型连通验证后才开启。首次历史导入不会触发补发；超过 15 分钟的旧消息保留在会话供人工处理。桥接服务器配置 `KELLAI_DOUYIN_BRIDGE_KEY`（或兼容的 WeCom bridge key）后，Douyin inbox 仅供客户端拉取，不能被云 CRM worker 或手动 sync 消费。
+API 默认连接 `127.0.0.1:8793`。桌面开发页使用同源 Vite 代理；公开站点地址不能作为工具 API 地址。Linux 无桌面的单实例环境可使用 `docker compose up --build`，该模式保留 host loopback 网络，需显式注入主密钥。
 
-Docker 使用根目录 `docker-compose.yml`，主机仅绑定 `127.0.0.1:8793`，容器监听 8790。公网回调由部署方既有 HTTPS 代理接入。生产强制认证；现有 JSON CRM/配置层采用单进程，不能随意增加 uvicorn workers。Docker 运行依赖来自 `backend/requirements.lock`，由 `uv.lock` 导出；容器构建与健康/401 验证已加入 CI，本地无 Docker 时不得记录成构建已通过。
+## 升级与历史数据
+
+先备份原数据目录及对应主密钥。历史只有一个工作区时可识别归属；检测到多个工作区时必须设置 `KELLAI_WORKSPACE_ID`，不会合并或猜测账号归属。
+
+旧渠道 JSON 仅用于一次性迁移，完成加密持久化与校验后移除旧凭据来源；运行时不再合并环境变量与旧 JSON。既有消息、请求号和出站账本沿用原数据库。历史记录只能在账号归属明确时绑定到迁移连接；无法判定的记录不会被自动重新发送。
+
+企业微信集中 Suite、抖音云桥接及独立 SaaS 业务运行入口已退出工具链。旧数据文件保留，账号需按当前支持的官方接入方式重新连接。
+
+## 验证与打包
 
 ```bash
-PYTHONPATH=backend uv run --project backend --group test python -m pytest backend/tests -q
+uv run --project backend --group test python -m pytest backend/tests -q
 cd desktop
 node --test tests/*.test.mjs
 npm run build
 ```
 
-最终验证数量、远端 CI、PR 与主干状态以对应候选提交的检查记录为准。历史 `closed_loop_audit` 现会如实报告其他演示模块尚未实现，其总结果不应通过；这和针对真实消息路径的测试通过是不同的证据。
+后端测试覆盖账号与密文隔离、迁移回滚、OAuth 单次回调/刷新/撤销、入站归属、出站幂等和未知结果恢复；前端测试覆盖操作者切换、旧响应拒绝和禁止自动重放写操作。发布前还必须通过宿主联合回归。
+
+### 宿主协议联合检查
+
+`backend/tests/integration/check_host_protocol.py` 是显式运行的跨仓库检查，不由默认 pytest 收集，也不会自动克隆宿主、跟随远程 `main` 或安装依赖。先准备一个与当前工具配套的 XCMAX checkout，以及已按宿主依赖要求安装完成的 Python 环境（包括 FastAPI、SQLAlchemy、HTTPX、keyring、filelock 和 Uvicorn）。使用这个**宿主 Python**启动脚本；工具子进程另用本仓库的后端 Python。
+
+从客来来仓库根目录运行，替换下面三个宿主参数；发布验证应使用明确的完整 commit SHA 和干净 checkout：
+
+```bash
+uv sync --locked --project backend --group test
+KELLAI_TEST_HOST_CHECKOUT=/absolute/path/to/xcmax
+KELLAI_TEST_HOST_PYTHON=/absolute/path/to/host-venv/bin/python
+KELLAI_TEST_HOST_REVISION=replace_with_the_exact_40_character_host_commit
+"$KELLAI_TEST_HOST_PYTHON" backend/tests/integration/check_host_protocol.py \
+  --host-checkout "$KELLAI_TEST_HOST_CHECKOUT" \
+  --expected-host-revision "$KELLAI_TEST_HOST_REVISION" \
+  --tool-python backend/.venv/bin/python
+```
+
+`--host-checkout`、`--tool-python`、`--expected-host-revision` 也分别支持环境变量 `KELLAI_TEST_HOST_CHECKOUT`、`KELLAI_TEST_TOOL_PYTHON`、`KELLAI_TEST_HOST_REVISION`。Windows 可显式传入相应环境的 `Scripts/python.exe`。开发中需要检查未提交的宿主改动时，可追加 `--allow-dirty-host`；输出会明确记录 `host_dirty=true`，不能把它当成指定 commit 的发布证据。
+
+脚本在隔离临时目录启动真实 loopback HTTP/ASGI 服务，使用真实 SQLite 用户会话、生产身份解析器与隔离 Chatwoot 协议服务，检查单次交接、最小权限、账号隔离、API 拉取入站、原请求幂等、发送响应丢失后的只读恢复、真实 SQL 审批消耗和 Agent 重载后的原回执核验。成功时输出实际检查列表，并在输出的 `runtime` 目录保存 `result.json` 和服务日志。服务会在结束时退出，临时证据目录保留供复查。
+
+测试只替换系统钥匙串的 I/O，仍执行生产安全后端选择逻辑；它不能证明真实操作系统钥匙串可用。测试不会使用真实平台凭据或发送外部消息，也不能替代平台账号与安装包验收。需要在 CI 使用时，应由调用方显式准备和固定两个 checkout，不依赖浮动的宿主分支。
+
+浏览器回归使用真实本机后端、隔离的宿主传输与测试账号，不接触真实平台：
+
+```bash
+uv sync --locked --project backend --group browser
+uv run --project backend --group browser playwright install chromium
+uv run --project backend --group browser python desktop/tests/smoke_tool_ui.py
+```
+
+CI 从干净的已提交源码构建 Windows NSIS 与 macOS DMG 候选包，将完整 commit SHA、源码树与版本同时嵌入原生壳和冻结后端；安装或挂载后核对包内文件，并启动包内后端验证 `/health` 返回相同身份及父进程监测。候选包通过独立 CI 配置明确使用未签名模式，仅保存为内部 artifact，正式签名配置保持不变，不能作为正式发布证据。当前验证尚未覆盖安装后的 GUI 操作、真实系统钥匙串、协议唤起和平台账号验收。
+
+```bash
+uv sync --locked --project backend --group build
+cd backend
+uv run --group build pyinstaller --clean --noconfirm kellai-backend.spec
+cd ../desktop
+npm run tauri build
+```
+
+资源目录同时支持 Windows 的 `kellai-backend.exe` 与 macOS/Linux 的 `kellai-backend`。编译通过、模拟服务回归与真实账号验收是不同证据。真实平台接收、发送、失效重连、Windows/macOS 安装及协议唤起需用实际授权账号和安装包验证；未取得这些证据时，不标记为真实送达或已发布。

@@ -1,475 +1,157 @@
-"""客来来 FastAPI 入口。"""
-
+"""Local XCMAX account and channel tool. Business decisions belong to the host."""
 from __future__ import annotations
 
-import logging
 import asyncio
+import logging
 import os
 import re
-import sys
-import time
-from pathlib import Path
-from typing import Awaitable, Callable
+from contextlib import asynccontextmanager
+from importlib.metadata import PackageNotFoundError, version
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.exceptions import HTTPException
 
-from app.api.routes import router
-from app.api import sales, content, scout, flow, finance, open as open_api
+from app.services.auth import LOCAL_ORIGINS, require_local_request, verify_token, workspace_id
 from app.services.tenant_context import bind_request_tenant, reset_request_tenant
+from app.build_info import load_build_info
 
-# --- 日志基础配置 ---
-logging.basicConfig(
-    level=os.environ.get("KELLAI_LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
 logger = logging.getLogger("kellai")
-
-# --- 配置验证 ---
-def _validate_configuration() -> None:
-    """验证关键配置项，生产环境强制要求安全配置。"""
-    from app.services.auth import JWT_SECRET, _PASSWORD_SALT
-    
-    app_env = os.environ.get("KELLAI_APP_ENV", "development").lower()
-    is_production = app_env in ("production", "prod")
-    strict_auth = os.environ.get("KELLAI_STRICT_AUTH", "0") == "1"
-    
-    # 生产环境关键配置检查
-    if is_production:
-        errors = []
-        
-        # 1. JWT_SECRET 必须配置
-        if JWT_SECRET == "kellai-dev-secret-change-in-production-2026":
-            errors.append("KELLAI_JWT_SECRET 未设置 - 生产环境必须使用自定义的强密钥")
-        
-        # 2. PASSWORD_SALT 必须配置（如果还在使用旧版的话）
-        if _PASSWORD_SALT == "kellai_default_salt_2026":
-            logger.warning("⚠️  生产环境建议设置 KELLAI_PASSWORD_SALT（虽然主要使用 bcrypt）")
-        
-        # Production APIs must not fall through to tenant zero.
-        if not strict_auth:
-            errors.append("生产环境必须设置 KELLAI_STRICT_AUTH=1")
-        
-        if errors:
-            logger.critical("=" * 60)
-            logger.critical("❌  生产环境配置验证失败，必须修复以下问题：")
-            for err in errors:
-                logger.critical(f"   - {err}")
-            logger.critical("=" * 60)
-            # 在生产环境，配置错误应该导致启动失败
-            sys.exit(1)
-    else:
-        # 开发环境友好提示
-        if JWT_SECRET == "kellai-dev-secret-change-in-production-2026":
-            logger.warning("⚠️  当前使用默认 JWT_SECRET，仅适用于开发环境")
-        if not strict_auth:
-            logger.warning("⚠️  当前处于软认证模式，未携带 token 的请求也会被放行（仅开发环境）")
-
-# --- 运行模式：KELLAI_STRICT_AUTH=1 时强制 token 验证（生产环境） ---
-_STRICT_AUTH = os.environ.get("KELLAI_STRICT_AUTH", "0") == "1"
-
-# --- 执行配置验证 ---
-_validate_configuration()
+# Provider URLs may contain API keys (for example Telegram bot tokens).
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpx2").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+class _AccessPathOnly(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Uvicorn access records contain the request target at argument 2.
+        # OAuth authorization codes and state must never enter persistent logs.
+        if isinstance(record.args, tuple) and len(record.args) == 5 and isinstance(record.args[2], str):
+            values = list(record.args)
+            values[2] = values[2].split("?", 1)[0]
+            record.args = tuple(values)
+        return True
 
 
-# --- 默认配置 ---
-
-DEFAULT_CORS_ORIGINS: list[str] = [
-    "tauri://localhost",
-    "tauri://127.0.0.1",
-    "http://tauri.localhost",
-    "https://tauri.localhost",
-    "http://localhost:1420",
-    "http://127.0.0.1:1420",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:5174",
-    "http://127.0.0.1:5174",
-    "http://localhost:8790",
-    "http://127.0.0.1:8790",
-]
+logging.getLogger("uvicorn.access").addFilter(_AccessPathOnly())
+DEFAULT_CORS_ORIGINS = sorted(LOCAL_ORIGINS)
 
 
 def _load_cors_origins() -> list[str]:
-    """从 KELLAI_CORS_ORIGINS 读取白名单（逗号分隔），回退到默认"""
-    raw = (os.environ.get("KELLAI_CORS_ORIGINS") or "").strip()
-    if not raw:
-        return list(DEFAULT_CORS_ORIGINS)
-    origins = [item.strip() for item in raw.split(",") if item.strip()]
-    return origins or list(DEFAULT_CORS_ORIGINS)
+    # Public callbacks do not need CORS. Keep operator requests on known local
+    # origins even if an old SaaS deployment still sets a wildcard env value.
+    return list(DEFAULT_CORS_ORIGINS)
 
 
-def _ensure_data_dir() -> None:
-    if not os.environ.get("KELLAI_DATA_DIR"):
-        repo_data = Path(__file__).resolve().parents[2] / "data"
-        os.environ.setdefault("KELLAI_DATA_DIR", str(repo_data))
-
-
-def _bootstrap_auth() -> None:
-    """启动时：建表 + 迁移密码 hash + 版本化迁移"""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    from app.channels import ChannelRegistry
+    from app.services.channel_worker import run
+    from app.services.message_store import ensure_messages_schema
+    workspace_id()  # Ambiguous legacy ownership must fail before any worker.
+    ensure_messages_schema()
+    stop = asyncio.Event()
+    worker = (asyncio.create_task(run(stop))
+              if os.environ.get("KELLAI_CHANNEL_WORKER_ENABLED", "1").strip() != "0" else None)
     try:
-        from app.services.auth import ensure_auth_schema, migrate_password_hashes
-
-        migration_result = ensure_auth_schema()
-        if migration_result:
-            applied_count = len(migration_result.get("applied", []))
-            skipped_count = len(migration_result.get("skipped", []))
-            failed_count = len(migration_result.get("failed", []))
-            if applied_count > 0:
-                logger.info(f"✅ 成功应用 {applied_count} 个数据库迁移")
-            if skipped_count > 0:
-                logger.debug(f"跳过 {skipped_count} 个已应用的迁移")
-            if failed_count > 0:
-                logger.error(f"❌ {failed_count} 个迁移失败")
-        
-        # 密码 hash 迁移
-        result = migrate_password_hashes()
-        logger.info("auth 启动完成: %s", result)
-    except Exception as exc:  # pragma: no cover - 启动时尽力而为
-        logger.warning("auth 启动引导失败: %s", exc)
-
-
-# --- 全局错误处理 ---
-
-
-async def _http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
-    """统一 HTTPException 返回 {success, error, code}"""
-    detail = exc.detail
-    if isinstance(detail, dict):
-        msg = str(detail.get("message") or detail.get("error") or detail)
-    else:
-        msg = str(detail) if detail is not None else "请求失败"
-    payload = {"success": False, "error": msg, "code": exc.status_code}
-    headers = getattr(exc, "headers", None)
-    return JSONResponse(status_code=exc.status_code, content=payload, headers=headers)
-
-
-async def _validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
-    """请求参数验证失败：返回 details 列表"""
-    errors = exc.errors() if hasattr(exc, "errors") else []
-    # 将每个错误转为简洁的 dict
-    details: list[dict] = []
-    for err in errors:
-        try:
-            details.append(
-                {
-                    "loc": list(err.get("loc", []) or []),
-                    "msg": err.get("msg", ""),
-                    "type": err.get("type", ""),
-                }
-            )
-        except Exception:
-            details.append({"msg": str(err)})
-    return JSONResponse(
-        status_code=422,
-        content={
-            "success": False,
-            "error": "参数验证失败",
-            "details": details,
-            "code": 422,
-        },
-    )
-
-
-async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-    """兜底异常处理：避免堆栈暴露给客户端"""
-    logger.exception("未处理异常: %s %s -> %s", request.method, request.url.path, exc)
-    return JSONResponse(
-        status_code=500,
-        content={"success": False, "error": "服务内部错误", "code": 500},
-    )
-
-
-# --- 软认证 + 请求日志中间件 ---
-
-
-# 软认证白名单（不强制 token，也不打印警告）
-_SOFT_AUTH_WHITELIST: set[str] = {
-    "/health",
-    "/api/kellai/status",
-    "/api/kellai/landing/sync",
-    "/docs",
-    "/openapi.json",
-    "/redoc",
-    # 登录前可访问的公共认证端点（登出 / 未登录状态下必须放行，
-    # 否则开启 KELLAI_STRICT_AUTH=1 后会把登录、注册、找回密码全部挡在门外）
-    "/api/kellai/auth/login",
-    "/api/kellai/auth/register",
-    "/api/kellai/auth/refresh",
-    "/api/kellai/auth/qr/start",
-    "/api/kellai/auth/qr/status",
-    "/api/kellai/auth/qr/scan",
-    "/api/kellai/auth/qr/cancel",
-    "/api/kellai/auth/xcmax-desktop",
-    "/api/kellai/auth/sms/send",
-    "/api/kellai/auth/forgot-password",
-    "/api/kellai/webhook/douyin",
-    "/api/kellai/webhook/wechat",
-    "/api/kellai/webhook/wework",
-    "/api/kellai/webhook/wework/suite",
-    "/api/kellai/channels/douyin/oauth/callback",
-    "/api/kellai/channels/wework/customer-entry",
-    "/api/kellai/channels/wechat/oauth/callback",
-    "/api/kellai/channels/wechat/oauth/qrcode",
-    "/api/kellai/channels/wework/oauth/callback",
-    "/api/kellai/channels/wework/install/callback",
-    # 服务间企业微信桥接使用独立的高熵请求头认证，不使用终端用户 JWT。
-    "/api/kellai/internal/wework/readiness",
-    "/api/kellai/internal/wework/install",
-    "/api/kellai/internal/wework/install/status",
-    "/api/kellai/internal/wework/customers/sync",
-    "/api/kellai/internal/wework/customers",
-    "/api/kellai/internal/wework/acquisition/members",
-    "/api/kellai/internal/wework/acquisition/links",
-    "/api/kellai/internal/douyin/readiness",
-    "/api/kellai/internal/douyin/config",
-    "/api/kellai/internal/douyin/oauth/initiate",
-    "/api/kellai/internal/douyin/oauth/status",
-    "/api/kellai/internal/douyin/connection",
-    "/api/kellai/internal/douyin/messages/send",
-    "/api/kellai/internal/douyin/inbox",
-    "/api/kellai/internal/douyin/inbox/ack",
-    # XCMAX uses a separate local pairing token for these endpoints.  They do
-    # not accept the user JWT and validate that token again in the route.
-    "/api/kellai/integrations/xcmax/data-status",
-    "/api/kellai/integrations/xcmax/customers",
-    "/api/kellai/integrations/xcmax/channels",
-    "/api/kellai/integrations/xcmax/messages/send",
-}
-
-
-def _get_client_ip(request: Request) -> str:
-    """获取客户端真实 IP（支持 X-Forwarded-For 反向代理）"""
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
-
-
-def _extract_bearer(request: Request) -> str:
-    """从 Authorization 头提取 Bearer token，未带则返回空串"""
-    auth = request.headers.get("Authorization", "")
-    if auth.startswith("Bearer "):
-        return auth[7:].strip()
-    return ""
-
-
-async def _request_log_middleware(
-    request: Request,
-    call_next: Callable[[Request], Awaitable],
-):
-    """软认证 + 请求日志中间件
-
-    - 软认证：解析 Authorization 头，把用户信息挂到 request.state.user
-      - 路径在白名单内：不强制要求 token
-      - 路径不在白名单：未带 token 时打印警告，但仍允许访问（过渡方案）
-    - 记录 method / path / status / duration_ms / user_id
-    """
-    start = time.perf_counter()
-    path = request.url.path
-    is_xcmax_data_route = (
-        path.startswith("/api/kellai/integrations/xcmax/customers/")
-        or path.startswith("/api/kellai/integrations/xcmax/messages/requests/")
-    )
-    is_signed_callback = bool(re.fullmatch(r"/api/kellai/webhook/(?:chatwoot|wechat)/[1-9][0-9]*", path))
-    exempt = path in _SOFT_AUTH_WHITELIST or is_xcmax_data_route or is_signed_callback
-    # Live messaging/configuration is authenticated even in development mode.
-    require_user = not exempt and (_STRICT_AUTH or path.startswith((
-        "/api/kellai/messages", "/api/kellai/channels", "/api/kellai/ai/auto-reply/", "/api/kellai/ai/llm-",
-    )))
-    user_id: object = "-"
-    user_info: dict | None = None
-
-    # 浏览器的 CORS 预检请求不会携带 Authorization。严格认证若在这里
-    # 提前返回 401，CORSMiddleware 就没有机会生成 allow-origin/headers，
-    # Tauri WebView 中所有带 Bearer token 的真实请求都会被浏览器拦截。
-    # 预检本身不执行业务路由，认证仍由随后真正的请求完成。
-    if request.method == "OPTIONS":
-        request.state.user = None
-        request.state.user_id = user_id
-        response = await call_next(request)
-        duration_ms = (time.perf_counter() - start) * 1000.0
-        logger.info(
-            "request %s %s status=%s duration=%.2fms user_id=%s",
-            request.method,
-            path,
-            response.status_code,
-            duration_ms,
-            user_id,
-        )
-        return response
-
-    token = _extract_bearer(request)
-    if token:
-        try:
-            from app.services.auth import verify_token
-
-            info = verify_token(token)
-            if info and "id" in info:
-                user_info = info
-                user_id = info["id"]
-            else:
-                # token 无效
-                if not exempt:
-                    if require_user:
-                        return JSONResponse(
-                            status_code=401,
-                            content={"success": False, "error": "token 无效或已过期", "code": 401},
-                        )
-                    logger.warning("soft-auth: 无效 token 放行 path=%s", path)
-        except Exception as exc:  # pragma: no cover - 解析失败不影响主流程
-            logger.debug("软认证解析异常: %s", exc)
-    else:
-        if not exempt:
-            if require_user:
-                return JSONResponse(
-                    status_code=401,
-                    content={"success": False, "error": "未提供认证 token", "code": 401},
-                )
-            # 软认证：未带 token 警告但仍放行（演示阶段）
-            logger.warning("soft-auth: 未带 token 访问受保护接口 path=%s（演示模式放行）", path)
-
-    if require_user and user_info is None:
-        return JSONResponse(status_code=401, content={"success": False, "error": "登录已失效", "code": 401})
-
-    # 把 user 挂到 request.state，便于路由层依赖读取
-    request.state.user = user_info
-    request.state.user_id = user_id
-
-    tenant_tokens = bind_request_tenant(user_info)
-    try:
-        response = await call_next(request)
-        status_code = response.status_code
-    except Exception as exc:
-        duration_ms = (time.perf_counter() - start) * 1000.0
-        logger.warning(
-            "request exception: %s %s duration=%.2fms user_id=%s err=%s",
-            request.method,
-            path,
-            duration_ms,
-            user_id,
-            exc,
-        )
-        raise
+        yield
     finally:
-        reset_request_tenant(tenant_tokens)
-
-    duration_ms = (time.perf_counter() - start) * 1000.0
-    logger.info(
-        "request %s %s status=%s duration=%.2fms user_id=%s",
-        request.method,
-        path,
-        status_code,
-        duration_ms,
-        user_id,
-    )
-    return response
-
-
-# --- 应用工厂 ---
-
-
-def create_app() -> FastAPI:
-    _ensure_data_dir()
-    _bootstrap_auth()
-    try:
-        from app.services.tenant_context import migrate_legacy_single_tenant_files
-
-        migration = migrate_legacy_single_tenant_files()
-        if migration.get("migrated"):
-            logger.info(
-                "旧版单租户文件已复制到隔离目录: team_id=%s files=%s",
-                migration.get("team_id"),
-                len(migration.get("copied") or []),
-            )
-    except Exception as exc:
-        logger.warning("租户文件迁移检查失败: %s", exc)
-
-    app = FastAPI(title="客来来", version="1.0.1", description="商机流水线 · 独立于 XCAGI")
-
-    # CORS：白名单
-    origins = _load_cors_origins()
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=origins,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-    # 全局异常处理
-    app.add_exception_handler(StarletteHTTPException, _http_exception_handler)
-    app.add_exception_handler(RequestValidationError, _validation_exception_handler)
-    app.add_exception_handler(Exception, _unhandled_exception_handler)
-
-    # 请求日志中间件（通过 BaseHTTPMiddleware 注入）
-    @app.middleware("http")
-    async def _log_middleware(request: Request, call_next):  # type: ignore[no-redef]
-        return await _request_log_middleware(request, call_next)
-
-    # 路由
-    app.include_router(router)
-    app.include_router(sales.router)
-    app.include_router(content.router)
-    app.include_router(scout.router)
-    app.include_router(flow.router)
-    app.include_router(finance.router)
-    app.include_router(open_api.router)
-    from app.api import xcmax_channels, channel_gateway, wechat_callbacks
-    app.include_router(xcmax_channels.router)
-    app.include_router(channel_gateway.router)
-    app.include_router(wechat_callbacks.router)
-
-    @app.on_event("startup")
-    async def _start_channel_worker():
-        if os.environ.get("KELLAI_CHANNEL_WORKER_ENABLED", "1") == "1":
-            from app.services.channel_worker import run
-            app.state.channel_stop = asyncio.Event()
-            app.state.channel_task = asyncio.create_task(run(app.state.channel_stop))
-
-    @app.on_event("shutdown")
-    async def _stop_channel_worker():
-        task = getattr(app.state, "channel_task", None)
-        if task is not None:
-            app.state.channel_stop.set()
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        from app.channels import ChannelRegistry
-        await ChannelRegistry().close_all()
-
-    @app.on_event("startup")
-    async def _resume_douyin_web_portal_monitors():
+        stop.set()
         try:
-            from app.services.douyin_web_portal import resume_connected_monitors
-
-            result = await resume_connected_monitors()
-            if result["started"] or result["failed"]:
-                logger.info("抖音网站私信监听恢复完成: %s", result)
-        except Exception as exc:
-            logger.warning("恢复抖音网站私信监听失败: %s", exc)
-
-    @app.get("/health")
-    def health():
-        return {"ok": True, "product": "客来来"}
-
-    return app
+            if worker is not None:
+                worker.cancel()
+                try:
+                    await worker
+                except asyncio.CancelledError:
+                    pass
+        finally:
+            await ChannelRegistry().close_all()
 
 
-app = create_app()
+try:
+    APP_VERSION = version("kellai")
+except PackageNotFoundError:
+    APP_VERSION = "0+source"
+
+BUILD_INFO = load_build_info(APP_VERSION)
+
+app = FastAPI(title="客来来账号与通道工具", version=APP_VERSION, lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=_load_cors_origins(),
+                   allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+                   allow_headers=["Authorization", "Content-Type", "X-Kellai-Desktop-Handoff", "X-Kellai-Local-Pairing"])
+
+
+@app.middleware("http")
+async def authenticate(request: Request, call_next):
+    path = request.url.path
+    public = path in {"/health", "/api/kellai/status"}
+    handoff = path == "/api/kellai/auth/xcmax-desktop"
+    gateway = path.startswith("/api/kellai/integrations/xcmax/") and (
+        path.endswith(("/channels", "/contacts", "/grant-status")) or "/contacts/" in path or "/messages/" in path)
+    callback = bool(re.fullmatch(r"/api/kellai/webhook/[a-z0-9_]+/[1-9][0-9]*/[A-Za-z0-9_-]+", path))
+    oauth_callback = request.method == "GET" and path == "/api/kellai/accounts/oauth/callback"
+    request.state.user = None
+    tokens = bind_request_tenant(None)
+    try:
+        if request.method != "OPTIONS" and not (public or callback or oauth_callback):
+            require_local_request(request)
+            if not (handoff or gateway):
+                authorization = request.headers.get("authorization", "")
+                token = authorization[7:] if authorization.startswith("Bearer ") else ""
+                user = verify_token(token)
+                if user is None:
+                    return JSONResponse(status_code=401, content={"success": False, "error": "请从 XCMAX 重新打开账号工具"})
+                reset_request_tenant(tokens)
+                tokens = bind_request_tenant(user)
+                request.state.user = user
+        return await call_next(request)
+    except HTTPException as exc:
+        return JSONResponse(status_code=exc.status_code, content=_http_error_content(exc))
+    finally:
+        reset_request_tenant(tokens)
+
+
+def _http_error_content(exc: HTTPException) -> dict:
+    if isinstance(exc.detail, dict):
+        return {"success": False, "error": str(exc.detail.get("message") or "操作被拒绝"), "detail": exc.detail}
+    return {"success": False, "error": str(exc.detail)}
+
+
+@app.exception_handler(HTTPException)
+async def http_error(request: Request, exc: HTTPException):
+    return JSONResponse(status_code=exc.status_code, content=_http_error_content(exc))
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=422, content={"success": False, "error": "参数无效",
+        "details": [{"loc": list(e["loc"]), "msg": e["msg"], "type": e["type"]} for e in exc.errors()]})
+
+
+@app.exception_handler(Exception)
+async def unhandled_error(request: Request, exc: Exception):
+    logger.error("工具请求失败: %s %s (%s)", request.method, request.url.path, type(exc).__name__)
+    return JSONResponse(status_code=500, content={"success": False, "error": "工具请求未完成，请检查本地配置"})
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "kellai-account-tool", "protocol_version": 2,
+            "build_info": BUILD_INFO}
+
+
+from app.api.routes import router
+from app.api.xcmax_channels import router as xcmax_router
+from app.api.channel_gateway import router as callback_router
+from app.api.accounts import router as accounts_router
+app.include_router(router)
+app.include_router(xcmax_router)
+app.include_router(callback_router)
+app.include_router(accounts_router)
 
 
 def run() -> None:
     import uvicorn
-
-    port = int(os.environ.get("KELLAI_PORT", "8793"))
-    uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=False)
-
-
-if __name__ == "__main__":
-    run()
+    uvicorn.run("app.main:app", host=os.environ.get("KELLAI_HOST", "127.0.0.1"),
+                port=int(os.environ.get("KELLAI_PORT", "8793")))

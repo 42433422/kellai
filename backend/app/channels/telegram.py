@@ -18,7 +18,7 @@ import httpx
 
 from app.channels.base import ChannelAdapter, UnifiedMessage
 from app.channels.config_store import get_field
-from app.channels.http_client import read_env, checked_json, send_error
+from app.channels.http_client import read_env, checked_json, send_error, check_send_authorization
 
 logger = logging.getLogger(__name__)
 
@@ -68,10 +68,11 @@ class TelegramAdapter(ChannelAdapter):
             }
             if kwargs.get("parse_mode"):
                 payload["parse_mode"] = str(kwargs["parse_mode"])
+            check_send_authorization(kwargs.get("before_send"))
             resp = await client.post("/sendMessage", json=payload)
             body = checked_json(resp)
             if body.get("ok") is not True:
-                return send_error(f"Telegram 拒绝请求: {body.get('error_code')} {body.get('description', '')}",
+                return send_error("Telegram 拒绝请求",
                                   definitely_not_sent=body.get("ok") is False)
             result = body.get("result", {}) or {}
             if not isinstance(result, dict) or not result.get("message_id"):
@@ -80,7 +81,7 @@ class TelegramAdapter(ChannelAdapter):
                     "delivery_state": "accepted", "error": ""}
 
         except Exception as exc:
-            logger.warning("Telegram send_message 异常: %s", exc)
+            logger.warning("Telegram send_message 异常: %s", type(exc).__name__)
             return send_error(exc)
 
     # ----------------- receive_messages -----------------
@@ -91,7 +92,7 @@ class TelegramAdapter(ChannelAdapter):
             from app.services.message_store import list_inbox
             rows = list_inbox(self.channel_type, limit=int(limit))
         except Exception as exc:
-            logger.warning("读取 Telegram 收件箱失败: %s", exc)
+            logger.warning("读取 Telegram 收件箱失败: %s", type(exc).__name__)
             rows = []
         out: list[UnifiedMessage] = []
         for r in rows:
@@ -157,7 +158,7 @@ class TelegramAdapter(ChannelAdapter):
                 }
             return {
                 "connected": False,
-                "message": f"errcode={body.get('error_code')} {body.get('description', '')}",
+                "message": "Telegram 鉴权失败",
             }
         except Exception as exc:
-            return {"connected": False, "message": f"Telegram 连接失败: {exc}"}
+            return {"connected": False, "message": f"Telegram 连接失败: {type(exc).__name__}"}

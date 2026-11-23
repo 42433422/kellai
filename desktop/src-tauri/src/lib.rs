@@ -8,11 +8,12 @@ use std::time::Duration;
 
 use tauri::Manager;
 
-mod douyin_automation;
-#[cfg(target_os = "macos")]
-mod douyin_native_macos;
 
 const BACKEND_PORT: u16 = 8793;
+
+pub fn build_info_json() -> &'static str {
+    include_str!(concat!(env!("OUT_DIR"), "/kellai-build-info.json"))
+}
 
 #[derive(Default)]
 struct BackendProcess(Mutex<Option<Child>>);
@@ -31,9 +32,16 @@ fn backend_is_healthy() -> bool {
         return false;
     }
     let mut response = String::new();
-    stream.read_to_string(&mut response).is_ok()
-        && response.starts_with("HTTP/1.1 200")
-        && response.contains("\"product\":\"客来来\"")
+    if stream.take(64 * 1024).read_to_string(&mut response).is_err()
+        || !response.starts_with("HTTP/1.1 200")
+    {
+        return false;
+    }
+    let Some((_, body)) = response.split_once("\r\n\r\n") else { return false; };
+    let Ok(health) = serde_json::from_str::<serde_json::Value>(body) else { return false; };
+    let Ok(expected) = serde_json::from_str::<serde_json::Value>(build_info_json()) else { return false; };
+    health["service"] == "kellai-account-tool" && health["protocol_version"] == 2
+        && (expected["source_sha"].is_null() || health["build_info"] == expected)
 }
 
 fn start_bundled_backend(app: &tauri::AppHandle) -> Result<(), String> {
@@ -45,7 +53,8 @@ fn start_bundled_backend(app: &tauri::AppHandle) -> Result<(), String> {
         .path()
         .resource_dir()
         .map_err(|error| format!("无法定位应用资源目录：{error}"))?;
-    let backend_binary = resource_dir.join("backend/kellai-backend");
+    let binary_name = if cfg!(target_os = "windows") { "backend/kellai-backend.exe" } else { "backend/kellai-backend" };
+    let backend_binary = resource_dir.join(binary_name);
     if !backend_binary.is_file() {
         return Err(format!(
             "发布包缺少本地服务：{}",
@@ -76,7 +85,6 @@ fn start_bundled_backend(app: &tauri::AppHandle) -> Result<(), String> {
         .env("KELLAI_DATA_DIR", &data_dir)
         .env("KELLAI_PORT", BACKEND_PORT.to_string())
         .env("KELLAI_PARENT_PID", std::process::id().to_string())
-        .env("KELLAI_STRICT_AUTH", "1")
         .env("KELLAI_LOG_LEVEL", "INFO")
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
@@ -123,53 +131,36 @@ fn stop_bundled_backend(app: &tauri::AppHandle) {
 }
 
 #[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! Welcome to 客来来!", name)
-}
-
-#[tauri::command]
-fn open_xcmax_desktop() -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        let bundle_ids = ["com.xcagi.desktop.enterprise", "com.xcagi.desktop.personal"];
-        for bundle_id in bundle_ids {
-            let opened = Command::new("open")
-                .args(["-b", bundle_id])
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(false);
-            if opened {
-                return Ok(());
-            }
-        }
-        return Err("未检测到 XCMAX 桌面端，请先安装并打开一次 XCAGI。".to_string());
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        Err("当前系统暂未配置 XCMAX 桌面端唤起。".to_string())
-    }
+fn open_xcmax_desktop(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url("xcagi://data-sources", None::<&str>)
+        .map_err(|_| "无法打开 XCMAX，请先安装并启动桌面端。".to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
+        .plugin(tauri_plugin_deep_link::init())
         .manage(BackendProcess::default())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            start_bundled_backend(app.handle())?;
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]
             {
-                douyin_automation::request_accessibility_permission_native();
+                use tauri_plugin_deep_link::DeepLinkExt;
+                app.deep_link().register_all()?;
             }
+            start_bundled_backend(app.handle())?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            greet,
             open_xcmax_desktop,
-            douyin_automation::douyin_desktop_send,
-            douyin_automation::open_accessibility_settings,
-            douyin_automation::request_accessibility_permission,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application");

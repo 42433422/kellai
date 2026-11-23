@@ -1,288 +1,242 @@
-"""Local XCMAX pairing client and read-only customer-data gateway."""
-
+"""Single local handoff and scoped tool grant for XCMAX."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
-import urllib.error
-import urllib.parse
-import urllib.request
+import tempfile
+import threading
+import time
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlsplit
 
+import httpx
 from fastapi import HTTPException
 
+from app.services.auth import create_operator_session, operator, workspace_id
+from app.services.tenant_context import base_data_root
 
-_LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost"}
+PROTOCOL_VERSION = 2
+SCOPES = {"channels.read", "messages.read", "messages.send"}
+_HANDOFFS: dict[tuple[str, str], dict] = {}
+_LOCK = threading.RLock()
 
 
 def _store_path() -> Path:
-    from app.services.tenant_context import tenant_data_root
-
-    root = tenant_data_root(required=False)
-    path = root / "integrations" / "xcmax.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
+    return base_data_root() / "tenants" / str(workspace_id()) / "integrations" / "xcmax.json"
 
 
-def _read() -> dict[str, Any]:
+def _read() -> dict:
     path = _store_path()
-    return _read_path(path)
-
-
-def _read_path(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        return {"version": 1, "connection": None}
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {"version": 1, "connection": None}
-    return raw if isinstance(raw, dict) else {"version": 1, "connection": None}
-
-
-def _write(value: dict[str, Any]) -> None:
-    path = _store_path()
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(path)
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
-
-
-def _xcmax_base() -> str:
-    raw = (os.environ.get("KELLAI_XCMAX_API_BASE") or "http://127.0.0.1:17500").strip().rstrip("/")
-    parsed = urllib.parse.urlsplit(raw)
-    if parsed.scheme not in {"http", "https"} or parsed.hostname not in _LOCAL_HOSTS:
-        raise RuntimeError("XCMAX 桌面端地址必须是本机回环地址")
-    return raw
-
-
-def _xcmax_request(path: str, *, method: str = "GET", data: dict[str, Any] | None = None) -> dict[str, Any]:
-    payload = json.dumps(data, ensure_ascii=False).encode("utf-8") if data is not None else None
-    request = urllib.request.Request(
-        f"{_xcmax_base()}{path}",
-        data=payload,
-        method=method,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "X-Kellai-Local-Pairing": "1",
-            "X-XCMAX-Client-Shell": "enterprise",
-        },
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=4) as response:  # noqa: S310 - validated loopback URL
-            body = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        try:
-            details = json.loads(exc.read().decode("utf-8"))
-            message = details.get("detail") or details.get("error") or str(exc)
-        except Exception:
-            message = str(exc)
-        raise RuntimeError(str(message)) from exc
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"无法连接 XCMAX 桌面端：{exc}") from exc
-    if not isinstance(body, dict) or not body.get("success"):
-        raise RuntimeError(str((body or {}).get("error") or "XCMAX 未接受此操作"))
-    return body
-
-
-def public_status() -> dict[str, Any]:
-    local = _read().get("connection")
-    try:
-        remote = _xcmax_request("/api/kellai/binding/status").get("data") or {}
-    except RuntimeError as exc:
-        return {
-            "state": "offline" if local else "not_connected",
-            "connected": bool(local),
-            "message": str(exc),
-            "connection": _public_connection(local),
-        }
-    return {
-        "state": str(remote.get("state") or "not_connected"),
-        "connected": str(remote.get("state") or "") == "connected" and bool(local),
-        "connection": remote.get("connection") or _public_connection(local),
-        "pending": remote.get("pending"),
-        "available_scopes": remote.get("available_scopes") or [],
-        "message": "",
-    }
-
-
-def pending_authorization() -> dict[str, Any] | None:
-    body = _xcmax_request("/api/kellai/binding/pending")
-    data = body.get("data")
-    return data if isinstance(data, dict) else None
-
-
-def create_desktop_login_for_pending_pairing() -> dict[str, Any]:
-    """Create or reuse the local desktop identity for an active XCMAX pairing.
-
-    A pending request is the proof that XCMAX initiated this handoff on the
-    same machine.  It only signs the user into 客来来 so they can review and
-    confirm the authorization; data access is still unavailable until approve.
-    """
-    if not pending_authorization():
-        raise RuntimeError("未检测到有效的 XCMAX 绑定请求")
-
-    from app.services.auth import create_login_session_for_user, register_user
-
-    state = _read()
-    identity = state.get("desktop_identity")
-    if isinstance(identity, dict):
-        session = create_login_session_for_user(identity.get("user_id"))
-        if session.get("success"):
-            return session
-
-    result = register_user(
-        email=f"xcmax-{secrets.token_hex(16)}@desktop.local",
-        password=f"{secrets.token_urlsafe(32)}Aa1!",
-        display_name="XCMAX 桌面用户",
-    )
-    if not result.get("success") or not isinstance(result.get("user"), dict):
-        raise RuntimeError(str(result.get("error") or "无法初始化客来来桌面身份"))
-
-    user_id = result["user"].get("id")
-    try:
-        user_id = int(user_id)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError("无法初始化客来来桌面身份") from exc
-
-    state["desktop_identity"] = {"user_id": user_id}
-    _write(state)
+    if not path.exists():
+        return {"version": PROTOCOL_VERSION, "connection": None}
+    result = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(result, dict):
+        raise RuntimeError("XCMAX 配对记录无效")
+    connection = result.get("connection")
+    if isinstance(connection, dict) and "access_token" in connection:
+        # Migrate the verification material without keeping the old plaintext
+        # token. Its v1 grant remains revoked until the user reauthorizes v2.
+        raw = str(connection.pop("access_token") or "")
+        connection["token_hash"] = hashlib.sha256(raw.encode()).hexdigest() if raw else ""
+        connection["requires_reconnect"] = True
+        _write(result)
     return result
 
 
-def approve_authorization(
-    *,
-    request_id: str,
-    authorization_secret: str,
-    accepted_scopes: list[str],
-    current_user: dict[str, Any],
-) -> dict[str, Any]:
-    from app.services.tenant_context import current_team_id
-
-    team_id = current_team_id()
-    if team_id <= 0:
-        raise RuntimeError("缺少已认证的租户上下文")
-    allowed = {"customer_profiles.read", "customer_conversations.read", "channels.read", "messages.send"}
-    if not accepted_scopes or not set(accepted_scopes).issubset(allowed):
-        raise RuntimeError("授权范围无效")
-    if "messages.send" in accepted_scopes:
-        from app.services.messaging import require_actor
-        require_actor(current_user, manage=True)
-    token = secrets.token_urlsafe(40)
-    user = {
-        "id": current_user.get("id") or "",
-        "display_name": current_user.get("display_name") or current_user.get("email") or current_user.get("phone") or "客来来用户",
-    }
-    body = _xcmax_request(
-        "/api/kellai/binding/approve",
-        method="POST",
-        data={
-            "request_id": request_id,
-            "authorization_secret": authorization_secret,
-            "accepted_scopes": accepted_scopes,
-            "access_token": token,
-            "authorized_by": user,
-        },
-    )
-    state = _read()
-    state["connection"] = {
-        "connection_id": request_id,
-        "access_token": token,
-        "authorized_scopes": accepted_scopes,
-        "authorized_by": user,
-        "team_id": team_id,
-    }
-    _write(state)
-    return body.get("data") if isinstance(body.get("data"), dict) else {}
-
-
-def cancel_authorization(*, request_id: str, authorization_secret: str) -> None:
-    _xcmax_request(
-        "/api/kellai/binding/cancel",
-        method="POST",
-        data={"request_id": request_id, "authorization_secret": authorization_secret},
-    )
-
-
-def disconnect() -> None:
+def _write(value: dict) -> None:
+    path = _store_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as stream:
+        temporary = Path(stream.name)
+        os.chmod(temporary, 0o600)
+        json.dump(value, stream, ensure_ascii=False)
+        stream.flush()
+        os.fsync(stream.fileno())
     try:
-        _xcmax_request("/api/kellai/binding/disconnect", method="POST", data={})
+        temporary.replace(path)
     finally:
-        state = _read()
-        state["connection"] = None
-        _write(state)
+        temporary.unlink(missing_ok=True)
 
 
-def _public_connection(connection: Any) -> dict[str, Any] | None:
-    if not isinstance(connection, dict):
+def _xcmax_base() -> str:
+    raw = (os.environ.get("KELLAI_XCMAX_API_BASE") or "http://127.0.0.1:17500").rstrip("/")
+    parsed = urlsplit(raw)
+    if parsed.scheme not in {"http", "https"} or parsed.hostname not in {"127.0.0.1", "::1", "localhost"}:
+        raise RuntimeError("XCMAX 地址必须是本机回环地址")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in {"", "/"}:
+        raise RuntimeError("XCMAX 地址不能包含凭据、路径或查询参数")
+    return raw
+
+
+def _xcmax_request(path: str, *, method: str = "GET", data: dict | None = None) -> dict:
+    try:
+        with httpx.Client(timeout=4, follow_redirects=False, trust_env=False) as client:
+            response = client.request(method, _xcmax_base() + path, json=data, headers={
+                "X-Kellai-Local-Pairing": "1", "X-XCMAX-Client-Shell": "enterprise",
+                "Accept": "application/json",
+            })
+        response.raise_for_status()
+        body = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise RuntimeError("无法完成 XCMAX 本机交接，请确认宿主正在运行并重新发起连接") from exc
+    if not isinstance(body, dict) or body.get("success") is not True:
+        raise RuntimeError("XCMAX 未接受此操作")
+    return body
+
+
+def _handoff_key(request_id: str) -> tuple[str, str]:
+    return str(base_data_root()), request_id
+
+
+def _pending_metadata(pending: dict | None) -> dict | None:
+    if not isinstance(pending, dict):
         return None
-    return {
-        "connection_id": str(connection.get("connection_id") or ""),
-        "authorized_scopes": list(connection.get("authorized_scopes") or []),
-        "authorized_by": connection.get("authorized_by") if isinstance(connection.get("authorized_by"), dict) else {},
-    }
+    return {key: value for key, value in pending.items()
+            if key not in {"authorization_secret", "access_token", "token_hash", "bootstrap_nonce"}}
 
 
-def authorize_access_token(token: str, required_scope: str) -> dict[str, Any]:
-    from app.services.tenant_context import (
-        base_data_root,
-        current_team_id,
-        infer_legacy_owner_team_id,
-    )
+def _public_connection(value: Any) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    return {"connection_id": str(value.get("connection_id") or ""),
+            "authorized_scopes": list(value.get("authorized_scopes") or []),
+            "authorized_by": value.get("authorized_by") or {},
+            "protocol_version": int(value.get("protocol_version") or 1),
+            "requires_reconnect": value.get("protocol_version") != PROTOCOL_VERSION}
 
-    candidates: list[tuple[int, dict[str, Any]]] = []
-    context_team_id = current_team_id()
-    if context_team_id > 0:
-        state = _read()
-        connection = state.get("connection")
-        if isinstance(connection, dict):
-            candidates.append((context_team_id, connection))
-    else:
-        tenant_root = base_data_root() / "tenants"
-        if tenant_root.is_dir():
-            for path in tenant_root.glob("*/integrations/xcmax.json"):
-                try:
-                    team_id = int(path.parents[1].name)
-                except (TypeError, ValueError):
-                    continue
-                connection = _read_path(path).get("connection")
-                if isinstance(connection, dict):
-                    candidates.append((team_id, connection))
-        legacy_path = base_data_root() / "integrations" / "xcmax.json"
-        legacy_connection = _read_path(legacy_path).get("connection")
-        legacy_team_id = infer_legacy_owner_team_id()
-        if isinstance(legacy_connection, dict) and legacy_team_id > 0:
-            candidates.append((legacy_team_id, legacy_connection))
 
-    connection: dict[str, Any] | None = None
-    matched_team_id = 0
-    for candidate_team_id, candidate in candidates:
-        expected = str(candidate.get("access_token") or "")
-        if token and expected and secrets.compare_digest(token, expected):
-            connection = dict(candidate)
-            matched_team_id = int(candidate_team_id)
-            break
-    if connection is None:
-        raise HTTPException(status_code=401, detail="XCMAX 本地访问令牌无效")
-    if required_scope not in set(connection.get("authorized_scopes") or []):
-        raise HTTPException(status_code=403, detail="该数据权限未授权")
-    connection["team_id"] = matched_team_id
-    if required_scope == "messages.send":
-        # Removing/demoting an approver immediately removes its delegated write
-        # access. Legacy read-only bindings never acquire this scope implicitly.
-        from app.services.auth import get_user
-        from app.services.messaging import require_actor
-        user_id = (connection.get("authorized_by") or {}).get("id")
+def public_status() -> dict:
+    state = _read()
+    local = state.get("connection")
+    valid = (isinstance(local, dict) and local.get("protocol_version") == PROTOCOL_VERSION
+             and not local.get("requires_reconnect"))
+    # A local grant proves authorization, not host process liveness. The host's
+    # session-authenticated status endpoint is deliberately not called here.
+    return {"state": "connected" if valid else "not_connected", "connected": bool(valid),
+            "connection": _public_connection(local), "pending": pending_authorization(),
+            "available_scopes": sorted(SCOPES), "host_state": "not_checked",
+            "host_cleanup_required": bool(state.get("host_cleanup_required")),
+            "message": "本机授权已记录；宿主运行状态请在 XCMAX 查看" if valid else ""}
+
+
+def create_desktop_login_for_pending_pairing() -> dict:
+    # The host atomically consumes a handoff once. A status GET never proves
+    # possession and cannot mint an operator session.
+    data = _xcmax_request("/api/kellai/binding/handoff", method="POST", data={}).get("data")
+    if not isinstance(data, dict):
+        raise RuntimeError("未检测到有效的 XCMAX 交接")
+    request_id = str(data.get("request_id") or "")
+    secret = str(data.get("authorization_secret") or "")
+    if not request_id or len(secret) < 32 or data.get("protocol_version") != PROTOCOL_VERSION:
+        raise RuntimeError("XCMAX 交接响应缺少一次性授权凭据")
+    with _LOCK:
+        for key in list(_HANDOFFS):
+            if key[0] == str(base_data_root()):
+                del _HANDOFFS[key]
+        _HANDOFFS[_handoff_key(request_id)] = {**data, "received_at": time.time(), "workspace_id": workspace_id()}
+    return create_operator_session()
+
+
+def _handoff_live(value: dict) -> bool:
+    if int(value.get("workspace_id") or 0) != workspace_id():
+        return False
+    if time.time() - float(value.get("received_at") or 0) > 600:
+        return False
+    expiry = value.get("expires_at")
+    if expiry:
         try:
-            actor = get_user(int(user_id))
-        except (TypeError, ValueError):
-            actor = None
-        if not actor or int(actor.get("team_id") or 0) != matched_team_id:
-            raise HTTPException(status_code=403, detail="发送授权的账号已失效，请重新授权")
-        connection["actor"] = require_actor(actor, manage=True)
-    return connection
+            expires = (float(expiry) if isinstance(expiry, (int, float)) else
+                       datetime.fromisoformat(str(expiry).replace("Z", "+00:00")).timestamp())
+            if expires <= time.time():
+                return False
+        except (ValueError, TypeError, OverflowError):
+            return False
+    return True
+
+
+def pending_authorization() -> dict | None:
+    # Only the one-time claim carries proof; never ask an unauthenticated host
+    # status endpoint for a pending secret or an operator session.
+    with _LOCK:
+        candidates = [value for key, value in _HANDOFFS.items()
+                      if key[0] == str(base_data_root()) and _handoff_live(value)]
+    return _pending_metadata(candidates[0]) if len(candidates) == 1 else None
+
+
+def _handoff(request_id: str) -> dict:
+    with _LOCK:
+        value = _HANDOFFS.get(_handoff_key(request_id))
+    if not value or not _handoff_live(value):
+        raise RuntimeError("本机交接已失效，请从 XCMAX 重新打开账号工具")
+    return value
+
+
+def approve_authorization(*, request_id: str, accepted_scopes: list[str], current_user: dict) -> dict:
+    if not accepted_scopes or not set(accepted_scopes).issubset(SCOPES):
+        raise RuntimeError("授权范围无效")
+    if int(current_user.get("team_id") or 0) != workspace_id() or current_user.get("role") != "owner":
+        raise RuntimeError("工作区操作者身份无效")
+    pending = _handoff(request_id)
+    requested = {str(item.get("id") or "") for item in pending.get("requested_scopes", []) if isinstance(item, dict)}
+    if not set(accepted_scopes).issubset(requested):
+        raise RuntimeError("不能授予宿主本次未请求的权限")
+    token = secrets.token_urlsafe(40)
+    user = {"id": current_user["id"], "display_name": "本地操作者"}
+    # Only activate the local grant after the host acknowledges the exact scope.
+    # A failure before local persistence remains unavailable and requires re-pairing.
+    response = _xcmax_request("/api/kellai/binding/approve", method="POST", data={
+        "request_id": request_id, "authorization_secret": pending["authorization_secret"],
+        "accepted_scopes": accepted_scopes, "access_token": token, "authorized_by": user,
+        "protocol_version": PROTOCOL_VERSION,
+    })
+    with _LOCK:
+        # The host roundtrip may overlap a local revoke or a new handoff.
+        # Only the still-current, live claim can activate this exact grant.
+        if (_HANDOFFS.get(_handoff_key(request_id)) is not pending
+                or not _handoff_live(pending)):
+            raise RuntimeError("本机交接已失效，请从 XCMAX 重新打开账号工具")
+        _write({"version": PROTOCOL_VERSION, "connection": {
+            "connection_id": request_id, "token_hash": hashlib.sha256(token.encode()).hexdigest(),
+            "authorized_scopes": sorted(set(accepted_scopes)), "authorized_by": user,
+            "team_id": workspace_id(), "protocol_version": PROTOCOL_VERSION,
+        }})
+        _HANDOFFS.pop(_handoff_key(request_id), None)
+    return response.get("data") or {}
+
+
+def cancel_authorization(*, request_id: str) -> None:
+    pending = _handoff(request_id)
+    _xcmax_request("/api/kellai/binding/cancel", method="POST", data={
+        "request_id": request_id, "authorization_secret": pending["authorization_secret"],
+    })
+    with _LOCK:
+        _HANDOFFS.pop(_handoff_key(request_id), None)
+
+
+def disconnect() -> dict:
+    # Local revocation is authoritative: the old host token immediately stops
+    # working. The host's owner-only disconnect API requires its own user session.
+    with _LOCK:
+        _write({"version": PROTOCOL_VERSION, "connection": None, "host_cleanup_required": True})
+        for key in list(_HANDOFFS):
+            if key[0] == str(base_data_root()):
+                del _HANDOFFS[key]
+    return {"local_grant_revoked": True, "host_metadata_cleared": False, "host_cleanup_required": True}
+
+
+def authorize_access_token(token: str, required_scope: str | None = None) -> dict:
+    connection = _read().get("connection")
+    if not isinstance(connection, dict):
+        raise HTTPException(status_code=401, detail={"code": "xcmax_grant_revoked", "message": "XCMAX 本机授权已失效，请重新连接"})
+    if connection.get("protocol_version") != PROTOCOL_VERSION or connection.get("requires_reconnect"):
+        raise HTTPException(status_code=403, detail={"code": "xcmax_reauthorization_required", "message": "工具权限已收敛，请重新确认 XCMAX 授权"})
+    expected = str(connection.get("token_hash") or "")
+    if not token or not expected or not secrets.compare_digest(hashlib.sha256(token.encode()).hexdigest(), expected):
+        raise HTTPException(status_code=401, detail={"code": "xcmax_grant_invalid", "message": "XCMAX 本机访问令牌无效"})
+    if required_scope and required_scope not in set(connection.get("authorized_scopes") or []):
+        raise HTTPException(status_code=403, detail={"code": "xcmax_scope_required", "message": "此工具操作未授权"})
+    return {**connection, "team_id": workspace_id(), "actor": operator()}

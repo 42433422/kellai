@@ -1,0 +1,511 @@
+"""Opt-in cross-checkout HTTP/ASGI contract test with real host SQL sessions.
+
+Run this script using the explicitly selected host Python environment. See the
+repository README for invocation. It is intentionally not collected by pytest
+and never clones, fetches, updates, or installs either project's dependencies.
+The only credential backend fixture replaces native OS keyring I/O; the
+production native backend selector, routers, and session resolver remain active.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import copy
+from datetime import timedelta
+import hashlib
+import hmac
+import json
+import logging
+import os
+from pathlib import Path
+import re
+import secrets
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    host_default = os.environ.get("KELLAI_TEST_HOST_CHECKOUT")
+    parser.add_argument("--host-checkout", type=Path, default=host_default, required=not host_default,
+                        help="Explicit XCMAX git checkout containing FHD/ (or KELLAI_TEST_HOST_CHECKOUT)")
+    backend = Path(__file__).resolve().parents[2]
+    python_name = "Scripts/python.exe" if os.name == "nt" else "bin/python"
+    parser.add_argument("--tool-python", type=Path,
+                        default=os.environ.get("KELLAI_TEST_TOOL_PYTHON") or backend / ".venv" / python_name,
+                        help="Prepared Kellai Python environment; defaults to backend/.venv")
+    parser.add_argument("--expected-host-revision", default=os.environ.get("KELLAI_TEST_HOST_REVISION"),
+                        help="Require this exact 40-character host commit; never resolves a remote branch")
+    parser.add_argument("--allow-dirty-host", action="store_true",
+                        help="Explicitly permit development changes; result records host_dirty=true")
+    options = parser.parse_args(argv)
+    options.host_checkout = options.host_checkout.expanduser().resolve()
+    # Preserve a virtualenv's symlink path: resolving it to the base interpreter
+    # would discard pyvenv.cfg and import a different dependency environment.
+    options.tool_python = options.tool_python.expanduser().absolute()
+    if not (options.host_checkout / "FHD/app/fastapi_routes/kellai_binding.py").is_file():
+        parser.error("--host-checkout must contain the XCMAX FHD account-tool integration")
+    if not options.tool_python.is_file():
+        parser.error("--tool-python must point to an already prepared Kellai interpreter")
+    if options.expected_host_revision and not re.fullmatch(r"[0-9a-fA-F]{40}", options.expected_host_revision):
+        parser.error("--expected-host-revision must be a full 40-character commit SHA")
+    try:
+        revision = subprocess.check_output(["git", "-C", str(options.host_checkout), "rev-parse", "HEAD"], text=True).strip()
+        dirty = subprocess.check_output(["git", "-C", str(options.host_checkout), "status", "--porcelain", "--untracked-files=no"], text=True).strip()
+    except (OSError, subprocess.CalledProcessError):
+        parser.error("Unable to inspect the explicit host git checkout")
+    if options.expected_host_revision and revision != options.expected_host_revision.lower():
+        parser.error("The host checkout does not match --expected-host-revision")
+    if dirty and not options.allow_dirty_host:
+        parser.error("Host checkout has tracked changes; use a clean pinned checkout or explicitly --allow-dirty-host")
+    return options, backend, revision, dirty
+
+
+def main(argv=None):
+    options, TOOL, revision, dirty = parse_args(argv)
+    tool_checkout, tool_revision, tool_tree = subprocess.check_output(
+        ["git", "-C", str(TOOL), "rev-parse", "--show-toplevel", "HEAD", "HEAD^{tree}"], text=True,
+    ).splitlines()
+    tool_dirty = bool(subprocess.check_output(
+        ["git", "-C", tool_checkout, "status", "--porcelain"], text=True,
+    ).strip())
+    HOST = options.host_checkout / "FHD"
+    RUNTIME = Path(tempfile.mkdtemp(prefix="kellai-real-protocol-"))
+    os.environ.update(
+        DATABASE_URL=f"sqlite:///{RUNTIME / 'host.sqlite'}",
+        VECTOR_DB_URL=f"sqlite:///{RUNTIME / 'host.sqlite'}",
+        XCAGI_DATA_DIR=str(RUNTIME / "host-data"),
+        XCAGI_DESKTOP_MODE="0",
+        SECRET_KEY=secrets.token_hex(32),
+        FHD_INTENT_SEMANTIC_ENABLED="0",
+    )
+    sys.path.insert(0, str(HOST))
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    import httpx
+    import keyring
+    import uvicorn
+    from fastapi import FastAPI, Header, HTTPException, Response
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app import db as host_db
+    from app.db import session as db_session
+    from app.db.db_base import Base
+    from app.db.models.user import User, Session as UserSession
+    from app.domain.shared_services.session_service import SessionService
+    from app.application.facades import session_facade
+    from app.domain.shared_services import kellai_binding_store
+    from app.fastapi_routes import kellai_binding
+    from app.infrastructure import kellai_client
+    from app.utils.time import utc_now_naive
+
+
+    def free_port():
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            return sock.getsockname()[1]
+
+
+    vault_values = {}
+
+
+    class NativeKeyringIOFixture:
+        __module__ = "keyring.backends.SecretService"
+        priority = 1
+
+        def set_password(self, service, name, value):
+            vault_values[(service, name)] = value
+
+        def get_password(self, service, name):
+            return vault_values.get((service, name))
+
+        def delete_password(self, service, name):
+            vault_values.pop((service, name), None)
+
+
+    native = NativeKeyringIOFixture()
+    keyring.get_keyring = lambda: native
+    binding_path = RUNTIME / "kellai-binding.json"
+    kellai_binding_store._store_path = lambda: binding_path
+    engine = create_engine(os.environ["DATABASE_URL"])
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine)
+    host_db.HostSessionLocal = factory
+    db_session.SessionLocal = factory
+    session_facade.get_session_service = SessionService
+    sid, other_sid = secrets.token_urlsafe(24), secrets.token_urlsafe(24)
+    with factory.begin() as database:
+        database.add_all([
+            User(id=7, username="owner", password="not-used", tenant_id=7, role="user", tier="enterprise"),
+            User(id=8, username="other", password="not-used", tenant_id=8, role="user", tier="enterprise"),
+        ])
+        database.flush()
+        for user_id, session_id in ((7, sid), (8, other_sid)):
+            database.add(UserSession(session_id=session_id, user_id=user_id,
+                                    expires_at=utc_now_naive() + timedelta(hours=1),
+                                    account_kind="enterprise", market_is_admin=False,
+                                    market_is_enterprise=True))
+
+    host_port, tool_port = free_port(), free_port()
+    host_url, tool_url = f"http://127.0.0.1:{host_port}", f"http://127.0.0.1:{tool_port}"
+    kellai_client._BASE = tool_url + "/api/kellai/integrations/xcmax/"
+    host_app = FastAPI()
+    host_app.include_router(kellai_binding.router)
+    provider = {"messages": [], "writes": 0, "polls": 0}
+    provider_token, webhook_secret = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+    provider_prefix = "/isolated-provider/api/v1/accounts/3"
+
+    def check_provider_token(authorization):
+        if authorization != "Bearer " + provider_token:
+            raise HTTPException(401, "isolated provider requires its test credential")
+
+    @host_app.get(provider_prefix + "/inboxes/4")
+    def provider_inbox(authorization: str = Header(default="")):
+        check_provider_token(authorization)
+        return {"id": 4, "name": "Isolated protocol inbox"}
+
+    @host_app.get(provider_prefix + "/conversations/28")
+    def provider_conversation(authorization: str = Header(default="")):
+        check_provider_token(authorization)
+        return {"id": 28, "inbox_id": 4, "can_reply": True}
+
+    @host_app.get(provider_prefix + "/conversations")
+    def provider_conversations(page: int = 1, authorization: str = Header(default="")):
+        check_provider_token(authorization)
+        provider["polls"] += 1
+        return {"data": {"payload": [{"id": 28, "inbox_id": 4}] if page == 1 else []}}
+
+    @host_app.get(provider_prefix + "/conversations/28/messages")
+    def provider_messages(after: int = 0, before: int = 0, authorization: str = Header(default="")):
+        check_provider_token(authorization)
+        rows = ([row for row in provider["messages"] if after <= row["id"] < before] if before
+                else [row for row in provider["messages"] if row["id"] > after][:100])
+        return {"payload": copy.deepcopy(rows)}
+
+    @host_app.post(provider_prefix + "/conversations/28/messages")
+    def provider_send(body: dict, authorization: str = Header(default="")):
+        check_provider_token(authorization)
+        provider["writes"] += 1
+        message = {**body, "message_type": 1, "id": 700 + provider["writes"], "conversation_id": 28,
+                   "inbox_id": 4, "status": "sent"}
+        provider["messages"].append(message)
+        # The upstream side effect exists, but the success acknowledgement is
+        # unusable. The real adapter must keep unknown and reconcile, not resend.
+        return Response(status_code=202) if body["content"].endswith("ACK_LOST") else message
+    host_server = uvicorn.Server(uvicorn.Config(host_app, host="127.0.0.1", port=host_port,
+                                              log_level="warning", access_log=False))
+    host_thread = threading.Thread(target=host_server.run, daemon=True)
+    host_thread.start()
+    tool_env = {**{key: value for key, value in os.environ.items() if not key.startswith("KELLAI_")},
+                "PYTHONPATH": str(TOOL), "KELLAI_DATA_DIR": str(RUNTIME / "tool-data"),
+                "KELLAI_WORKSPACE_ID": "1", "KELLAI_XCMAX_API_BASE": host_url,
+                "KELLAI_CHANNEL_WORKER_ENABLED": "0",
+                "KELLAI_VAULT_KEY": base64.urlsafe_b64encode(os.urandom(32)).decode()}
+    tool_log = (RUNTIME / "tool.log").open("w")
+    tool_process = subprocess.Popen(
+        [str(options.tool_python), "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1",
+         "--port", str(tool_port), "--log-level", "warning"], cwd=TOOL, env=tool_env,
+        stdout=tool_log, stderr=subprocess.STDOUT,
+    )
+    checks = []
+
+
+    def check(condition, label):
+        if not condition:
+            raise AssertionError(label)
+        checks.append(label)
+
+
+    def expect(response, code, label):
+        check(response.status_code == code, f"{label}: HTTP {code} (observed {response.status_code})")
+        return response.json()
+
+
+    def wait_ready(client):
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            try:
+                if host_server.started and client.get(tool_url + "/health").status_code == 200:
+                    return
+            except httpx.HTTPError:
+                pass
+            if tool_process.poll() is not None:
+                raise AssertionError("tool server exited before readiness")
+            time.sleep(0.05)
+        raise AssertionError("local servers did not become ready")
+
+
+    try:
+        with httpx.Client(trust_env=False, timeout=10) as client:
+            wait_ready(client)
+            hp = host_url + "/api/kellai/binding"
+            tp = tool_url + "/api/kellai"
+            pair = {"X-Kellai-Local-Pairing": "1"}
+            host_headers = {**pair, "X-XCMAX-Client-Shell": "enterprise", "X-Session-ID": sid}
+            other_headers = {**host_headers, "X-Session-ID": other_sid}
+            expect(client.post(hp + "/start", headers={**pair, "X-XCMAX-Client-Shell": "enterprise"}),
+                   400, "real sid is required before pairing")
+            start = expect(client.post(hp + "/start", headers=host_headers, json={
+                "requested_scopes": ["channels.read", "messages.read", "messages.send"]}), 200, "authenticated host starts pairing")["data"]
+            check("authorization_secret" not in json.dumps(start), "host start does not expose handoff secret")
+            login_response = client.post(tp + "/auth/xcmax-desktop", headers={"X-Kellai-Desktop-Handoff": "1"})
+            login = expect(login_response, 200, "tool consumes host handoff over actual HTTP")
+            operator_headers = {"Authorization": "Bearer " + login["access_token"]}
+            expect(client.post(hp + "/handoff", headers=pair), 409, "host handoff cannot be claimed twice")
+            expect(client.get(hp + "/status", headers=other_headers), 403, "another real sid cannot read pending pairing")
+            pending_response = client.get(tp + "/integrations/xcmax/pending", headers=operator_headers)
+            pending = expect(pending_response, 200, "tool reads claimed pending metadata without host sid")["data"]
+            check(pending["request_id"] == start["request_id"], "pending request stays identical across processes")
+            check([scope["id"] for scope in pending["requested_scopes"]] ==
+                  ["channels.read", "messages.read", "messages.send"], "pending contains actual requested scope objects")
+            check("authorization_secret" not in pending_response.text, "pending metadata does not expose secret")
+            approved_response = client.post(tp + "/integrations/xcmax/approve", headers=operator_headers,
+                json={"request_id": pending["request_id"], "accepted_scopes": ["channels.read"]})
+            approved = expect(approved_response, 200, "tool approves least privilege subset over actual HTTP")["data"]
+            check(approved["authorized_scopes"] == ["channels.read"], "host records only consented scope")
+            stored = json.loads(binding_path.read_text())
+            check(stored["connection"]["xcmax_user_id"] == 7 and stored["connection"]["xcmax_tenant_id"] == "7",
+                  "real sid owner and tenant are persisted in binding")
+            check("access_token" not in stored["connection"] and stored["connection"].get("access_token_ref"),
+                  "host binding contains OS key reference only")
+            grant_token = native.get_password(kellai_binding_store._KEYRING_SERVICE,
+                                             stored["connection"]["access_token_ref"])
+            check(grant_token and grant_token not in binding_path.read_text(), "raw grant token is absent from binding JSON")
+            check(grant_token not in approved_response.text and grant_token not in login_response.text,
+                  "approval and operator response do not expose host grant token")
+            tool_binding = RUNTIME / "tool-data/tenants/1/integrations/xcmax.json"
+            check(grant_token not in tool_binding.read_text(), "tool keeps grant verification hash only")
+            expect(client.post(tp + "/accounts", headers=operator_headers, json={
+                "channel_type": "oauth2", "auth_type": "oauth2", "name": "Read-only credential account",
+                "config": {"provider": "github", "client_id": "integration-fixture", "client_secret": "fixture-secret"}}),
+                200, "operator creates an encrypted credential account")
+            channels_response = client.get(hp + "/channels", headers=host_headers)
+            channels = expect(channels_response, 200, "host reads granted account metadata through tool gateway")["data"]["channels"]
+            check(len(channels) == 1 and channels[0]["channel_type"] == "oauth2", "account connection identity crosses both routes")
+            check(not channels[0]["capabilities"]["send"] and not channels[0]["capabilities"]["receive"],
+                  "credential-only OAuth account never reports messaging capabilities")
+            check("fixture-secret" not in channels_response.text and grant_token not in channels_response.text,
+                  "host-visible account metadata contains no account or grant secret")
+            expect(client.get(hp + "/contacts", headers=host_headers), 403, "ungranted messages.read is denied")
+            expect(client.get(hp + "/channels", headers=other_headers), 403, "another real sid cannot use grant")
+            state = expect(client.get(hp + "/status", headers=host_headers), 200, "host verifies live grant status")["data"]
+            check(state["state"] == "connected", "host status reports active grant as connected")
+
+            # Complete both directions through the actual host and tool routes.
+            # Only the remote Chatwoot service is isolated; no product adapter or
+            # delivery ledger is replaced and no real platform account is used.
+            scopes = ["channels.read", "messages.read", "messages.send"]
+            expect(client.post(hp + "/start", headers=host_headers, json={"requested_scopes": scopes}),
+                   200, "host explicitly requests send permission")
+            login = expect(client.post(tp + "/auth/xcmax-desktop", headers={"X-Kellai-Desktop-Handoff": "1"}),
+                           200, "new permission uses a new single-use handoff")
+            operator_headers = {"Authorization": "Bearer " + login["access_token"]}
+            pending = expect(client.get(tp + "/integrations/xcmax/pending", headers=operator_headers),
+                             200, "tool sees the new permission request")["data"]
+            expect(client.post(tp + "/integrations/xcmax/approve", headers=operator_headers,
+                               json={"request_id": pending["request_id"], "accepted_scopes": scopes}),
+                   200, "tool explicitly grants the requested send scope")
+            stored = json.loads(binding_path.read_text())
+            grant_token = native.get_password(kellai_binding_store._KEYRING_SERVICE,
+                                             stored["connection"]["access_token_ref"])
+            provider_url = host_url + "/isolated-provider"
+            account = expect(client.post(tp + "/accounts", headers=operator_headers, json={
+                "channel_type": "chatwoot", "name": "Protocol test account", "config": {
+                    "base_url": provider_url, "account_id": "3", "inbox_id": "4",
+                    "api_access_token": provider_token, "webhook_secret": webhook_secret}}),
+                200, "tool creates the isolated gateway account")["data"]
+            account_id = account["connection_id"]
+            tested = expect(client.post(tp + f"/accounts/{account_id}/test", headers=operator_headers),
+                            200, "real adapter authenticates to the isolated provider")["data"]
+            check(tested["connected"] is True, "account authentication has a provider readback")
+            target = "chatwoot:" + hashlib.sha256(provider_url.encode()).hexdigest()[:16] + ":3:4:28"
+            webhook_path = tp + f"/webhook/chatwoot/1/{account_id}"
+
+            def callback(payload, label, *, sync=True):
+                raw = json.dumps(payload, separators=(",", ":")).encode()
+                timestamp = str(int(time.time()))
+                signature = "sha256=" + hmac.new(webhook_secret.encode(), timestamp.encode() + b"." + raw,
+                                                 hashlib.sha256).hexdigest()
+                expect(client.post(webhook_path, content=raw, headers={"Content-Type": "application/json",
+                    "X-Chatwoot-Timestamp": timestamp, "X-Chatwoot-Signature": signature,
+                    "X-Chatwoot-Delivery": label}), 200, label)
+                if sync:
+                    expect(client.post(tp + "/channels/sync-inbox", headers=operator_headers,
+                                       json={"connection_id": account_id}), 200, label + " projects durably")
+
+            event_context = {"account": {"id": 3}, "inbox": {"id": 4},
+                             "conversation": {"id": 28, "inbox_id": 4}, "private": False}
+            inbound = {**event_context, "event": "message_created", "id": 600, "message_type": "incoming",
+                       "content": "Isolated customer question", "sender": {"id": 5, "name": "Protocol contact"}}
+            provider["messages"].append({**inbound, "message_type": 0, "conversation_id": 28, "inbox_id": 4})
+            expect(client.post(tp + "/channels/sync-inbox", headers=operator_headers,
+                               json={"connection_id": account_id}),
+                   200, "loopback tool pulls incoming messages through authenticated provider GETs without a callback")
+            pulled = expect(client.get(hp + "/contacts", headers=host_headers),
+                            200, "host discovers a contact from the pull-only inbox")["data"]["contacts"]
+            check(any(item["connection_id"] == account_id and item["contact_id"] == target for item in pulled)
+                  and provider["writes"] == 0, "pull-only synchronization reaches the host without any provider write")
+            contact = next(item for item in pulled if item["connection_id"] == account_id and item["contact_id"] == target)
+            message_url = hp + f"/contacts/{contact['customer_id']}/messages"
+            queued = {**inbound, "id": 601, "content": "Already durable pending message"}
+            provider["messages"].append({**queued, "message_type": 0, "conversation_id": 28, "inbox_id": 4})
+            polls = provider["polls"]
+            callback(queued, "pending signed inbound is already durable", sync=False)
+            deadline, projected = time.monotonic() + 5, False
+            while time.monotonic() < deadline:
+                rows = client.get(message_url, headers=host_headers, params={"connection_id": account_id}).json()["data"]["messages"]
+                projected = any(row["content"] == queued["content"] for row in rows)
+                if projected:
+                    break
+                time.sleep(0.01)
+            check(projected and provider["polls"] == polls, "pending durable inbox drains before any external polling")
+            callback(inbound, "signed inbound enters the real account inbox")
+            callback(inbound, "duplicate inbound keeps the original message")
+            contacts = expect(client.get(hp + "/contacts", headers=host_headers),
+                              200, "host reads the ingested account contact")["data"]["contacts"]
+            contact = next(item for item in contacts if item["connection_id"] == account_id and item["contact_id"] == target)
+            params = {"connection_id": account_id, "customer_id": contact["customer_id"],
+                      "channel_type": "chatwoot", "contact_id": target, "content": "Confirmed manual test"}
+            messages = expect(client.get(message_url, headers=host_headers, params={"connection_id": account_id}),
+                              200, "host reads the real incoming message")["data"]["messages"]
+            check(len(messages) == 2 and sum(row["content"] == inbound["content"] for row in messages) == 1,
+                  "inbound replay retains one projection per provider message")
+            denied = expect(client.post(hp + "/messages/send", headers=other_headers,
+                json={**params, "client_request_id": "wrong-owner-request"}), 403, "other host actor cannot send")
+            check(denied["detail"]["request_not_dispatched"] is True and provider["writes"] == 0,
+                  "ownership refusal is explicit and performs no provider write")
+            expect(client.post(hp + "/messages/send", headers=host_headers,
+                json={**params, "content": "x" * 8001, "client_request_id": "invalid-body-request"}),
+                422, "host rejects oversize body before provider dispatch")
+            sent = expect(client.post(hp + "/messages/send", headers=host_headers,
+                json={**params, "client_request_id": "manual-original-request"}), 200, "manual confirmation traverses both gateways")["data"]
+            check(sent["status"] == "accepted" and provider["writes"] == 1, "accepted is persisted once and not called delivered")
+            duplicate = expect(client.post(hp + "/messages/send", headers=host_headers,
+                json={**params, "client_request_id": "manual-original-request"}), 200, "duplicate request reads the original ledger")["data"]
+            check(duplicate["request_id"] == sent["request_id"] and provider["writes"] == 1, "duplicate request never sends a second message")
+            expect(client.post(hp + "/messages/send", headers=host_headers,
+                json={**params, "content": "changed body", "client_request_id": "manual-original-request"}),
+                409, "reused request with changed body remains a conflict")
+            unknown = expect(client.post(hp + "/messages/send", headers=host_headers,
+                json={**params, "content": "Confirmed uncertain test ACK_LOST", "client_request_id": "unknown-original-request"}),
+                200, "unusable upstream acknowledgement is an original unknown receipt")["data"]
+            check(unknown["status"] == "unknown" and provider["writes"] == 2, "lost acknowledgement never becomes a second dispatch")
+
+            def delivered(request_id):
+                row = next(row for row in provider["messages"] if row.get("content_attributes", {}).get("kellai_request_id") == request_id)
+                row["status"] = "delivered"
+                callback({**event_context, **row, "event": "message_updated"}, "verified delivery for " + request_id)
+
+            delivered("unknown-original-request")
+            recovered = expect(client.get(hp + "/messages/requests/unknown-original-request", headers=host_headers),
+                               200, "host reads the recovered original request")["data"]
+            check(recovered["provider_state"] == "delivered" and recovered["persisted"] is True
+                  and recovered["provider_message_id"] and provider["writes"] == 2,
+                  "unknown delivery is reconciled to exact provider evidence without resending")
+
+            from app.application.agent_orchestrator import approval_grant, run_repository
+            from app.application.agent_orchestrator.result_verification import (
+                bind_execution_receipt, freeze_verification_contract, verify_step_result)
+            from app.application.agent_orchestrator.run_models import AgentRun, AgentStep, ToolCall
+            from app.application.agent_orchestrator.run_sql_repository import SQLAlchemyAgentRunRepository
+            from app.application.agent_orchestrator.task_background import task_execution_context
+            from app.application.agent_orchestrator.tool_spec import get_tool_action_spec
+            from app.application.tools.kellai import execute_kellai
+            from app.infrastructure.auth.agent_mod_scope import bind_agent_actor_scope
+            from app.domain.task_lifecycle.results import normalize_execution_result
+            context = {"user_id": "7", "tenant_id": "7", "_actor_authorization":
+                       bind_agent_actor_scope(session_id=sid, user_id="7")}
+            step = AgentStep(tool_id="kellai", action="send", node_id="send", status="waiting_user",
+                             params={**params, "content": "Approved isolated Agent test"}, risk="high")
+            run = AgentRun(user_id="7", message="Isolated approved delivery", status="waiting_user",
+                           steps=[step], metadata={"runtime_context": copy.deepcopy(context)})
+            repository = SQLAlchemyAgentRunRepository(session_factory=factory)
+            run_repository.set_agent_run_repository_for_tests(repository)
+            repository.save(run)
+            context.update(task_execution_context(run, step), run_id=run.run_id, step_id=step.step_id)
+            refused = execute_kellai("send", step.params, context)
+            check(refused.get("error_code") == "approval_required" and provider["writes"] == 2,
+                  "real Agent actor without persisted approval cannot send")
+            grant = approval_grant.issue_approval_grant(run, principal_id="7")
+            claims = approval_grant.consume_approval_grant(grant["grant"], run=run, principal_id="7")
+            run.metadata["approval_receipt"] = {"grant_id": claims["jti"], "approved_by": "7",
+                "step_id": step.step_id, "tool_id": "kellai", "action": "send",
+                **approval_grant.approval_receipt_claims(run, step, claims=claims)}
+            run.status = step.status = "running"
+            repository.save(run)
+            changed = execute_kellai("send", {**step.params, "content": "unapproved change"}, context)
+            check(changed.get("error_code") == "approval_required" and provider["writes"] == 2,
+                  "consumed approval cannot authorize a different message")
+            call = ToolCall(step_id=step.step_id, node_id=step.node_id, tool_id="kellai", action="send", params=copy.deepcopy(step.params))
+            run.tool_calls.append(call)
+            freeze_verification_contract(run, step, call, get_tool_action_spec("kellai", "send"), context)
+            output = execute_kellai("send", step.params, context)
+            check(output["success"] is True and provider["writes"] == 3, "consumed SQL approval sends through the real tool adapter once")
+            call.output = step.output = normalize_execution_result(output)
+            call.status = step.status = "completed"
+            bind_execution_receipt(call)
+            pending = verify_step_result(run=run, step=step, call=call, context=context)
+            check(pending["accepted"] is False and pending["code"] == "result_delivery_confirmation_pending",
+                  "Agent never equates provider acceptance to delivered")
+            repository.save(run)
+            delivered(output["data"]["request_id"])
+            recovered_run = SQLAlchemyAgentRunRepository(session_factory=factory).get(run.run_id)
+            verified = verify_step_result(run=recovered_run, step=recovered_run.steps[0],
+                                          call=recovered_run.tool_calls[0], context=context)
+            check(verified["accepted"] is True and provider["writes"] == 3,
+                  "reloaded Agent run verifies the original delivered message without a new POST")
+            check(recovered_run.tool_calls[0].output == call.output, "reconciliation preserves the original execution receipt")
+
+            pair_bearer = {"Authorization": "Bearer " + grant_token}
+            expect(client.get(tp + "/integrations/xcmax/grant-status", headers=pair_bearer), 200,
+                   "pair bearer has distinct scope-independent grant status route")
+            revoked = expect(client.post(tp + "/integrations/xcmax/disconnect", headers=operator_headers), 200,
+                             "tool revokes local grant without impersonating host sid")["data"]
+            check(revoked.get("local_grant_revoked") is True and revoked.get("host_metadata_cleared") is False,
+                  "tool accurately reports local revocation and remaining host cleanup")
+            expect(client.get(tp + "/integrations/xcmax/grant-status", headers=pair_bearer), 401,
+                   "old bearer stops authorizing immediately after tool revocation")
+            revoked_read = expect(client.get(hp + "/channels", headers=host_headers), 401,
+                                  "ordinary host read observes tool revocation before status probe")
+            check(revoked_read.get("detail", {}).get("code") == "xcmax_grant_revoked",
+                  "host read preserves the explicit grant revocation code")
+            state = expect(client.get(hp + "/status", headers=host_headers), 200,
+                           "host status preserves observed tool revocation")["data"]
+            check(state["state"] in {"revoked", "requires_reconnect"}, "host does not show revoked grant as connected")
+            expect(client.post(hp + "/disconnect", headers=host_headers), 200, "authenticated host cleans binding metadata")
+            check(json.loads(binding_path.read_text())["connection"] is None, "host cleanup removes binding reference")
+            check(not vault_values, "consumed handoff and revoked grant references are cleaned from keyring fixture")
+            expect(client.get(hp + "/channels", headers=host_headers), 409, "cleaned host binding cannot read accounts")
+        result = {"passed": len(checks), "checks": checks,
+                          "runtime": str(RUNTIME), "host_checkout": str(options.host_checkout),
+                          "host_revision": revision, "host_dirty": bool(dirty),
+                          "tool_checkout": tool_checkout, "tool_revision": tool_revision,
+                          "tool_tree": tool_tree, "tool_dirty": tool_dirty,
+                          "host_python": sys.executable, "tool_python": str(options.tool_python),
+                          "os_keyring": "I/O fixture; real selector retained",
+                          "session_auth": "real SQLite User/Session and production resolver",
+                          "transport": "two real loopback HTTP servers, production ASGI routers",
+                          "external_provider": "isolated Chatwoot HTTP protocol fixture; no real account or external messages",
+                          "provider_writes": provider["writes"],
+                          "agent_approval": "real sealed actor, signed grant consumption and SQL AgentRun readback"}
+        (RUNTIME / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    finally:
+        host_server.should_exit = True
+        tool_process.terminate()
+        try:
+            tool_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            tool_process.kill()
+            tool_process.wait(timeout=5)
+        host_thread.join(timeout=5)
+        tool_log.close()
+        engine.dispose()
+
+
+if __name__ == "__main__":
+    main()

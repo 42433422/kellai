@@ -1,4 +1,4 @@
-"""PyInstaller entry point for the self-contained macOS desktop backend."""
+"""PyInstaller entry point for the self-contained desktop backend."""
 
 from __future__ import annotations
 
@@ -18,6 +18,31 @@ def _watch_parent_process() -> None:
         return
 
     def watch() -> None:
+        if os.name == "nt":
+            # os.kill(pid, 0) terminates a process on Windows. Wait on a
+            # SYNCHRONIZE-only handle instead; it cannot modify the parent.
+            import ctypes
+            from ctypes import wintypes
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel.OpenProcess.restype = wintypes.HANDLE
+            kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            kernel.WaitForSingleObject.restype = wintypes.DWORD
+            kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+            handle = kernel.OpenProcess(0x00100000, False, parent_pid)
+            if not handle:
+                if ctypes.get_last_error() == 87:  # ERROR_INVALID_PARAMETER: PID has exited.
+                    os._exit(0)
+                return
+            try:
+                while True:
+                    result = kernel.WaitForSingleObject(handle, 1000)
+                    if result == 0:  # WAIT_OBJECT_0: the actual parent handle exited.
+                        os._exit(0)
+                    if result != 258:  # WAIT_TIMEOUT is the only live-parent result.
+                        return
+            finally:
+                kernel.CloseHandle(handle)
         while True:
             time.sleep(1.0)
             try:

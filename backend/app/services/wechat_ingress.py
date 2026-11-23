@@ -2,7 +2,7 @@
 
 No callback chooses its tenant from an unverified body. WeChat uses a scoped
 URL and a saved tenant token; WeCom uses its verified decrypted corporation ID
-and the existing third-party authorization registry.
+and the explicit self-built corporate application connection.
 """
 
 from __future__ import annotations
@@ -10,15 +10,12 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import logging
-import os
 import time
 import xml.etree.ElementTree as ET
 from typing import Any
 
 from app.services.tenant_context import resolve_team_id, tenant_scope
 
-logger = logging.getLogger(__name__)
 MAX_CALLBACK_BYTES = 1024 * 1024
 
 
@@ -26,16 +23,6 @@ class WechatIngressError(ValueError):
     def __init__(self, message: str, status_code: int = 400):
         super().__init__(message)
         self.status_code = status_code
-
-
-def legacy_wechat_team() -> int:
-    """The old URL is usable only after an operator binds it to one team."""
-
-    try:
-        team_id = int(os.environ.get("KELLAI_WECHAT_WEBHOOK_TEAM_ID", "0"))
-        return resolve_team_id(team_id, required=True)
-    except (ValueError, PermissionError) as exc:
-        raise WechatIngressError("微信回调未绑定团队，请使用团队专属回调地址", 403) from exc
 
 
 def wechat_config(team_id: int) -> dict[str, str]:
@@ -57,9 +44,12 @@ def wechat_config(team_id: int) -> dict[str, str]:
             break
     if not token:
         raise WechatIngressError("此团队未配置微信回调 Token", 403)
+    original_id = str(fields.get("official_original_id") or fields.get("original_id") or "").strip()
+    if not original_id:
+        raise WechatIngressError("请先配置公众号原始 ID（official_original_id），再启用账号回调", 403)
     return {
         "token": token,
-        "original_id": str(fields.get("official_original_id") or fields.get("original_id") or "").strip(),
+        "original_id": original_id,
     }
 
 
@@ -73,7 +63,7 @@ def verify_wechat_signature(*, signature: str, timestamp: str, nonce: str, token
     except (ValueError, TypeError):
         fresh = False
     expected = hashlib.sha1("".join(sorted([token, timestamp, nonce])).encode()).hexdigest()
-    if not fresh or not hmac.compare_digest(expected, signature):
+    if not fresh or not signature.isascii() or not hmac.compare_digest(expected, signature):
         raise WechatIngressError("微信回调签名校验失败", 403)
 
 
@@ -96,7 +86,11 @@ def parse_xml(raw: bytes) -> dict[str, str]:
     for child in root:
         if child.tag in body:
             raise WechatIngressError("回调 XML 存在重复字段")
-        body[child.tag] = (child.text or "").strip() if not len(child) else ET.tostring(child, encoding="unicode")
+        if len(child):
+            body[child.tag] = ET.tostring(child, encoding="unicode")
+        else:
+            text = child.text or ""
+            body[child.tag] = text if child.tag in {"Content", "Recognition"} else text.strip()
     return body
 
 
@@ -157,14 +151,3 @@ def persist_callback(*, channel_type: str, team_id: int, body: dict[str, str]) -
         return push_inbox(channel_type, contact_id=from_user, contact_name=from_user,
                           direction="inbound", content=content, content_type=content_type,
                           metadata=metadata, msg_id=stable_message_id(channel_type, body), team_id=team_id)
-
-
-async def sync_persisted_callback(*, team_id: int, channel_type: str) -> None:
-    """The durable inbox remains retryable if CRM or enqueue is unavailable."""
-
-    from app.services.channel_ingest import sync_inbox
-
-    try:
-        await sync_inbox(team_id=team_id, channel_type=channel_type)
-    except Exception:
-        logger.exception("已保存渠道回调，接入待重试: team=%s channel=%s", team_id, channel_type)

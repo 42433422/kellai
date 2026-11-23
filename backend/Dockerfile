@@ -18,11 +18,8 @@ COPY app/ app/
 RUN mkdir -p /data
 ENV KELLAI_DATA_DIR=/data
 
-# 生产环境必须设置的环境变量（运行时注入）
-ENV KELLAI_APP_ENV=production
-ENV KELLAI_STRICT_AUTH=1
-ENV KELLAI_PORT=8790
+ENV KELLAI_PORT=8793
 
-EXPOSE 8790
+EXPOSE 8793
 
-CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8790", "--workers", "1"]
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8793", "--workers", "1"]

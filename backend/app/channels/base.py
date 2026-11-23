@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class UnifiedMessage(BaseModel):
@@ -12,13 +12,14 @@ class UnifiedMessage(BaseModel):
 
     id: str
     customer_id: int
+    connection_id: str = ""
     channel_type: str
     contact_id: str
     contact_name: str
     direction: str  # "inbound" / "outbound"
     content: str
     content_type: str = "text"  # text / image / file
-    metadata: dict = {}
+    metadata: dict = Field(default_factory=dict)
     created_at: str
 
 

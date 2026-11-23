@@ -22,7 +22,7 @@ import httpx
 
 from app.channels.base import ChannelAdapter, UnifiedMessage
 from app.channels.config_store import get_field
-from app.channels.http_client import CachedToken, read_env, checked_json, send_error
+from app.channels.http_client import CachedToken, read_env, checked_json, send_error, check_send_authorization
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +76,7 @@ class MiniAppAdapter(ChannelAdapter):
         )
         body = checked_json(resp)
         if int(body.get("errcode", 0)) != 0:
-            raise RuntimeError(f"小程序 gettoken 失败: {body.get('errmsg')} (errcode={body.get('errcode')})")
+            raise RuntimeError("小程序 gettoken 失败")
         token = str(body.get("access_token", ""))
         ttl = int(body.get("expires_in", 7200))
         if not token:
@@ -136,6 +136,7 @@ class MiniAppAdapter(ChannelAdapter):
             }
             if kwargs.get("page"):
                 payload["page"] = str(kwargs["page"])
+            check_send_authorization(kwargs.get("before_send"))
             resp = await client.post(
                 "/cgi-bin/message/subscribe/send",
                 params={"access_token": token},
@@ -150,10 +151,10 @@ class MiniAppAdapter(ChannelAdapter):
                 "delivery_state": "accepted" if errcode == 0 else "failed",
                 "definitely_not_sent": errcode != 0,
                 "message_id": "",  # 订阅消息无 message_id
-                "error": "" if errcode == 0 else f"errcode={errcode} errmsg={body.get('errmsg')}",
+                "error": "" if errcode == 0 else "小程序拒绝请求",
             }
         except Exception as exc:
-            logger.warning("小程序 send_message 异常: %s", exc)
+            logger.warning("小程序 send_message 异常: %s", type(exc).__name__)
             return send_error(exc)
 
     # ----------------- receive_messages -----------------
@@ -168,7 +169,7 @@ class MiniAppAdapter(ChannelAdapter):
             rows.sort(key=lambda item: str(item.get("received_at", "")), reverse=True)
             rows = rows[: int(limit)]
         except Exception as exc:
-            logger.warning("读取小程序收件箱失败: %s", exc)
+            logger.warning("读取小程序收件箱失败: %s", type(exc).__name__)
             return []
         out: list[UnifiedMessage] = []
         for r in rows:
@@ -230,4 +231,4 @@ class MiniAppAdapter(ChannelAdapter):
                 return {"connected": True, "message": "小程序 access_token 拉取成功"}
             return {"connected": False, "message": "小程序 token 为空"}
         except Exception as exc:
-            return {"connected": False, "message": f"小程序连接失败: {exc}"}
+            return {"connected": False, "message": f"小程序连接失败: {type(exc).__name__}"}

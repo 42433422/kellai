@@ -9,7 +9,10 @@ __pycache__/
 desktop/dist/
 backend/build/
 backend/dist/
+backend/build-info.json
+native-test-artifacts/
 release/
+ui-test-artifacts/
 
 # Environment
 .env
