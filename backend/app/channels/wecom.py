@@ -171,8 +171,7 @@ class WeComAdapter(ChannelAdapter):
         if not self._is_configured():
             return {"success": False, "message_id": "", "error": _UNCONFIGURED_MSG, "delivery_state": "failed", "definitely_not_sent": True}
 
-        content = (content or "").strip()
-        if not content:
+        if not (content or "").strip():
             return {"success": False, "message_id": "", "error": "消息内容为空", "delivery_state": "failed", "definitely_not_sent": True}
         if not contact_id:
             return {"success": False, "message_id": "", "error": "contact_id 不能为空", "delivery_state": "failed", "definitely_not_sent": True}

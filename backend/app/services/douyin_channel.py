@@ -147,19 +147,10 @@ async def access_context(team_id: int) -> dict:
     if not token.get("refresh_token") or int(token.get("refresh_expires_at") or 0) <= time.time() + 60:
         store.update_connection(identifier, connected=False, status="requires_reconnect", expected_version=item["version"])
         raise DouyinChannelError("授权已过期，请重新连接")
-    holder = secrets.token_hex(16)
-    with store.database(write=True) as db:
-        acquired = db.execute("""INSERT INTO connection_refresh_leases VALUES(?,?,?)
-            ON CONFLICT(connection_id) DO UPDATE SET holder=excluded.holder,expires_at=excluded.expires_at
-            WHERE connection_refresh_leases.expires_at<?""", (identifier, holder, int(time.time()) + 60, int(time.time()))).rowcount
-        if not acquired:
-            raise store.ConnectionConflict("授权刷新正在进行")
-        if store._row(db, identifier)["version"] != item["version"]:
-            db.execute("DELETE FROM connection_refresh_leases WHERE connection_id=? AND holder=?", (identifier, holder))
-            raise store.ConnectionConflict("账号配置已变化")
-    try:
-        data = await _token_request("/oauth/refresh_token/", {"client_key": item["config"]["client_key"],
-            "grant_type": "refresh_token", "refresh_token": token["refresh_token"]})
+    fields = {"client_key": item["config"]["client_key"],
+              "grant_type": "refresh_token", "refresh_token": token["refresh_token"]}
+    with store.refresh_lease(identifier, expected_version=item["version"]):
+        data = await _token_request("/oauth/refresh_token/", fields)
         updated = _token(data, token)
         if "enterprise.im" not in set(updated["scope"].replace(" ", ",").split(",")):
             raise DouyinChannelError("刷新后的授权缺少私信权限")
@@ -168,15 +159,6 @@ async def access_context(team_id: int) -> dict:
         refreshed = store.update_connection(identifier, {"oauth_token": updated}, connected=True,
                                             expected_version=item["version"])
         return {**updated, "_connection_version": refreshed["version"]}
-    except Exception:
-        try:
-            store.update_connection(identifier, connected=False, status="requires_reconnect", expected_version=item["version"])
-        except store.ConnectionConflict:
-            pass
-        raise
-    finally:
-        with store.database(write=True) as db:
-            db.execute("DELETE FROM connection_refresh_leases WHERE connection_id=? AND holder=?", (identifier, holder))
 
 
 def verify_webhook_signature(raw_body: bytes, signature: str) -> bool:

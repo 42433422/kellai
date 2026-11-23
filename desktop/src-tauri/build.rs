@@ -17,6 +17,7 @@ fn main() {
                     String::from_utf8(output.stdout).unwrap().trim().to_string()
                 };
                 assert_eq!(git(&["rev-parse", "HEAD"]), value["source_sha"].as_str().unwrap(), "rebuild backend for the current native source");
+                assert_eq!(git(&["rev-parse", "HEAD^{tree}"]), value["source_tree"].as_str().unwrap(), "backend tree does not match native source");
                 assert!(git(&["status", "--porcelain", "--untracked-files=all"]).is_empty(), "native candidate requires a clean checkout");
             }
             text

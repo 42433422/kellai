@@ -174,39 +174,19 @@ async def active_token(connection_id: str) -> dict[str, Any]:
         store.update_connection(connection_id, connected=False, status="requires_reconnect",
                                 expected_version=item["version"])
         raise store.ConnectionUnavailable("账号授权已过期，请重新连接")
-    holder = secrets.token_hex(16)
-    with store.database(write=True) as database:
-        acquired = database.execute("""INSERT INTO connection_refresh_leases VALUES (?,?,?)
-            ON CONFLICT(connection_id) DO UPDATE SET holder=excluded.holder,expires_at=excluded.expires_at
-            WHERE connection_refresh_leases.expires_at<?""",
-            (connection_id, holder, int(time.time()) + 120, int(time.time()))).rowcount
-        if not acquired:
-            raise store.ConnectionConflict("账号授权正在刷新，请稍后重试")
-        # A concurrent completed refresh may have updated the version before our lease.
-        current = store._result(store._row(database, connection_id), include_secrets=True)
     try:
-        if current["version"] != item["version"]:
-            raise store.ConnectionConflict("账号配置已变化，请重新读取授权")
         provider = _provider(config)
         async with _client(config, token=token) as client:
-            updated = dict(await client.refresh_token(provider["token"], refresh_token=token["refresh_token"]))
-        updated.setdefault("refresh_token", token["refresh_token"])
-        store.update_connection(connection_id, {"oauth_token": updated}, connected=True,
-                                expected_version=item["version"])
-        return updated
+            with store.refresh_lease(connection_id, expected_version=item["version"]):
+                updated = dict(await client.refresh_token(provider["token"], refresh_token=token["refresh_token"]))
+                updated.setdefault("refresh_token", token["refresh_token"])
+                store.update_connection(connection_id, {"oauth_token": updated}, connected=True,
+                                        expected_version=item["version"])
+                return updated
     except store.ConnectionUnavailable:
         raise
     except Exception as exc:
-        try:
-            store.update_connection(connection_id, connected=False, status="requires_reconnect",
-                                    expected_version=item["version"])
-        except store.ConnectionConflict:
-            pass
         raise store.ConnectionUnavailable("授权刷新失败，请重新连接账号") from exc
-    finally:
-        with store.database(write=True) as database:
-            database.execute("DELETE FROM connection_refresh_leases WHERE connection_id=? AND holder=?",
-                             (connection_id, holder))
 
 
 async def disconnect(connection_id: str) -> dict[str, bool]:
@@ -218,7 +198,8 @@ async def disconnect(connection_id: str) -> dict[str, bool]:
                 "provider_revocation_supported": False}
     config = item["config"]
     token = config.get("oauth_token") or {}
-    provider = PROVIDERS.get(str(config.get("provider") or ""), {})
+    provider = (PROVIDERS.get(str(config.get("provider") or ""), {})
+                if item["channel_type"] == "oauth2" else {})
     store.update_connection(connection_id, {"oauth_token": {}}, enabled=False, connected=False, status="revoked",
                             expected_version=item["version"])
     revoked = False

@@ -8,6 +8,7 @@ import json
 import logging
 import struct
 import time
+from contextlib import contextmanager
 
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -22,6 +23,17 @@ from app.services import wechat_ingress
 router = APIRouter(prefix="/api/kellai", tags=["channel-callbacks"])
 MAX_BYTES = 1_048_576
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _commit_account(item: dict):
+    from app.services.connection_store import active_snapshot
+    try:
+        with active_snapshot(item["connection_id"], expected_version=item["version"],
+                             channel_type=item["channel_type"]):
+            yield
+    except (config_store.ConnectionUnavailable, KeyError, PermissionError) as exc:
+        raise HTTPException(403, "回调账号已变更或撤销，未保存旧账号消息") from exc
 
 
 async def _body(request: Request) -> bytes:
@@ -69,8 +81,9 @@ async def chatwoot_webhook(team_id: int, connection_id: str, request: Request, b
                 signature = request.headers.get("x-chatwoot-signature", "")
                 payload = authenticate(raw, timestamp=request.headers.get("x-chatwoot-timestamp", ""),
                                        signature=signature, settings=settings)
-                result = store_event(payload, settings=settings, team_id=team_id,
-                                     delivery_id=request.headers.get("x-chatwoot-delivery") or signature)
+                with _commit_account(item):
+                    result = store_event(payload, settings=settings, team_id=team_id,
+                                         delivery_id=request.headers.get("x-chatwoot-delivery") or signature)
             except WebhookRejected as exc:
                 raise HTTPException(exc.status_code, str(exc)) from exc
     if result.get("kind") in {"inbound", "receipt"}:
@@ -82,7 +95,7 @@ async def chatwoot_webhook(team_id: int, connection_id: str, request: Request, b
 async def wechat_callback(team_id: int, connection_id: str, request: Request, background_tasks: BackgroundTasks):
     try:
         with tenant_scope(team_id):
-            _account(team_id, connection_id, "wechat")
+            item = _account(team_id, connection_id, "wechat")
             with config_store.connection_scope(connection_id):
                 config = wechat_ingress.wechat_config(team_id)
                 query = request.query_params
@@ -95,9 +108,10 @@ async def wechat_callback(team_id: int, connection_id: str, request: Request, ba
                 body = wechat_ingress.parse_xml(await _body(request))
                 if body.get("Encrypt"):
                     raise HTTPException(400, "公众号 AES 回调尚未接入")
-                if config["original_id"] and body.get("ToUserName") != config["original_id"]:
+                if body.get("ToUserName") != config["original_id"]:
                     raise HTTPException(403, "公众号账号身份不匹配")
-                wechat_ingress.persist_callback(channel_type="wechat", team_id=team_id, body=body)
+                with _commit_account(item):
+                    wechat_ingress.persist_callback(channel_type="wechat", team_id=team_id, body=body)
     except wechat_ingress.WechatIngressError as exc:
         raise HTTPException(exc.status_code, str(exc)) from exc
     background_tasks.add_task(_sync, team_id, connection_id)
@@ -157,7 +171,8 @@ async def wecom_callback(team_id: int, connection_id: str, request: Request, bac
             agent = str(item["config"].get("agent_id") or "")
             if agent and str(body.get("AgentID") or "") != agent:
                 raise HTTPException(403, "企业微信回调应用不匹配")
-            wechat_ingress.persist_callback(channel_type="wework", team_id=team_id, body=body)
+            with _commit_account(item):
+                wechat_ingress.persist_callback(channel_type="wework", team_id=team_id, body=body)
     background_tasks.add_task(_sync, team_id, connection_id)
     return PlainTextResponse("success")
 
@@ -207,8 +222,11 @@ async def douyin_callback(team_id: int, connection_id: str, request: Request, ba
             if not own or own not in {sender, receiver}:
                 raise HTTPException(403, "抖音回调账号不匹配")
             if event == "unauthorize":
-                config_store.update_connection(connection_id, {"oauth_token": {}}, connected=False,
-                                               status="requires_reconnect", expected_version=item["version"])
+                try:
+                    config_store.update_connection(connection_id, {"oauth_token": {}}, connected=False,
+                                                   status="requires_reconnect", expected_version=item["version"])
+                except config_store.ConnectionUnavailable as exc:
+                    raise HTTPException(409, "账号授权已变化，请按当前账号重新核对撤销事件") from exc
                 return {"success": True, "data": {"revoked": True}}
             if event != "receive_msg" or receiver != own:
                 return {"success": True, "data": {"ignored": True}}
@@ -218,10 +236,11 @@ async def douyin_callback(team_id: int, connection_id: str, request: Request, ba
                              or payload.get("message_id") or request.headers.get("Msg-Id") or "")
             kind = str(content.get("message_type") or "unsupported")
             text = str(content.get("text") or content.get("title") or content.get("resource_url") or "")
-            mid = push_inbox("douyin", contact_id=sender, contact_name=sender, direction="inbound",
-                content=text, content_type="text" if kind == "text" else "unsupported",
-                msg_id="douyin:" + identifier if identifier else None,
-                metadata={"owner_open_id": own, "source": "verified_callback", "provider_message_id": identifier,
-                          "dedupe_available": bool(identifier), "event": event})
+            with _commit_account(item):
+                mid = push_inbox("douyin", contact_id=sender, contact_name=sender, direction="inbound",
+                    content=text, content_type="text" if kind == "text" else "unsupported",
+                    msg_id="douyin:" + identifier if identifier else None,
+                    metadata={"owner_open_id": own, "source": "verified_callback", "provider_message_id": identifier,
+                              "dedupe_available": bool(identifier), "event": event})
     background_tasks.add_task(_sync, team_id, connection_id)
     return {"success": True, "data": {"message_id": mid, "queued": True}}

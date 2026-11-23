@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 import sqlite3
+import time
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -247,19 +249,42 @@ def update_connection(connection_id: str, config: dict[str, Any] | None = None, 
             if len(json.dumps(merged, ensure_ascii=False)) > 65536:
                 raise ConnectionUnavailable("账号配置过大")
             encrypted = credential_vault.encrypt(merged, owner_id=row["owner_id"], connection_id=connection_id)
+        confirmed_token = (connected is True and expected_version is not None and not authorization_changed
+                           and row["channel_type"] in {"oauth2", "douyin"} and config is not None
+                           and isinstance(config.get("oauth_token"), dict)
+                           and bool(config["oauth_token"].get("access_token")))
         state = status or ("configured" if changed else row["status"])
         verified = bool(connected) if connected is not None else (False if changed else bool(row["connected"]))
         if connected is True and status is None:
             state = "authenticated"
         if authorization_changed:
             verified, state = False, "requires_reconnect"
+        if (not confirmed_token and state != "revoked"
+                and connection.execute("SELECT 1 FROM connection_refresh_leases WHERE connection_id=?",
+                                       (connection_id,)).fetchone()):
+            # Labels and delayed connection tests invalidate the in-flight
+            # version without confirming its new token. Never replay its old
+            # rotating secret after that result is rejected.
+            verified, state = False, "requires_reconnect"
+        if row["status"] in {"revoked", "requires_reconnect"} and connected is not True:
+            # A locked vault may prevent erasing tokens during disconnect. A
+            # later metadata edit/enable must not resurrect that old grant or
+            # retry a rotating refresh whose result is unknown.
+            verified, state = False, row["status"]
         if row["auth_type"] == "browser":
             verified, state = False, "executor_required"
+        if status == "revoked":
+            verified, state = False, "revoked"
         connection.execute("""UPDATE connections SET name=?,enabled=?,connected=?,status=?,config_enc=?,
             version=version+1,updated_at=? WHERE connection_id=? AND owner_id=?""",
             (row["name"] if name is None else name,
              row["enabled"] if enabled is None else int(enabled), int(verified), state, encrypted,
              _now(), connection_id, row["owner_id"]))
+        if verified and confirmed_token:
+            # A provider-confirmed credential write and its lease settlement are
+            # one commit. Process exit after this point must preserve the new
+            # token as confirmed. Metadata edits/connection tests cannot settle it.
+            connection.execute("DELETE FROM connection_refresh_leases WHERE connection_id=?", (connection_id,))
         return _result(_row(connection, connection_id))
 
 
@@ -276,12 +301,78 @@ def delete_connection(connection_id: str) -> bool:
     return True
 
 
-def require_active(connection_id: str, *, channel_type: str | None = None) -> dict[str, Any]:
-    item = get_connection(connection_id, include_secrets=True)
+def _check_active(item: Any, *, channel_type: str | None = None) -> None:
     if not item["enabled"]:
         raise ConnectionUnavailable("账号连接已停用")
     if channel_type is not None and item["channel_type"] != channel_type:
         raise PermissionError("账号连接与渠道不匹配")
-    if item["status"] in {"requires_reconnect", "executor_required", "revoked"}:
+    if (item["auth_type"] == "browser"
+            or item["status"] in {"requires_reconnect", "executor_required", "revoked", "deleted"}):
         raise ConnectionUnavailable("账号需要重新授权或配置执行器")
+
+
+@contextmanager
+def active_snapshot(connection_id: str, *, expected_version: int,
+                    channel_type: str | None = None) -> Iterator[None]:
+    """Fence a local commit against account changes and revocation across processes.
+
+    Callers must finish provider I/O before acquiring this existing SQLite write
+    lock. No credential values are exposed by the snapshot.
+    """
+    with database(write=True) as connection:
+        item = _row(connection, connection_id)
+        _check_active(item, channel_type=channel_type)
+        if item["version"] != expected_version:
+            raise ConnectionConflict("账号配置已变化，未提交旧账号操作")
+        yield
+
+
+def _uncertain_refresh(connection: sqlite3.Connection, connection_id: str, version: int) -> None:
+    connection.execute("""UPDATE connections SET connected=0,status='requires_reconnect',
+        version=version+1,updated_at=? WHERE connection_id=? AND owner_id=? AND version=?""",
+        (_now(), connection_id, resolve_team_id(required=True), version))
+
+
+@contextmanager
+def refresh_lease(connection_id: str, *, expected_version: int) -> Iterator[None]:
+    """Serialize rotating token exchanges without replay after a crash/cancellation."""
+    holder, now = secrets.token_hex(16), int(time.time())
+    abandoned = False
+    with database(write=True) as connection:
+        item = _row(connection, connection_id)
+        _check_active(item)
+        if item["version"] != expected_version:
+            raise ConnectionConflict("账号配置已变化，请重新读取授权")
+        previous = connection.execute("SELECT * FROM connection_refresh_leases WHERE connection_id=?",
+                                       (connection_id,)).fetchone()
+        if previous is not None:
+            if previous["expires_at"] > now:
+                raise ConnectionConflict("账号授权正在刷新，请稍后重试")
+            # The previous process may have rotated the secret before it died.
+            # Commit the blocked state instead of reusing its refresh token.
+            _uncertain_refresh(connection, connection_id, expected_version)
+            connection.execute("DELETE FROM connection_refresh_leases WHERE connection_id=?", (connection_id,))
+            abandoned = True
+        else:
+            connection.execute("INSERT INTO connection_refresh_leases VALUES (?,?,?)",
+                               (connection_id, holder, now + 120))
+    if abandoned:
+        raise ConnectionUnavailable("上次授权刷新结果不确定，请重新连接账号")
+    try:
+        yield
+    except BaseException:
+        # CancelledError is not an Exception. The provider may already have
+        # rotated its token, so cancellation is just as uncertain as a timeout.
+        with database(write=True) as connection:
+            _uncertain_refresh(connection, connection_id, expected_version)
+        raise
+    finally:
+        with database(write=True) as connection:
+            connection.execute("DELETE FROM connection_refresh_leases WHERE connection_id=? AND holder=?",
+                               (connection_id, holder))
+
+
+def require_active(connection_id: str, *, channel_type: str | None = None) -> dict[str, Any]:
+    item = get_connection(connection_id, include_secrets=True)
+    _check_active(item, channel_type=channel_type)
     return item

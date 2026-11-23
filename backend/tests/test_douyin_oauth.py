@@ -1,4 +1,5 @@
 """Official Douyin OAuth dialect; the real Authlib state URL and encrypted store."""
+import asyncio
 import json
 import time
 from urllib.parse import parse_qs, urlsplit
@@ -127,3 +128,36 @@ async def test_missing_permission_or_expired_refresh_blocks_before_provider_send
         adapter = ChannelRegistry().get("douyin", "dy")
         result = await adapter.send_message("visitor", "Hi")
         assert result["definitely_not_sent"] and result["delivery_state"] == "failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interruption", ["cancelled", "abandoned"])
+async def test_uncertain_refresh_is_not_replayed_after_restart_or_cancellation(tool_env, monkeypatch, interruption):
+    started = asyncio.Event()
+    calls = []
+    async def provider(request):
+        calls.append(request)
+        started.set()
+        await asyncio.Event().wait()
+    mock_http(monkeypatch, provider)
+    with tenant_scope(1):
+        config_store.create_connection("douyin", {"client_key": "client", "client_secret": "secret",
+            "external_account_id": "own", "oauth_token": {"access_token": "expired", "refresh_token": "once",
+            "expires_at": 1, "refresh_expires_at": int(time.time())+3600, "open_id": "own", "scope": "enterprise.im"}},
+            connection_id="dy", auth_type="oauth2")
+        with config_store.connection_scope("dy"):
+            if interruption == "abandoned":
+                with connection_store.database(write=True) as database:
+                    database.execute("INSERT INTO connection_refresh_leases VALUES(?,?,?)", ("dy", "dead-process", 1))
+                with pytest.raises(connection_store.ConnectionUnavailable):
+                    await douyin_channel.access_context(1)
+            else:
+                running = asyncio.create_task(douyin_channel.access_context(1))
+                await started.wait()
+                running.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await running
+            assert config_store.get_connection("dy")["status"] == "requires_reconnect"
+            with pytest.raises(connection_store.ConnectionUnavailable):
+                await douyin_channel.access_context(1)
+            assert len(calls) == (1 if interruption == "cancelled" else 0)

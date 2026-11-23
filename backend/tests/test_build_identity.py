@@ -4,10 +4,42 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tomllib
 
 import pytest
 
 from app import build_info
+
+
+def test_native_dependencies_and_release_versions_match():
+    """Catch cross-language bundle failures before native installer compilation."""
+    root = Path(__file__).resolve().parents[2]
+    desktop = root / "desktop"
+    package = json.loads((desktop / "package.json").read_text(encoding="utf-8"))
+    npm_lock = json.loads((desktop / "package-lock.json").read_text(encoding="utf-8"))["packages"]
+    cargo = tomllib.loads((desktop / "src-tauri/Cargo.toml").read_text(encoding="utf-8"))
+    cargo_lock = tomllib.loads((desktop / "src-tauri/Cargo.lock").read_text(encoding="utf-8"))["package"]
+
+    for js_name, rust_name in [("@tauri-apps/api", "tauri"), ("@tauri-apps/plugin-opener", "tauri-plugin-opener")]:
+        js_version = package["dependencies"][js_name]
+        assert js_version == npm_lock[""]["dependencies"][js_name]
+        assert js_version == npm_lock[f"node_modules/{js_name}"]["version"]
+        rust_requirement = cargo["dependencies"][rust_name]
+        if isinstance(rust_requirement, dict):
+            rust_requirement = rust_requirement["version"]
+        assert rust_requirement.startswith("="), f"Pin {rust_name} for reproducible candidate builds"
+        rust_version = rust_requirement[1:]
+        assert [entry["version"] for entry in cargo_lock if entry["name"] == rust_name] == [rust_version]
+        # Tauri requires the core API's minor, and each plugin's full version, to match.
+        # https://v2.tauri.app/develop/updating-dependencies/
+        parts = 2 if rust_name == "tauri" else 3
+        assert js_version.split(".")[:parts] == rust_version.split(".")[:parts], (
+            f"{js_name} {js_version} and {rust_name} {rust_version} are incompatible"
+        )
+
+    backend = tomllib.loads((root / "backend/pyproject.toml").read_text(encoding="utf-8"))
+    config = json.loads((desktop / "src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
+    assert package["version"] == cargo["package"]["version"] == config["version"] == backend["project"]["version"]
 
 
 def test_provenance_uses_clean_git_tree_and_rejects_dirty_source(tmp_path, monkeypatch):

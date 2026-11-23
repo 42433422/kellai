@@ -220,14 +220,9 @@ class ChatwootAdapter(ChannelAdapter):
         No network I/O occurs while the existing account write lock is held.
         Other processes can revoke before or after this commit, never mid-page.
         """
-        from app.services import connection_store
-        with connection_store.database(write=True) as accounts:
-            item = connection_store._row(accounts, config_store.current_connection_id())
-            if (not item["enabled"] or item["channel_type"] != self.channel_type
-                    or item["status"] in {"requires_reconnect", "executor_required", "revoked", "deleted"}):
-                raise config_store.ConnectionUnavailable("账号连接已停用或需要重新授权")
-            if item["version"] != self._configuration["version"]:
-                raise config_store.ConnectionConflict("账号配置已变化，未推进旧账号同步进度")
+        from app.services.connection_store import active_snapshot
+        with active_snapshot(config_store.current_connection_id(), expected_version=self._configuration["version"],
+                             channel_type=self.channel_type):
             yield
 
     async def _pull_inbox(self) -> None:

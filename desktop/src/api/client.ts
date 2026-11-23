@@ -1,4 +1,4 @@
-import axios, { type InternalAxiosRequestConfig } from 'axios';
+import axios, { type AxiosRequestConfig, type InternalAxiosRequestConfig } from 'axios';
 
 export interface ToolSession {
   access_token: string;
@@ -61,6 +61,9 @@ declare module 'axios' {
 }
 
 client.interceptors.request.use((config: InternalAxiosRequestConfig) => {
+  if (config.toolSessionRevision !== undefined && config.toolSessionRevision !== revision) {
+    throw new Error('连接已切换，未执行原连接的请求');
+  }
   if (!session) throw new Error('请先从 XCMAX 连接客来来');
   config.toolSessionRevision = revision;
   config.headers.Authorization = `Bearer ${session.access_token}`;
@@ -89,9 +92,26 @@ export async function beginHandoff() {
 }
 
 export async function request<T>(method: 'get' | 'post' | 'patch' | 'delete', path: string, data?: unknown): Promise<T> {
-  const response = await client.request({ method, url: `/api/kellai${path}`, data });
+  // Bind when the operation is created, before Axios schedules its interceptor.
+  const config: AxiosRequestConfig & { toolSessionRevision: number } = {
+    method, url: `/api/kellai${path}`, data, toolSessionRevision: revision,
+  };
+  const response = await client.request(config);
   if (response.data?.success !== true) throw new Error(response.data?.error || '工具请求未完成');
   return response.data.data as T;
+}
+
+export async function lockTool() {
+  const originalRevision = revision;
+  try {
+    await request('post', '/auth/lock', {});
+  } catch {
+    throw new Error(originalRevision !== revision && session
+      ? '连接已切换，原会话撤销未确认；原会话最迟在原定到期时间失效'
+      : '工具已在本机锁定，但服务端会话撤销未确认；原会话最迟在原定到期时间失效');
+  } finally {
+    if (originalRevision === revision) setToolSession(null);
+  }
 }
 
 export function errorMessage(error: unknown): string {

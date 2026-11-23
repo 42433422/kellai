@@ -162,3 +162,100 @@ async def test_ingest_failure_replays_durably_without_second_message_or_business
         contact = message_store.list_contacts()[0]
         assert len(message_store.get_messages(contact["customer_id"], connection_id="inbox")) == 2
         assert message_store.list_inbox(connection_id="inbox") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["revoke", "credentials", "delete"])
+async def test_account_change_after_receive_cannot_commit_or_consume_old_batch(tool_env, monkeypatch, change):
+    with tenant_scope(1):
+        config_store.create_connection("telegram", {"bot_token": "original"}, connection_id="inbox")
+        with config_store.connection_scope("inbox"):
+            message_store.push_inbox("telegram", contact_id="visitor", direction="inbound", content="pending", msg_id="pending")
+        adapter = ChannelRegistry().get("telegram", "inbox")
+        receive = adapter._adapter.receive_messages
+
+        async def changed_after_read(**kwargs):
+            messages = await receive(**kwargs)
+            if change == "delete":
+                config_store.delete_connection("inbox")
+            else:
+                config_store.update_connection("inbox", {"bot_token": "replacement"} if change == "credentials" else None,
+                                               enabled=False if change == "revoke" else None)
+            return messages
+
+        monkeypatch.setattr(adapter._adapter, "receive_messages", changed_after_read)
+        with pytest.raises(config_store.ConnectionUnavailable):
+            await sync_inbox(connection_id="inbox")
+        assert message_store.list_contacts() == []
+        assert len(message_store.list_inbox(connection_id="inbox")) == 1
+
+
+@pytest.mark.asyncio
+async def test_inbox_batch_commit_is_serialized_with_concurrent_revocation(tool_env, monkeypatch):
+    import contextvars
+    import threading
+
+    attempted, revoked = threading.Event(), threading.Event()
+    threads, errors = [], []
+    with tenant_scope(1):
+        config_store.create_connection("telegram", {"bot_token": "original"}, connection_id="inbox")
+        with config_store.connection_scope("inbox"):
+            for mid in ("first", "second"):
+                message_store.push_inbox("telegram", contact_id="visitor", direction="inbound", content=mid, msg_id=mid)
+        save = message_store.save_message
+
+        def revoke():
+            attempted.set()
+            try:
+                config_store.update_connection("inbox", enabled=False)
+                revoked.set()
+            except Exception as error:
+                errors.append(error)
+
+        def interleave(message):
+            result = save(message)
+            if message.id == "first":
+                thread = threading.Thread(target=contextvars.copy_context().run, args=(revoke,))
+                threads.append(thread)
+                thread.start()
+                assert attempted.wait(1)
+                assert not revoked.is_set(), "Revocation committed inside the old account batch"
+            return result
+
+        monkeypatch.setattr(message_store, "save_message", interleave)
+        result = await sync_inbox(connection_id="inbox")
+        for thread in threads:
+            thread.join(timeout=3)
+            assert not thread.is_alive()
+        assert not errors and revoked.is_set()
+        assert result["data"]["synced"] == result["data"]["consumed"] == 2
+        assert message_store.list_inbox(connection_id="inbox") == []
+        assert not (await sync_inbox(connection_id="inbox"))["success"]
+
+
+@pytest.mark.asyncio
+async def test_wechat_requires_explicit_original_account_and_preserves_original_text(tool_env):
+    from app.services import wechat_ingress
+
+    content = "  Original inbound\n"
+    with tenant_scope(1):
+        assert "official_original_id" in config_store.config_schema("wechat")["properties"]
+        config_store.create_connection("wechat", {"webhook_token": "mp-token"}, connection_id="mp")
+        with config_store.connection_scope("mp"):
+            with pytest.raises(wechat_ingress.WechatIngressError, match="official_original_id"):
+                wechat_ingress.wechat_config(1)
+        # Existing deployments can keep the documented legacy field alias.
+        config_store.update_connection("mp", {"original_id": "gh_one"})
+    stamp, nonce = str(int(time.time())), "nonce"
+    query = {"timestamp": stamp, "nonce": nonce,
+             "signature": hashlib.sha1("".join(sorted(["mp-token", stamp, nonce])).encode()).hexdigest()}
+    xml = ("<xml><ToUserName>gh_one</ToUserName><FromUserName>openid</FromUserName><MsgType>text</MsgType>"
+           "<MsgId>83</MsgId><CreateTime>1760000000</CreateTime><Content><![CDATA["+content+"]]></Content></xml>")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://callback.example") as client:
+        path = "/api/kellai/webhook/wechat/1/mp"
+        for _ in range(2):
+            assert (await client.post(path, params=query, content=xml)).status_code == 200
+    with tenant_scope(1):
+        contact = message_store.list_contacts()[0]
+        messages = message_store.get_messages(contact["customer_id"], connection_id="mp")
+        assert len(messages) == 1 and messages[0].content == content

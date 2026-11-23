@@ -25,6 +25,18 @@ def local_headers():
     return {"Authorization": "Bearer " + auth.create_operator_session()["access_token"]}
 
 
+@pytest.mark.asyncio
+async def test_lock_revokes_original_operator_session_but_preserves_other_session_and_grant(tool_env):
+    first, second = local_headers(), local_headers()
+    host = grant()
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8793") as client:
+        assert (await client.post(PREFIX + "/auth/lock", headers=first)).status_code == 200
+        assert (await client.get(PREFIX + "/accounts", headers=first)).status_code == 401
+        assert (await client.post(PREFIX + "/auth/lock", headers=first)).status_code == 401
+        assert (await client.get(PREFIX + "/accounts", headers=second)).status_code == 200
+        assert (await client.get(GATEWAY + "/grant-status", headers=host)).status_code == 200
+
+
 def grant(scopes=None, *, version=2):
     token = "host-test-token-with-enough-entropy"
     xcmax_integration._write({"version": version, "connection": {

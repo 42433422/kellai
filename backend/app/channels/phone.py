@@ -128,8 +128,7 @@ class PhoneAdapter(ChannelAdapter):
         """发送短信到 contact_id（手机号）。"""
         if not self._is_configured():
             return {"success": False, "message_id": "", "error": _UNCONFIGURED_MSG, "delivery_state": "failed", "definitely_not_sent": True}
-        content = (content or "").strip()
-        if not content and self._provider == "twilio":
+        if not (content or "").strip() and self._provider == "twilio":
             return {"success": False, "message_id": "", "error": "消息内容为空", "delivery_state": "failed", "definitely_not_sent": True}
         if not contact_id:
             return {"success": False, "message_id": "", "error": "contact_id (手机号) 不能为空", "delivery_state": "failed", "definitely_not_sent": True}

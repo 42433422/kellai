@@ -5,7 +5,7 @@ import validator from '@rjsf/validator-ajv8';
 import type { RJSFSchema, UiSchema } from '@rjsf/utils';
 import { ArrowUpRight, Cable, Check, CircleHelp, KeyRound, Mail, Plus, RefreshCw, ShieldCheck, Unplug, X } from 'lucide-react';
 import toast from 'react-hot-toast';
-import { beginHandoff, currentAccountKey, errorMessage, getSession, request, setToolSession, subscribeSession } from './api/client';
+import { beginHandoff, currentAccountKey, errorMessage, getSession, lockTool, request, subscribeSession } from './api/client';
 import { receiptLabel, receiptState, scopeLabels, type Account, type Channel, type Contact, type Message, type PairStatus, type PendingPairing, type Receipt } from './types';
 
 async function openExternal(url: string) {
@@ -78,7 +78,7 @@ function Accounts() {
   const namespace = currentAccountKey();
   const accounts = useQuery({ queryKey: ['accounts', namespace], queryFn: () => request<Account[]>('get', '/accounts') });
   const channels = useQuery({ queryKey: ['channels', namespace], queryFn: () => request<Channel[]>('get', '/channels') });
-  const operation = useMutation({ mutationFn: async ({ account, action }: { account: Account; action: 'test' | 'toggle' | 'delete' | 'oauth' }) => {
+  const operation = useMutation({ mutationFn: async ({ account, action }: { account: Account; action: 'test' | 'toggle' | 'delete' | 'oauth' | 'revoke' }) => {
     const path = `/accounts/${encodeURIComponent(account.connection_id)}`;
     if (action === 'test') {
       const result = await request<{ connected: boolean; message: string }>('post', `${path}/test`, {});
@@ -87,6 +87,10 @@ function Accounts() {
     }
     if (action === 'toggle') { await request('patch', path, { enabled: !account.enabled, expected_version: account.version }); return account.enabled ? '连接已停用' : '连接已启用'; }
     if (action === 'delete') { await request('delete', path); return '连接已移除'; }
+    if (action === 'revoke') {
+      const result = await request<{ provider_revoked: boolean }>('post', `${path}/disconnect`, {});
+      return result.provider_revoked ? '本机及平台授权已撤销' : '本机授权已撤销，平台端撤销尚未确认';
+    }
     const result = await request<{ authorization_url: string }>('post', `${path}/oauth/start`, {});
     await openExternal(result.authorization_url);
     return '请在浏览器完成授权，然后刷新账号状态';
@@ -104,7 +108,7 @@ function Accounts() {
         <div className="capabilities"><span>接收：{channel?.capabilities?.receive ? '已实现' : '未开放'}</span><span>发送：{channel?.capabilities?.send ? '已实现' : '未开放'}</span></div>
         {channel?.capabilities?.limitations?.slice(0, 2).map((line) => <p className="limitation" key={line}>{line}</p>)}
         <div className="actions card-actions"><button onClick={() => setEditor(account)}>编辑</button><button disabled={operation.isPending || !account.enabled} onClick={() => operation.mutate({ account, action: 'test' })}>验证连接</button>
-          {account.auth_type === 'oauth2' && <button disabled={operation.isPending || !account.enabled} onClick={() => operation.mutate({ account, action: 'oauth' })}>登录授权<ArrowUpRight size={14} /></button>}
+          {(account.auth_type === 'oauth2' || account.channel_type === 'douyin') && <><button disabled={operation.isPending || !account.enabled} onClick={() => operation.mutate({ account, action: 'oauth' })}>登录授权<ArrowUpRight size={14} /></button><button className="danger" disabled={operation.isPending} onClick={() => { if (window.confirm(`撤销“${account.name}”的账号授权？重新使用需要再次授权。`)) operation.mutate({ account, action: 'revoke' }); }}>撤销账号授权</button></>}
           <button disabled={operation.isPending} onClick={() => operation.mutate({ account, action: 'toggle' })}>{account.enabled ? '停用' : '启用'}</button>
           <button className="danger" disabled={operation.isPending} onClick={() => { if (window.confirm(`移除“${account.name}”的连接凭据？已有统一聊天会保留。`)) operation.mutate({ account, action: 'delete' }); }}>移除</button>
         </div>
@@ -206,6 +210,7 @@ export default function App() {
   const cache = useQueryClient();
   const [tab, setTab] = useState<'accounts' | 'traffic' | 'pairing'>('accounts');
   const handoff = useMutation({ mutationFn: beginHandoff, onSuccess: () => setTab('pairing') });
+  const lock = useMutation({ mutationFn: lockTool, onError: (error) => toast.error(errorMessage(error)) });
   useEffect(() => subscribeSession(() => cache.clear()), [cache]);
   const openHost = async () => {
     try {
@@ -218,5 +223,5 @@ export default function App() {
     <button className={tab === 'accounts' ? 'active' : ''} onClick={() => setTab('accounts')}><KeyRound size={18} />账号连接</button>
     <button className={tab === 'traffic' ? 'active' : ''} onClick={() => setTab('traffic')}><Mail size={18} />统一聊天</button>
     <button className={tab === 'pairing' ? 'active' : ''} onClick={() => setTab('pairing')}><ShieldCheck size={18} />XCMAX 授权</button>
-  </nav><div className="sidebar-bottom"><span><CircleHelp size={16} />业务处理在 XCMAX 中完成</span><button onClick={() => setToolSession(null)}>锁定工具</button></div></aside><main className="workspace"><header className="workspace-header"><span>本机工作区 {session.user.team_id}</span><button onClick={() => void openHost()}>打开 XCMAX<ArrowUpRight size={15} /></button></header>{tab === 'accounts' ? <Accounts /> : tab === 'traffic' ? <Traffic /> : <Pairing />}</main></div>;
+  </nav><div className="sidebar-bottom"><span><CircleHelp size={16} />业务处理在 XCMAX 中完成</span><button disabled={lock.isPending} onClick={() => lock.mutate()}>锁定工具</button></div></aside><main className="workspace"><header className="workspace-header"><span>本机工作区 {session.user.team_id}</span><button onClick={() => void openHost()}>打开 XCMAX<ArrowUpRight size={15} /></button></header>{tab === 'accounts' ? <Accounts /> : tab === 'traffic' ? <Traffic /> : <Pairing />}</main></div>;
 }

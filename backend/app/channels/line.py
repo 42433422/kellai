@@ -76,9 +76,14 @@ class LineAdapter(ChannelAdapter):
             body = checked_json(resp)
             if "message" in body:
                 return send_error("LINE 拒绝请求", definitely_not_sent=True)
-            messages = body.get("sentMessages", [])
-            message_id = str(messages[0].get("id", "")) if messages else ""
-            return {"success": True, "message_id": message_id, "delivery_state": "accepted", "error": ""}
+            messages = body.get("sentMessages")
+            if not isinstance(messages, list) or len(messages) != 1 or not isinstance(messages[0], dict):
+                return send_error("LINE 未返回唯一消息凭据，发送结果未知")
+            message_id = messages[0].get("id")
+            if not ((type(message_id) is int and message_id > 0)
+                    or (isinstance(message_id, str) and message_id.strip())):
+                return send_error("LINE 未返回有效消息编号，发送结果未知")
+            return {"success": True, "message_id": str(message_id), "delivery_state": "accepted", "error": ""}
 
         except Exception as exc:
             logger.warning("LINE send_message 异常: %s", type(exc).__name__)

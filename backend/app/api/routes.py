@@ -64,6 +64,14 @@ def auth_xcmax_desktop(request: Request):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+@router.post("/auth/lock")
+def lock_tool(request: Request):
+    from app.services.auth import revoke_session
+    request_actor(request, manage=True)
+    revoke_session(_require_xcmax_loopback(request))
+    return {"success": True, "data": {"session_revoked": True}}
+
+
 @router.get("/integrations/xcmax/status")
 def xcmax_integration_status(request: Request):
     from app.services.xcmax_integration import public_status

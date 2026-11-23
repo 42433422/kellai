@@ -191,8 +191,35 @@ with tenant_scope(1):
     page.get_by_role("button", name="查询回执", exact=True).click()
     expect(page.locator(".receipt dd").nth(0)).to_have_text("结果待核验，请查询原请求")
     page.set_viewport_size({"width": 1280, "height": 900})
+
+    # Generate a real OAuth URL without navigating to a live provider account.
+    page.get_by_role("button", name="账号连接", exact=True).click()
+    page.get_by_role("button", name="添加账号", exact=True).click()
+    dialog = page.get_by_role("dialog")
+    dialog.get_by_label("平台", exact=True).select_option("douyin")
+    dialog.locator("#root_name").fill("抖音授权流程")
+    dialog.locator("#root_config_client_key").fill("isolated-client")
+    dialog.locator("#root_config_client_secret").fill("isolated-secret")
+    dialog.get_by_role("button", name="保存连接").click()
+    card = page.locator("article.card").filter(has=page.get_by_role("heading", name="抖音授权流程"))
+    expect(card.get_by_role("button", name="登录授权")).to_be_visible()
+    page.context.route("https://open.douyin.com/**", lambda route: route.fulfill(body="Isolated authorization page"))
+    with page.expect_popup() as opened:
+        card.get_by_role("button", name="登录授权").click()
+    popup = opened.value
+    popup.wait_for_load_state()
+    assert popup.url.startswith("https://open.douyin.com/")
+    popup.close()
+    page.once("dialog", lambda dialog: dialog.accept())
+    card.get_by_role("button", name="撤销账号授权", exact=True).click()
+    expect(card.locator(".badge")).to_have_text("已停用")
+    expect(card.get_by_role("button", name="登录授权")).to_be_disabled()
+
+    original = page.evaluate("JSON.parse(sessionStorage.getItem('kellai:tool-session:v2')).access_token")
     page.get_by_role("button", name="锁定工具", exact=True).click()
     expect(page.get_by_role("heading", name="从 XCMAX 连接")).to_be_visible()
+    assert page.request.get("http://127.0.0.1:8793/api/kellai/accounts", headers={
+        "Authorization": "Bearer " + original}).status == 401
 
 
 server = ThreadingHTTPServer(("127.0.0.1", 17599), Host)
@@ -239,7 +266,8 @@ with tempfile.TemporaryDirectory(prefix="kellai-ui-") as data:
                     context.tracing.stop(path=ARTIFACTS / "trace.zip")
                     browser.close()
                 print("PASS: local handoff, subset scope, two account forms, masked secrets, isolated inbox sync/dedupe, "
-                      "unknown/read receipts, narrow layout, host revocation, retained history and lock; no sends or page errors")
+                      "unknown/read receipts, narrow layout, host revocation, retained history, Douyin authorization entry/revocation "
+                      "and server session lock; no sends or page errors")
         finally:
             stop(frontend)
             stop(backend)

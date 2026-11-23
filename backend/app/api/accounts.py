@@ -39,6 +39,21 @@ def _actor(request: Request, *, manage: bool = False):
     return request_actor(request, manage=manage)
 
 
+def _editable_config(config: dict[str, Any] | None, account: dict | None = None):
+    if config is None:
+        return None
+    saved = account["config"] if account else {}
+    editable = dict(config)
+    for key, value in config.items():
+        if key.startswith("oauth_") or key in {"external_account_id", "account_name"}:
+            # The editor may echo public metadata and masks, but only a verified
+            # provider callback/refresh may install authorization or its identity.
+            if key not in saved or value != saved[key]:
+                raise HTTPException(400, "账号授权与身份字段只能由平台授权流程更新")
+            editable.pop(key)
+    return editable
+
+
 @contextmanager
 def _errors():
     try:
@@ -71,11 +86,12 @@ def create_account(body: CreateAccount, request: Request):
     _actor(request, manage=True)
     with _errors():
         kind = config_store._canonical(body.channel_type)
-        if kind not in {row["channel_type"] for row in ChannelRegistry().list_channels()}:
+        channel = next((row for row in ChannelRegistry().list_channels() if row["channel_type"] == kind), None)
+        if channel is None:
             raise HTTPException(400, "不支持的渠道类型")
-        if kind == "oauth2" and body.auth_type != "oauth2":
-            raise HTTPException(400, "OAuth 账号必须使用 oauth2 授权方式")
-        item = config_store.create_connection(kind, body.config, name=body.name,
+        if body.auth_type not in channel["auth_types"]:
+            raise HTTPException(400, "该渠道不支持所选账号授权方式")
+        item = config_store.create_connection(kind, _editable_config(body.config), name=body.name,
                                                auth_type=body.auth_type, enabled=body.enabled)
         return {"success": True, "data": item}
 
@@ -111,6 +127,8 @@ async def update_account(connection_id: str, body: UpdateAccount, request: Reque
     _actor(request, manage=True)
     with _errors():
         fields = body.model_dump(exclude_unset=True)
+        if fields.get("config") is not None:
+            fields["config"] = _editable_config(fields["config"], config_store.get_connection(connection_id))
         item = config_store.update_connection(connection_id, **fields)
         await ChannelRegistry().invalidate(connection_id=connection_id)
         return {"success": True, "data": item}
@@ -124,7 +142,7 @@ async def delete_account(connection_id: str, request: Request):
         result = {"deleted": True}
         if item["status"] == "deleted":
             return {"success": True, "data": result}
-        if item["channel_type"] == "oauth2":
+        if item["channel_type"] in {"oauth2", "douyin"}:
             result.update(await oauth_client.disconnect(connection_id))
         config_store.delete_connection(connection_id)
         await ChannelRegistry().invalidate(connection_id=connection_id)
@@ -159,6 +177,8 @@ async def test_account(connection_id: str, request: Request):
             raise config_store.ConnectionConflict("测试期间账号配置发生变化，请重新测试")
         account = config_store.update_connection(connection_id, connected=result["connected"],
                                                  expected_version=current["version"])
+        if result["connected"] and not account["connected"]:
+            raise config_store.ConnectionConflict("验证期间账号授权发生变化，请重新连接")
         result["account"] = account
         await ChannelRegistry().invalidate(connection_id=connection_id)
         return {"success": True, "data": result}
@@ -188,7 +208,7 @@ async def disconnect_account(connection_id: str, request: Request):
     _actor(request, manage=True)
     with _errors():
         item = config_store.get_connection(connection_id)
-        if item["channel_type"] == "oauth2":
+        if item["channel_type"] in {"oauth2", "douyin"}:
             result = await oauth_client.disconnect(connection_id)
         else:
             config_store.update_connection(connection_id, enabled=False, connected=False, status="revoked",

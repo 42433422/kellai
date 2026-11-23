@@ -97,6 +97,60 @@ test('unlocked operator is required before any account operation', async () => {
   await assert.rejects(api.request('get', '/accounts'), /请先从 XCMAX/);
 });
 
+test('lock revokes the current server session once before discarding its token', async () => {
+  const calls = [];
+  api.default.defaults.adapter = async (config) => {
+    calls.push([config.method, config.url, config.headers.Authorization]);
+    return ok(config, { success: true, data: { session_revoked: true } });
+  };
+  await api.lockTool();
+  assert.deepEqual(calls, [['post', '/api/kellai/auth/lock', 'Bearer operator-7']]);
+  assert.equal(api.getSession(), null);
+  assert.equal(sessionStorage.getItem('kellai:tool-session:v2'), null);
+});
+
+test('failed lock clears local access without replaying or claiming remote revocation', async () => {
+  let calls = 0;
+  api.default.defaults.adapter = async () => { calls++; throw new Error('offline'); };
+  await assert.rejects(api.lockTool(), /服务端会话撤销未确认/);
+  assert.equal(calls, 1);
+  assert.equal(api.getSession(), null);
+});
+
+test('same-tick account replacement rejects the old operation before transport', async () => {
+  let calls = 0;
+  api.default.defaults.adapter = async (config) => { calls++; return ok(config); };
+  const saving = api.request('patch', '/accounts/original-account', { name: 'original change' });
+  const rejected = assert.rejects(saving, /未执行原连接的请求/);
+  api.setToolSession(session(8));
+  await rejected;
+  assert.equal(calls, 0);
+});
+
+test('same-tick re-pairing cannot redirect a lock to the new session', async () => {
+  let calls = 0;
+  api.default.defaults.adapter = async (config) => { calls++; return ok(config); };
+  const locking = api.lockTool();
+  const rejected = assert.rejects(locking, /连接已切换，原会话撤销未确认/);
+  api.setToolSession(session(8));
+  await rejected;
+  assert.equal(calls, 0);
+  assert.equal(api.getSession().access_token, 'operator-8');
+});
+
+test('late lock completion cannot clear a newly paired operator', async () => {
+  const pending = deferred(), started = deferred();
+  let original;
+  api.default.defaults.adapter = (config) => { original = config; started.resolve(); return pending.promise; };
+  const locking = api.lockTool();
+  const rejected = assert.rejects(locking, /原会话撤销未确认/);
+  await started.promise;
+  api.setToolSession(session(8));
+  pending.resolve(ok(original, { success: true, data: { session_revoked: true } }));
+  await rejected;
+  assert.equal(api.getSession().access_token, 'operator-8');
+});
+
 test('application failures are shown even when transport returned HTTP 200', async () => {
   api.default.defaults.adapter = async (config) => ok(config, { success: false, error: '账号已停用' });
   await assert.rejects(api.request('post', '/accounts/a/test', {}), /账号已停用/);

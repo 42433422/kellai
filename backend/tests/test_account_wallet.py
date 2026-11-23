@@ -3,7 +3,10 @@ import asyncio
 import base64
 import hashlib
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 import time
 from urllib.parse import parse_qs, urlsplit
 
@@ -454,3 +457,279 @@ async def test_identity_check_does_not_send_old_token_to_changed_provider(wallet
         with pytest.raises(store.ConnectionConflict):
             await oauth_client.OAuthAccountAdapter().test_connection()
     assert calls == []
+
+
+@pytest.mark.parametrize("channel_type,auth_type", [("oauth2", "oauth2"), ("douyin", "oauth2")])
+def test_account_api_cannot_install_or_replace_provider_authorization(wallet, channel_type, auth_type):
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.services.auth import create_operator_session
+    client = TestClient(app, base_url="http://127.0.0.1:8793")
+    headers = {"Authorization": "Bearer " + create_operator_session()["access_token"]}
+    base = {"provider": "github", "client_id": "client"} if channel_type == "oauth2" else {
+        "client_key": "client", "client_secret": "secret"}
+    fake = {"access_token": "caller-supplied-token", "scope": "enterprise.im", "open_id": "other"}
+    rejected = client.post("/api/kellai/accounts", headers=headers, json={
+        "channel_type": channel_type, "auth_type": auth_type,
+        "config": {**base, "oauth_token": fake, "external_account_id": "other"}})
+    assert rejected.status_code == 400
+    created = config_store.create_connection(channel_type, base, auth_type=auth_type)
+    identifier = created["connection_id"]
+    verified = store.update_connection(identifier, {"oauth_token": {"access_token": "original-secret"},
+        "external_account_id": "original", "account_name": "Original"}, connected=True)
+    for forged in ({"oauth_token": fake}, {"external_account_id": "other"}, {"account_name": "Forged"}):
+        response = client.patch(f"/api/kellai/accounts/{identifier}", headers=headers,
+            json={"expected_version": verified["version"], "config": forged})
+        assert response.status_code == 400
+    unchanged = store.get_connection(identifier, include_secrets=True)
+    assert unchanged["version"] == verified["version"]
+    assert unchanged["config"]["external_account_id"] == "original"
+    assert unchanged["config"]["oauth_token"]["access_token"] == "original-secret"
+    # The editor round-trips public metadata and secret masks; those are no-ops.
+    edited = client.patch(f"/api/kellai/accounts/{identifier}", headers=headers, json={
+        "expected_version": verified["version"], "config": verified["config"], "name": "Renamed"})
+    assert edited.status_code == 200, edited.text
+    assert "original-secret" not in edited.text
+    assert store.get_connection(identifier, include_secrets=True)["config"]["oauth_token"]["access_token"] == "original-secret"
+
+
+def test_account_api_rejects_auth_types_outside_channel_contract(wallet):
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.services.auth import create_operator_session
+    client = TestClient(app, base_url="http://127.0.0.1:8793")
+    headers = {"Authorization": "Bearer " + create_operator_session()["access_token"]}
+    result = client.post("/api/kellai/accounts", headers=headers, json={
+        "channel_type": "telegram", "auth_type": "oauth2", "config": {"bot_token": "secret"}})
+    assert result.status_code == 400
+    assert store.list_connections() == []
+
+
+def test_douyin_disconnect_erases_old_authorization_and_preserves_identity(wallet):
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.services.auth import create_operator_session
+    client = TestClient(app, base_url="http://127.0.0.1:8793")
+    headers = {"Authorization": "Bearer " + create_operator_session()["access_token"]}
+    item = store.create_connection("douyin", {"client_key": "client", "client_secret": "secret",
+        "external_account_id": "original", "oauth_token": {"access_token": "old-secret",
+        "refresh_token": "old-refresh", "open_id": "original", "scope": "enterprise.im"}}, auth_type="oauth2")
+    identifier = item["connection_id"]
+    response = client.post(f"/api/kellai/accounts/{identifier}/disconnect", headers=headers)
+    assert response.status_code == 200, response.text
+    disconnected = store.get_connection(identifier, include_secrets=True)
+    assert disconnected["config"]["oauth_token"] == {}
+    assert disconnected["config"]["external_account_id"] == "original"
+    assert not disconnected["enabled"] and not disconnected["connected"]
+    # Editing and enabling cannot bring a revoked platform token back.
+    edited = client.patch(f"/api/kellai/accounts/{identifier}", headers=headers,
+        json={"expected_version": disconnected["version"], "enabled": True, "config": {"scope": "enterprise.im"}})
+    assert edited.status_code == 200, edited.text
+    assert store.get_connection(identifier, include_secrets=True)["config"]["oauth_token"] == {}
+
+
+@pytest.mark.asyncio
+async def test_cancelled_refresh_requires_reconnect_before_reusing_rotating_secret(wallet, monkeypatch):
+    started = asyncio.Event()
+    calls = []
+    async def provider(request):
+        calls.append(request)
+        started.set()
+        await asyncio.Event().wait()
+    oauth_transport(monkeypatch, provider)
+    item = oauth_account()
+    identifier = item["connection_id"]
+    store.update_connection(identifier, {"oauth_token": {"access_token": "old", "refresh_token": "rotating",
+        "expires_at": 1, "token_type": "Bearer"}}, connected=True)
+    first = asyncio.create_task(oauth_client.active_token(identifier))
+    await started.wait()
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    record = store.get_connection(identifier)
+    assert record["status"] == "requires_reconnect" and not record["connected"]
+    store.update_connection(identifier, {"public_label": "changed"}, enabled=True)
+    with pytest.raises(store.ConnectionUnavailable):
+        await oauth_client.active_token(identifier)
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_abandoned_refresh_lease_never_replays_rotating_secret(wallet, monkeypatch):
+    async def forbidden(request):
+        pytest.fail("An abandoned refresh exchange cannot safely reuse the old rotating token")
+    oauth_transport(monkeypatch, forbidden)
+    item = oauth_account()
+    identifier = item["connection_id"]
+    store.update_connection(identifier, {"oauth_token": {"access_token": "old", "refresh_token": "rotating",
+        "expires_at": 1, "token_type": "Bearer"}}, connected=True)
+    with store.database(write=True) as database:
+        database.execute("INSERT INTO connection_refresh_leases VALUES (?,?,?)", (identifier, "crashed-worker", 1))
+    with pytest.raises(store.ConnectionUnavailable):
+        await oauth_client.active_token(identifier)
+    assert store.get_connection(identifier)["status"] == "requires_reconnect"
+    with store.database() as database:
+        assert database.execute("SELECT COUNT(*) FROM connection_refresh_leases").fetchone()[0] == 0
+
+
+def test_locked_vault_revocation_cannot_be_undone_by_editing_metadata(wallet, monkeypatch):
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.services.auth import create_operator_session
+    key = os.environ["KELLAI_VAULT_KEY"]
+    item = config_store.create_connection("douyin", {"client_key": "client", "client_secret": "secret",
+        "external_account_id": "original", "oauth_token": {"access_token": "old-secret",
+        "open_id": "original", "scope": "enterprise.im"}}, auth_type="oauth2")
+    identifier = item["connection_id"]
+    client = TestClient(app, base_url="http://127.0.0.1:8793")
+    headers = {"Authorization": "Bearer " + create_operator_session()["access_token"]}
+    monkeypatch.setenv("KELLAI_VAULT_KEY", Fernet.generate_key().decode())
+    assert client.post(f"/api/kellai/accounts/{identifier}/disconnect", headers=headers).status_code == 200
+    monkeypatch.setenv("KELLAI_VAULT_KEY", key)
+    disabled = store.get_connection(identifier)
+    result = client.patch(f"/api/kellai/accounts/{identifier}", headers=headers, json={
+        "expected_version": disabled["version"], "enabled": True, "config": {"public_label": "edited"}})
+    assert result.status_code == 200, result.text
+    with pytest.raises(store.ConnectionUnavailable):
+        store.require_active(identifier)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["rename", "disconnect", "reauthorize"])
+async def test_refresh_cannot_overwrite_concurrent_account_changes(wallet, monkeypatch, change):
+    started, release = asyncio.Event(), asyncio.Event()
+    calls = []
+    async def provider(request):
+        calls.append(request)
+        started.set()
+        await release.wait()
+        return httpx2.Response(200, json={"access_token": "late-access", "refresh_token": "late-refresh",
+            "expires_in": 3600, "token_type": "Bearer"})
+    oauth_transport(monkeypatch, provider)
+    item = oauth_account()
+    identifier = item["connection_id"]
+    store.update_connection(identifier, {"oauth_token": {"access_token": "old", "refresh_token": "rotating",
+        "expires_at": 1, "token_type": "Bearer"}}, connected=True)
+    running = asyncio.create_task(oauth_client.active_token(identifier))
+    await started.wait()
+    if change == "disconnect":
+        await oauth_client.disconnect(identifier)
+    elif change == "reauthorize":
+        store.update_connection(identifier, {"oauth_token": {"access_token": "new-grant", "expires_at": time.time()+3600}},
+                                connected=True, expected_version=store.get_connection(identifier)["version"])
+    else:
+        store.update_connection(identifier, name="Renamed during refresh")
+    release.set()
+    with pytest.raises(store.ConnectionConflict):
+        await running
+    current = store.get_connection(identifier, include_secrets=True)
+    assert current["config"].get("oauth_token", {}).get("access_token") != "late-access"
+    if change == "reauthorize":
+        assert (await oauth_client.active_token(identifier))["access_token"] == "new-grant"
+    else:
+        with pytest.raises(store.ConnectionUnavailable):
+            await oauth_client.active_token(identifier)
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_confirmed_refresh_commit_survives_process_exit_before_lease_cleanup(wallet, monkeypatch):
+    item = oauth_account()
+    identifier = item["connection_id"]
+    store.update_connection(identifier, {"oauth_token": {"access_token": "expired", "refresh_token": "previous",
+        "expires_at": 1, "token_type": "Bearer"}}, connected=True)
+    result = subprocess.run([sys.executable, "-c", """
+import os
+import sys
+from app.services import connection_store as store
+from app.services.tenant_context import tenant_scope
+with tenant_scope(1):
+    item = store.get_connection(sys.argv[1])
+    with store.refresh_lease(sys.argv[1], expected_version=item["version"]):
+        store.update_connection(sys.argv[1], {"oauth_token": {"access_token": "committed-access",
+            "refresh_token": "committed-refresh", "expires_at": 1, "token_type": "Bearer"}},
+            connected=True, expected_version=item["version"])
+        os._exit(23)
+""", identifier], check=False, capture_output=True, timeout=10)
+    assert result.returncode == 23, result.stderr.decode()
+    assert store.get_connection(identifier, include_secrets=True)["config"]["oauth_token"]["refresh_token"] == "committed-refresh"
+    with store.database() as database:
+        assert database.execute("SELECT COUNT(*) FROM connection_refresh_leases").fetchone()[0] == 0
+    calls = []
+    async def provider(request):
+        calls.append(parse_qs(request.content.decode()))
+        assert calls[0]["refresh_token"] == ["committed-refresh"]
+        return httpx2.Response(200, json={"access_token": "next-access", "refresh_token": "next-refresh",
+            "expires_in": 3600, "token_type": "Bearer"})
+    oauth_transport(monkeypatch, provider)
+    assert (await oauth_client.active_token(identifier))["access_token"] == "next-access"
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_disconnect_after_failed_refresh_persists_revoked_status(wallet):
+    item = oauth_account()
+    identifier = item["connection_id"]
+    store.update_connection(identifier, connected=False, status="requires_reconnect")
+    await oauth_client.disconnect(identifier)
+    with store.database() as database:
+        assert store._row(database, identifier)["status"] == "revoked"
+    disabled = store.get_connection(identifier)
+    store.update_connection(identifier, {"public_label": "edited"}, enabled=True,
+                            expected_version=disabled["version"])
+    assert store.get_connection(identifier)["status"] == "revoked"
+
+
+def test_connection_test_cannot_settle_a_pending_token_refresh(wallet):
+    item = oauth_account()
+    identifier = item["connection_id"]
+    with store.database(write=True) as database:
+        database.execute("INSERT INTO connection_refresh_leases VALUES (?,?,?)", (identifier, "active-worker", int(time.time())+120))
+    store.update_connection(identifier, connected=True, expected_version=item["version"])
+    with store.database() as database:
+        assert database.execute("SELECT holder FROM connection_refresh_leases WHERE connection_id=?", (identifier,)).fetchone()[0] == "active-worker"
+
+
+@pytest.mark.asyncio
+async def test_delayed_account_test_cannot_allow_replay_of_inflight_rotating_token(wallet, monkeypatch):
+    import httpx
+    from app.main import app
+    from app.services.auth import create_operator_session
+    clock = [10_000.0]
+    monkeypatch.setattr(oauth_client.time, "time", lambda: clock[0])
+    identity_started, identity_release = asyncio.Event(), asyncio.Event()
+    refresh_started, refresh_release = asyncio.Event(), asyncio.Event()
+    refreshes = []
+    async def provider(request):
+        if request.url.path.endswith("access_token"):
+            refreshes.append(request)
+            refresh_started.set()
+            await refresh_release.wait()
+            return httpx2.Response(200, json={"access_token": "late-access", "refresh_token": "late-refresh",
+                "expires_in": 3600, "token_type": "Bearer"})
+        identity_started.set()
+        await identity_release.wait()
+        return httpx2.Response(200, json={"id": "owner", "login": "Verified owner"})
+    oauth_transport(monkeypatch, provider)
+    item = oauth_account()
+    identifier = item["connection_id"]
+    store.update_connection(identifier, {"external_account_id": "owner", "oauth_token": {
+        "access_token": "original", "refresh_token": "rotating-once", "token_type": "Bearer",
+        "expires_at": clock[0] + 120}}, connected=True)
+    headers = {"Authorization": "Bearer " + create_operator_session()["access_token"]}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8793") as client:
+        testing = asyncio.create_task(client.post(f"/api/kellai/accounts/{identifier}/test", headers=headers))
+        await asyncio.wait_for(identity_started.wait(), 2)
+        clock[0] += 100
+        refreshing = asyncio.create_task(oauth_client.active_token(identifier))
+        await asyncio.wait_for(refresh_started.wait(), 2)
+        identity_release.set()
+        tested = await asyncio.wait_for(testing, 2)
+        refresh_release.set()
+        with pytest.raises(store.ConnectionConflict):
+            await refreshing
+        with pytest.raises(store.ConnectionUnavailable):
+            await oauth_client.active_token(identifier)
+        assert len(refreshes) == 1
+        assert tested.status_code == 409
+        assert store.get_connection(identifier)["status"] == "requires_reconnect"

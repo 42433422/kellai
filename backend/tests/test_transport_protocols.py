@@ -16,6 +16,7 @@ from app.main import _AccessPathOnly
 @pytest.mark.parametrize("kind,config,host,path,response", [
     ("telegram", {"bot_token":"bot-secret"}, "api.telegram.org", "/botbot-secret/sendMessage", {"ok":True,"result":{"message_id":81}}),
     ("line", {"channel_access_token":"line-secret"}, "api.line.me", "/v2/bot/message/push", {"sentMessages":[{"id":"81"}]}),
+    ("line", {"channel_access_token":"line-secret"}, "api.line.me", "/v2/bot/message/push", {"sentMessages":[{"id":81}]}),
     ("whatsapp", {"phone_number_id":"1234","access_token":"wa-secret"}, "graph.facebook.com", "/v25.0/1234/messages", {"messages":[{"id":"wamid.81"}]}),
 ])
 async def test_official_text_senders_use_selected_credentials_and_one_post(tool_env, kind, config, host, path, response):
@@ -142,3 +143,62 @@ async def test_legacy_wechat_oauth_metadata_is_not_remote_authentication(tool_en
     with tenant_scope(1):
         config_store.create_connection("wechat",{"oauth_authorized":True,"oauth_openid":"old-openid"},connection_id="mp")
         assert (await ChannelRegistry().get("wechat","mp").test_connection())["connected"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response", [{}, {"sentMessages": []}, {"sentMessages": [{}]},
+                                      {"sentMessages": [{"id": True}]}, {"sentMessages": [{"id": " "}]}])
+async def test_line_malformed_ack_stays_unknown_and_original_request_is_not_resent(tool_env, response):
+    from app.channels.base import UnifiedMessage
+    from app.services import outbound_delivery
+
+    calls = []
+    def provider(request):
+        calls.append(request)
+        return httpx.Response(200, json=response)
+    with tenant_scope(1):
+        config_store.create_connection("line", {"channel_access_token": "isolated-token"}, connection_id="line-ack")
+        adapter = ChannelRegistry().get("line", "line-ack")
+        adapter._adapter._client = httpx.AsyncClient(base_url="https://api.line.me", transport=httpx.MockTransport(provider))
+        original = UnifiedMessage(id="", customer_id=7, connection_id="line-ack", channel_type="line",
+            contact_id="recipient", contact_name="Recipient", direction="outbound", content="Approved text",
+            metadata={"team_id": 1}, created_at="2026-11-23T00:00:00+00:00")
+        async def send():
+            return await adapter.send_message("recipient", original.content)
+        first = await outbound_delivery.dispatch(original, idempotency_key="line-original", team_id=1, sender=send)
+        again = await outbound_delivery.dispatch(original, idempotency_key="line-original", team_id=1, sender=send)
+        assert first["status"] == again["status"] == "unknown"
+        assert not first["success"] and first["provider_message_id"] == ""
+        assert len(calls) == 1 and again["replayed"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind,config,response", [
+    ("wechat", {"official_app_id": "wx-test", "official_app_secret": "wx-secret"}, {"errcode": 0}),
+    ("wework", {"corp_id": "corp", "secret": "secret", "agent_id": "1001"}, {"errcode": 0, "msgid": "81"}),
+    ("phone", {"provider": "twilio", "account_sid": "ACtest", "auth_token": "secret", "from_number": "+12025550100"}, {"sid": "SM81", "status": "queued"}),
+])
+async def test_sender_preserves_exact_approved_text(tool_env, monkeypatch, kind, config, response):
+    from app.channels.base import UnifiedMessage
+    from app.services import outbound_delivery, message_store
+
+    approved = "  Approved text\n"
+    sent = []
+    async def provider(_transport, request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"errcode": 0, "access_token": "isolated", "expires_in": 7200})
+        sent.append(request)
+        return httpx.Response(200, json=response)
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", provider)
+    with tenant_scope(1):
+        config_store.create_connection(kind, config, connection_id="exact")
+        adapter = ChannelRegistry().get(kind, "exact")
+        original = UnifiedMessage(id="", customer_id=7, connection_id="exact", channel_type=kind,
+            contact_id="recipient", contact_name="Recipient", direction="outbound", content=approved,
+            metadata={"team_id": 1}, created_at="2026-11-23T00:00:00+00:00")
+        result = await outbound_delivery.dispatch(original, idempotency_key="exact-request", team_id=1,
+            sender=lambda: adapter.send_message(original.contact_id, original.content))
+        assert result["success"] and len(sent) == 1
+        remote_text = parse_qs(sent[0].content.decode())["Body"][0] if kind == "phone" else json.loads(sent[0].content)["text"]["content"]
+        assert remote_text == approved
+        assert message_store.get_messages(7, connection_id="exact")[0].content == remote_text

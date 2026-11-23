@@ -44,9 +44,12 @@ def wechat_config(team_id: int) -> dict[str, str]:
             break
     if not token:
         raise WechatIngressError("此团队未配置微信回调 Token", 403)
+    original_id = str(fields.get("official_original_id") or fields.get("original_id") or "").strip()
+    if not original_id:
+        raise WechatIngressError("请先配置公众号原始 ID（official_original_id），再启用账号回调", 403)
     return {
         "token": token,
-        "original_id": str(fields.get("official_original_id") or fields.get("original_id") or "").strip(),
+        "original_id": original_id,
     }
 
 
@@ -83,7 +86,11 @@ def parse_xml(raw: bytes) -> dict[str, str]:
     for child in root:
         if child.tag in body:
             raise WechatIngressError("回调 XML 存在重复字段")
-        body[child.tag] = (child.text or "").strip() if not len(child) else ET.tostring(child, encoding="unicode")
+        if len(child):
+            body[child.tag] = ET.tostring(child, encoding="unicode")
+        else:
+            text = child.text or ""
+            body[child.tag] = text if child.tag in {"Content", "Recognition"} else text.strip()
     return body
 
 
